@@ -23,6 +23,7 @@ mod nested;
 mod post_return;
 mod resources;
 mod strings;
+mod val_traits;
 
 #[derive(Copy, Clone)]
 enum ApiStyle {
