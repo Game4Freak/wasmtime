@@ -958,6 +958,77 @@ impl<'a, T> Source<'a, T> {
     }
 }
 
+impl<'a> Source<'a, Val> {
+    /// Accept zero or more items from the writer.
+    pub fn read_val<B, S: AsContextMut>(&mut self, mut store: S, buffer: &mut B) -> Result<()>
+    where
+        B: ReadBuffer<Val>,
+    {
+        if let Some(input) = &mut self.host_buffer {
+            let count = input.remaining().len().min(buffer.remaining_capacity());
+            buffer.move_from(*input, count);
+        } else {
+            let store = store.as_context_mut();
+            let transmit = store.0.concurrent_state_mut().get_mut(self.id)?;
+
+            let &ReadState::HostReady { guest_offset, .. } = &transmit.read else {
+                bail_bug!("expected ReadState::HostReady");
+            };
+
+            let &WriteState::GuestReady {
+                ty,
+                address,
+                count,
+                options,
+                instance,
+                ..
+            } = &transmit.write
+            else {
+                bail_bug!("expected WriteState::GuestReady");
+            };
+
+            let cx = &mut LiftContext::new(store.0.store_opaque_mut(), options, instance);
+            let ty = ty.payload(cx.types).unwrap();
+            let old_remaining = buffer.remaining_capacity();
+
+            // Load Val values from memory
+            let abi = cx.types.canonical_abi(ty);
+            let size32 = usize::try_from(abi.size32).unwrap();
+            let align32 = usize::try_from(abi.align32).unwrap();
+
+            let start_address = address + (size32 * guest_offset.as_usize());
+            let items_to_read =
+                (count.as_usize() - guest_offset.as_usize()).min(buffer.remaining_capacity());
+
+            if start_address % align32 != 0 {
+                bail!("read pointer not aligned");
+            }
+
+            let memory = cx.memory();
+            let bytes = memory
+                .get(start_address..)
+                .and_then(|b| b.get(..size32 * items_to_read))
+                .ok_or_else(|| crate::format_err!("read pointer out of bounds of memory"))?;
+
+            for i in 0..items_to_read {
+                let item_bytes = &bytes[i * size32..(i + 1) * size32];
+                let val = Val::load(cx, *ty, item_bytes)?;
+                buffer.extend(std::iter::once(val));
+            }
+
+            let transmit = store.0.concurrent_state_mut().get_mut(self.id)?;
+
+            let ReadState::HostReady { guest_offset, .. } = &mut transmit.read else {
+                bail_bug!("expected ReadState::HostReady");
+            };
+
+            guest_offset.inc(old_remaining - buffer.remaining_capacity())?;
+        }
+
+        Ok(())
+    }
+}
+
 impl<'a> Source<'a, u8> {
     /// Return a `DirectSource` view of `self`.
     pub fn as_direct<D>(self, store: StoreContextMut<'a, D>) -> DirectSource<'a, D> {
