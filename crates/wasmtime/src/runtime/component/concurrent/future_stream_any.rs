@@ -1,15 +1,15 @@
 //! Implementation of [`FutureAny`] and [`StreamAny`].
 
-use crate::component::concurrent::futures_and_streams::{self, TransmitOrigin};
+use crate::component::concurrent::futures_and_streams::{self, ReadState, TransmitOrigin, ItemCount};
 use crate::component::concurrent::{TableId, TransmitHandle};
 use crate::component::func::{LiftContext, LowerContext, bad_type_info, desc};
 use crate::component::matching::InstanceType;
 use crate::component::types::{self, FutureType, StreamType};
 use crate::component::{
-    ComponentInstanceId, ComponentType, FutureReader, Lift, Lower, StreamReader,
+    ComponentInstanceId, ComponentType, FutureReader, Lift, Lower, StreamReader, Val,
 };
 use crate::store::StoreOpaque;
-use crate::{AsContextMut, Result, bail, error::Context};
+use crate::{AsContext, AsContextMut, Result, bail, error::Context};
 use std::any::TypeId;
 use std::mem::MaybeUninit;
 use wasmtime_environ::component::{
@@ -36,8 +36,10 @@ use wasmtime_environ::component::{
 /// [`Store`]: crate::Store
 #[derive(Debug, Clone, PartialEq)]
 pub struct FutureAny {
-    id: TableId<TransmitHandle>,
-    ty: PayloadType<FutureType>,
+    /// The table identifier for this future.
+    pub id: TableId<TransmitHandle>,
+    /// The type of the payload for this future.
+    pub ty: PayloadType<FutureType>,
 }
 
 impl FutureAny {
@@ -136,6 +138,48 @@ impl FutureAny {
     pub fn close(&mut self, mut store: impl AsContextMut) -> Result<()> {
         futures_and_streams::future_close(store.as_context_mut().0, &mut self.id)
     }
+
+    /// Create a new `FutureAny` with a `Val` value.
+    ///
+    /// This function creates a host-originated future with a dynamic type using `Val`.
+    /// The future will be ready to be read by guest code.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - The store context
+    /// * `val` - The Val value to store in the future
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the future cannot be created.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store does not support concurrency.
+    pub fn new_val<S: AsContextMut>(mut store: S, val: Val) -> Result<Self> {
+        let store = store.as_context_mut();
+        if !store.0.concurrency_support() {
+            bail!("concurrency support is not enabled");
+        }
+
+        let concurrent_state = store.0.concurrent_state_mut();
+        let (write_id, read_id) = concurrent_state.new_transmit(TransmitOrigin::Host)?;
+
+        let state_id = concurrent_state.get_mut(write_id)?.state;
+        let transmit = concurrent_state.get_mut(state_id)?;
+        transmit.read = ReadState::HostValReady {
+            val: Some(val),
+            guest_offset: ItemCount::ZERO,
+        };
+
+        Ok(FutureAny {
+            id: read_id,
+            ty: PayloadType::Host {
+                id: TypeId::of::<Val>(),
+                typecheck: |_payload, _types| Ok(()),
+            },
+        })
+    }
 }
 
 unsafe impl ComponentType for FutureAny {
@@ -213,8 +257,10 @@ unsafe impl Lift for FutureAny {
 /// [`Store`]: crate::Store
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamAny {
-    id: TableId<TransmitHandle>,
-    ty: PayloadType<StreamType>,
+    /// The table identifier for this stream.
+    pub id: TableId<TransmitHandle>,
+    /// The type of the payload for this stream.
+    pub ty: PayloadType<StreamType>,
 }
 
 impl StreamAny {
@@ -306,6 +352,48 @@ impl StreamAny {
     pub fn close(&mut self, mut store: impl AsContextMut) -> Result<()> {
         futures_and_streams::stream_close(store.as_context_mut().0, &mut self.id)
     }
+
+    /// Create a new `StreamAny` with a `Val` value.
+    ///
+    /// This function creates a host-originated stream with a dynamic type using `Val`.
+    /// The stream will be ready to be read by guest code.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - The store context
+    /// * `val` - The Val value to store in the stream
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream cannot be created.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store does not support concurrency.
+    pub fn new_val<S: AsContextMut>(mut store: S, val: Val) -> Result<Self> {
+        let store = store.as_context_mut();
+        if !store.0.concurrency_support() {
+            bail!("concurrency support is not enabled");
+        }
+
+        let concurrent_state = store.0.concurrent_state_mut();
+        let (write_id, read_id) = concurrent_state.new_transmit(TransmitOrigin::Host)?;
+
+        let state_id = concurrent_state.get_mut(write_id)?.state;
+        let transmit = concurrent_state.get_mut(state_id)?;
+        transmit.read = ReadState::HostValReady {
+            val: Some(val),
+            guest_offset: ItemCount::ZERO,
+        };
+
+        Ok(StreamAny {
+            id: read_id,
+            ty: PayloadType::Host {
+                id: TypeId::of::<Val>(),
+                typecheck: |_payload, _types| Ok(()),
+            },
+        })
+    }
 }
 
 unsafe impl ComponentType for StreamAny {
@@ -364,7 +452,7 @@ unsafe impl Lift for StreamAny {
 }
 
 #[derive(Debug, Clone)]
-enum PayloadType<T> {
+pub enum PayloadType<T> {
     Guest(T),
     Host {
         id: TypeId,

@@ -1,5 +1,6 @@
 use super::table::{TableDebug, TableId};
 use super::{Event, GlobalErrorContextRefCount, Waitable, WaitableCommon};
+use crate::component::concurrent::future_stream_any::PayloadType;
 use crate::component::concurrent::{ConcurrentState, QualifiedThreadId, WorkItem, tls};
 use crate::component::func::{self, LiftContext, LowerContext};
 use crate::component::matching::InstanceType;
@@ -104,7 +105,7 @@ pub struct ItemCount {
 
 impl ItemCount {
     const MAX: u32 = 1 << 28;
-    const ZERO: ItemCount = ItemCount { raw: 0 };
+    pub const ZERO: ItemCount = ItemCount { raw: 0 };
 
     /// Creates a new `ItemCount` with the specified count, or a trap if it's
     /// too large.
@@ -319,6 +320,73 @@ fn lift<T: func::Lift + Send + 'static, B: ReadBuffer<T>>(
         let list = &WasmList::new(address, count, lift, ty)?;
         T::linear_lift_into_from_memory(lift, list, &mut Extender(buffer))?
     }
+    Ok(())
+}
+
+/// Helper function to lift a single Val from guest memory without using the buffer system.
+pub(super) fn lift_val(
+    lift: &mut LiftContext<'_>,
+    ty: InterfaceType,
+    address: usize,
+) -> Result<Val> {
+    let abi = lift.types.canonical_abi(&ty);
+    let size = usize::try_from(abi.size32)?;
+    let offset = address;
+
+    if offset % usize::try_from(abi.align32)? != 0 {
+        bail!("read pointer not aligned");
+    }
+
+    lift.memory()
+        .get(offset..)
+        .and_then(|b| b.get(..size))
+        .ok_or_else(|| crate::format_err!("read pointer out of bounds of memory"))?;
+
+    let bytes = &lift.memory()[offset..offset + size];
+    Val::load(lift, ty, bytes)
+}
+
+/// Helper function to lower a single Val to guest memory without using the buffer system.
+pub(super) fn lower_val<U>(
+    store: &mut StoreContextMut<U>,
+    instance: Instance,
+    caller_thread: QualifiedThreadId,
+    options: OptionsIndex,
+    ty: InterfaceType,
+    address: usize,
+    val: &Val,
+) -> Result<()> {
+    let (lower, old_thread) = if true {
+        // Val may require realloc, so always use the full context
+        let old_thread = store.0.set_thread(caller_thread)?;
+        (
+            &mut LowerContext::new(store.as_context_mut(), options, instance),
+            Some(old_thread),
+        )
+    } else {
+        (
+            &mut LowerContext::new_without_realloc(store.as_context_mut(), options, instance),
+            None,
+        )
+    };
+
+    let abi = lower.types.canonical_abi(&ty);
+    if address % usize::try_from(abi.align32)? != 0 {
+        bail!("write pointer not aligned");
+    }
+
+    lower
+        .as_slice_mut()
+        .get_mut(address..)
+        .and_then(|b| b.get(..usize::try_from(abi.size32).ok()?))
+        .ok_or_else(|| crate::format_err!("write pointer out of bounds of memory"))?;
+
+    val.store(lower, ty, address)?;
+
+    if let Some(old_thread) = old_thread {
+        store.0.set_thread(old_thread)?;
+    }
+
     Ok(())
 }
 
@@ -883,7 +951,7 @@ impl<'a, T> Source<'a, T> {
             let count = input.remaining().len().min(buffer.remaining_capacity());
             buffer.move_from(*input, count);
         } else {
-            let store = store.as_context_mut();
+            let mut store = store.as_context_mut();
             let transmit = store.0.concurrent_state_mut().get_mut(self.id)?;
 
             let &ReadState::HostReady { guest_offset, .. } = &transmit.read else {
@@ -1739,7 +1807,7 @@ impl<T> StreamReader<T> {
     /// Panics if this stream has already been closed, or if this stream doesn't
     /// belong to the specified `store`.
     pub fn try_into<V: 'static>(mut self, mut store: impl AsContextMut) -> Result<V, Self> {
-        let store = store.as_context_mut();
+        let mut store = store.as_context_mut();
         let state = store.0.concurrent_state_mut();
         let id = state.get_mut(self.id).unwrap().state;
         if let WriteState::HostReady { try_into, .. } = &state.get_mut(id).unwrap().write {
@@ -2166,7 +2234,7 @@ unsafe impl func::Lift for ErrorContext {
 pub(super) struct TransmitHandle {
     pub(super) common: WaitableCommon,
     /// See `TransmitState`
-    state: TableId<TransmitState>,
+    pub state: TableId<TransmitState>,
 }
 
 impl TransmitHandle {
@@ -2185,17 +2253,17 @@ impl TableDebug for TransmitHandle {
 }
 
 /// Represents the state of a stream or future.
-struct TransmitState {
+pub struct TransmitState {
     /// The write end of the stream or future.
-    write_handle: TableId<TransmitHandle>,
+    pub write_handle: TableId<TransmitHandle>,
     /// The read end of the stream or future.
-    read_handle: TableId<TransmitHandle>,
+    pub read_handle: TableId<TransmitHandle>,
     /// See `WriteState`
-    write: WriteState,
+    pub write: WriteState,
     /// See `ReadState`
-    read: ReadState,
+    pub read: ReadState,
     /// Whether further values may be transmitted via this stream or future.
-    done: bool,
+    pub done: bool,
     /// The original creator of this stream, used for type-checking with
     /// `{Future,Stream}Any`.
     pub(super) origin: TransmitOrigin,
@@ -2265,6 +2333,12 @@ enum WriteState {
         cancel: bool,
         cancel_waker: Option<Waker>,
     },
+    /// The write end is owned by the host with a Val value (for dynamic types).
+    HostValReady {
+        /// The Val value to write.
+        val: Option<Val>,
+        guest_offset: ItemCount,
+    },
     /// The write end has been dropped.
     Dropped,
 }
@@ -2275,13 +2349,14 @@ impl fmt::Debug for WriteState {
             Self::Open => f.debug_tuple("Open").finish(),
             Self::GuestReady { .. } => f.debug_tuple("GuestReady").finish(),
             Self::HostReady { .. } => f.debug_tuple("HostReady").finish(),
+            Self::HostValReady { .. } => f.debug_tuple("HostValReady").finish(),
             Self::Dropped => f.debug_tuple("Dropped").finish(),
         }
     }
 }
 
-/// Represents the state of the read end of a stream or future.
-enum ReadState {
+/// Represents the state of the read end of a future or stream.
+pub enum ReadState {
     /// The read end is open, but no read is pending.
     Open,
     /// The read end is owned by a guest task and a read is pending.
@@ -2316,6 +2391,12 @@ enum ReadState {
         buffer: Vec<u8>,
         limit: usize,
     },
+    /// The read end is owned by the host with a Val value (for dynamic types).
+    HostValReady {
+        /// The Val value to read.
+        val: Option<Val>,
+        guest_offset: ItemCount,
+    },
     /// The read end has been dropped.
     Dropped,
 }
@@ -2327,6 +2408,7 @@ impl fmt::Debug for ReadState {
             Self::GuestReady { .. } => f.debug_tuple("GuestReady").finish(),
             Self::HostReady { .. } => f.debug_tuple("HostReady").finish(),
             Self::HostToHost { .. } => f.debug_tuple("HostToHost").finish(),
+            Self::HostValReady { .. } => f.debug_tuple("HostValReady").finish(),
             Self::Dropped => f.debug_tuple("Dropped").finish(),
         }
     }
@@ -2473,6 +2555,8 @@ impl StoreOpaque {
 
             WriteState::HostReady { .. } => {}
 
+            WriteState::HostValReady { .. } => {}
+
             WriteState::Open => {
                 state.update_event(
                     write_handle.rep(),
@@ -2531,6 +2615,7 @@ impl StoreOpaque {
                 }
             }
             WriteState::Dropped => bail_bug!("write state is already dropped"),
+            &mut WriteState::HostValReady { .. } => {}
         }
 
         let transmit = self.concurrent_state_mut().get_mut(transmit_id)?;
@@ -2570,31 +2655,13 @@ impl StoreOpaque {
                 )?;
             }
 
-            ReadState::HostReady { .. } | ReadState::HostToHost { .. } => {}
+            ReadState::HostReady { .. } => {}
 
-            // If the read state is open, then there are no registered readers of the stream/future
-            ReadState::Open => {
-                self.concurrent_state_mut().update_event(
-                    read_handle.rep(),
-                    match on_drop_open {
-                        Some(_) => Event::FutureRead {
-                            code: ReturnCode::Dropped(ItemCount::ZERO),
-                            pending: None,
-                        },
-                        None => Event::StreamRead {
-                            code: ReturnCode::Dropped(ItemCount::ZERO),
-                            pending: None,
-                        },
-                    },
-                )?;
-            }
+            ReadState::HostToHost { .. } => {}
 
-            // If the read state was already dropped, then we can remove the transmit state completely
-            // (both writer and reader have been dropped)
-            ReadState::Dropped => {
-                log::trace!("host_drop_writer delete {transmit_id:?}");
-                self.concurrent_state_mut().delete_transmit(transmit_id)?;
-            }
+            ReadState::HostValReady { .. } => {}
+
+            ReadState::Open | ReadState::Dropped => {}
         }
         Ok(())
     }
@@ -2951,7 +3018,7 @@ impl<T> StoreContextMut<'_, T> {
                         async move { consume(Some(input.get_mut::<C::Item>())).await }.boxed()
                     }),
                     buffer: Vec::new(),
-                    limit: 0,
+                    limit: usize::MAX,
                 };
 
                 let future = async move {
@@ -2985,6 +3052,9 @@ impl<T> StoreContextMut<'_, T> {
             WriteState::Dropped => {
                 let reader = transmit.read_handle;
                 self.0.host_drop_reader(reader, kind)?;
+            }
+            &WriteState::HostValReady { .. } => {
+                bail!("HostValReady not supported for typed stream consumers")
             }
         }
         Ok(())
@@ -3703,6 +3773,8 @@ impl Instance {
 
             ReadState::HostToHost { .. } => bail_bug!("unexpected HostToHost"),
 
+            ReadState::HostValReady { .. } => bail_bug!("unexpected HostValReady"),
+
             ReadState::Open => {
                 set_guest_ready(concurrent_state)?;
                 ReturnCode::Blocked
@@ -3947,6 +4019,8 @@ impl Instance {
             }
 
             WriteState::Dropped => ReturnCode::Dropped(ItemCount::ZERO),
+
+            WriteState::HostValReady { .. } => bail_bug!("unexpected HostValReady"),
         };
 
         if result == ReturnCode::Blocked && !self.options(store.0, options).async_ {
@@ -4048,6 +4122,7 @@ impl Instance {
                     transmit.write = WriteState::Open;
                 }
                 WriteState::HostReady { .. } => bail_bug!("support host write cancellation"),
+                WriteState::HostValReady { .. } => bail_bug!("support host write cancellation"),
                 WriteState::Open | WriteState::Dropped => {}
             }
         }
@@ -4134,7 +4209,9 @@ impl Instance {
                 ReadState::GuestReady { .. } => {
                     transmit.read = ReadState::Open;
                 }
-                ReadState::HostReady { .. } | ReadState::HostToHost { .. } => {
+                ReadState::HostReady { .. }
+                | ReadState::HostToHost { .. }
+                | ReadState::HostValReady { .. } => {
                     bail_bug!("support host read cancellation")
                 }
                 ReadState::Open | ReadState::Dropped => {}
@@ -4734,7 +4811,7 @@ impl ConcurrentState {
 
     /// Allocate a new future or stream, including the `TransmitState` and the
     /// `TransmitHandle`s corresponding to the read and write ends.
-    fn new_transmit(
+    pub fn new_transmit(
         &mut self,
         origin: TransmitOrigin,
     ) -> Result<(TableId<TransmitHandle>, TableId<TransmitHandle>)> {
@@ -4970,15 +5047,415 @@ impl<T> Drop for LockedStateGuard<'_, T> {
     }
 }
 
+/// Read a value from a future as a `Val`.
+///
+/// This function reads the value from a `FutureAny` when it becomes available,
+/// converting it to a `Val` without requiring compile-time type knowledge.
+///
+/// # Arguments
+///
+/// * `store` - The store to use for the operation
+/// * `future` - The future to read from
+///
+/// # Errors
+///
+/// Returns an error if the future has already been read, if the future
+/// has been closed, or if the value cannot be converted to a `Val`.
+///
+/// # Panics
+///
+/// Panics if the `store` does not own the future.
+pub fn future_read_val<S: AsContextMut>(mut store: S, future: &mut FutureAny) -> Result<Val> {
+    let mut store = store.as_context_mut();
+    let (instance, options, address, state) = {
+        let concurrent_state = store.0.concurrent_state_mut();
+        let handle = concurrent_state.get_mut(future.id)?;
+        let state = handle.state;
+        let transmit = concurrent_state.get_mut(state)?;
+
+        // Check if we can read - need the write end to be GuestReady
+        let (instance, options, address, _count, _ty) = match &transmit.write {
+            WriteState::GuestReady {
+                instance,
+                options,
+                address,
+                count,
+                ty,
+                ..
+            } => (instance, options, address, count, ty),
+            WriteState::Dropped => bail!("future closed - write end dropped"),
+            _ => bail!("future not ready for reading"),
+        };
+        (*instance, *options, *address, state)
+    };
+
+    // Get the payload type from the future's PayloadType
+    let payload_ty = match &future.ty {
+        crate::component::concurrent::future_stream_any::PayloadType::Guest(future_ty) => {
+            // Extract the InterfaceType from the FutureType
+            let instance_data = instance.id().get(store.0);
+            let types = InstanceType::new(instance_data);
+            types.types[future_ty.index()]
+                .payload
+                .ok_or_else(|| crate::format_err!("future has no payload type"))?
+        }
+        crate::component::concurrent::future_stream_any::PayloadType::Host { .. } => {
+            // For host-originated futures with Val, we don't have a static type
+            // Use Unit as a placeholder since we'll handle Val directly
+            InterfaceType::U32
+        }
+    };
+
+    // Create LiftContext and read the value
+    let cx = &mut crate::component::func::LiftContext::new(
+        store.0.store_opaque_mut(),
+        options,
+        instance,
+    );
+
+    let val = lift_val(cx, payload_ty, address)?;
+
+    // Mark the future as done
+    let concurrent_state = store.0.concurrent_state_mut();
+    let transmit = concurrent_state.get_mut(state)?;
+    transmit.done = true;
+
+    Ok(val)
+}
+
+/// Write a `Val` value to a future.
+///
+/// This function writes the provided `Val` value to a `FutureAny`, converting it
+/// to the appropriate type without requiring compile-time type knowledge.
+///
+/// # Arguments
+///
+/// * `store` - The store to use for the operation
+/// * `future` - The future to write to
+/// * `val` - The value to write
+///
+/// # Errors
+///
+/// Returns an error if the future has already been written, if the future
+/// has been closed, or if the value cannot be converted to the future's type.
+///
+/// # Panics
+///
+/// Panics if the `store` does not own the future.
+pub fn future_write_val<S: AsContextMut>(
+    mut store: S,
+    future: &mut FutureAny,
+    val: &Val,
+) -> Result<()> {
+    let mut store = store.as_context_mut();
+    let (instance, caller_thread, options, address, state) = {
+        let concurrent_state = store.0.concurrent_state_mut();
+        let handle = concurrent_state.get_mut(future.id)?;
+        let state = handle.state;
+        let transmit = concurrent_state.get_mut(state)?;
+
+        // Check if we can write - need the read end to be GuestReady
+        let (instance, _caller_instance, caller_thread, options, address, _count, _ty) =
+            match &transmit.read {
+                ReadState::GuestReady {
+                    ty,
+                    caller_instance,
+                    caller_thread,
+                    instance,
+                    options,
+                    address,
+                    count,
+                    ..
+                } => (
+                    instance,
+                    caller_instance,
+                    caller_thread,
+                    options,
+                    address,
+                    count,
+                    ty,
+                ),
+                ReadState::Dropped => bail!("future closed - read end dropped"),
+                _ => bail!("future not ready for writing"),
+            };
+        (*instance, *caller_thread, *options, *address, state)
+    };
+
+    // Get the payload type from the future's PayloadType
+    let payload_ty = match &future.ty {
+        crate::component::concurrent::future_stream_any::PayloadType::Guest(future_ty) => {
+            // Extract the InterfaceType from the FutureType
+            let instance_data = instance.id().get(store.0);
+            let types = InstanceType::new(instance_data);
+            types.types[future_ty.index()]
+                .payload
+                .ok_or_else(|| crate::format_err!("future has no payload type"))?
+        }
+        crate::component::concurrent::future_stream_any::PayloadType::Host { .. } => {
+            // For host-originated futures with Val, we don't have a static type
+            // Use Unit as a placeholder since we'll handle Val directly
+            InterfaceType::U32
+        }
+    };
+
+    // Write the value
+    lower_val(
+        &mut store,
+        instance,
+        caller_thread,
+        options,
+        payload_ty,
+        address,
+        val,
+    )?;
+
+    // Mark the future as done
+    let concurrent_state = store.0.concurrent_state_mut();
+    let transmit = concurrent_state.get_mut(state)?;
+    transmit.done = true;
+
+    Ok(())
+}
+
+/// Read values from a stream as a `Vec<Val>`.
+///
+/// This function reads up to `max_items` values from a `StreamAny`, converting them
+/// to `Val` without requiring compile-time type knowledge.
+///
+/// # Arguments
+///
+/// * `store` - The store to use for the operation
+/// * `stream` - The stream to read from
+/// * `max_items` - Maximum number of items to read
+///
+/// # Returns
+///
+/// Returns a tuple of:
+/// - The vector of `Val` values that were read
+/// - A boolean indicating whether the stream is closed (true if closed, false if more data may be available)
+///
+/// # Errors
+///
+/// Returns an error if the stream has been closed, if the stream doesn't
+/// belong to the store, or if values cannot be converted to `Val`.
+///
+/// # Panics
+///
+/// Panics if the `store` does not own the stream.
+pub fn stream_read_val<S: AsContextMut>(
+    mut store: S,
+    stream: &mut StreamAny,
+    max_items: usize,
+) -> Result<(Vec<Val>, bool)> {
+    let mut store = store.as_context_mut();
+    let (instance, options, address, count, state) = {
+        let concurrent_state = store.0.concurrent_state_mut();
+        let handle = concurrent_state.get_mut(stream.id)?;
+        let state = handle.state;
+        let transmit = concurrent_state.get_mut(state)?;
+
+        // Check if we can read - need the write end to be GuestReady
+        let (instance, options, address, count, _ty) = match &transmit.write {
+            WriteState::GuestReady {
+                instance,
+                options,
+                address,
+                count,
+                ty,
+                ..
+            } => (instance, options, address, count, ty),
+            WriteState::Dropped => return Ok((vec![], true)), // Stream closed
+            _ => bail!("stream not ready for reading"),
+        };
+        (*instance, *options, *address, count, state)
+    };
+
+    let count = std::cmp::min(count.as_usize(), max_items);
+    if count == 0 {
+        return Ok((vec![], false));
+    }
+
+    // Get the payload type from the stream's PayloadType
+    let payload_ty = match &stream.ty {
+        crate::component::concurrent::future_stream_any::PayloadType::Guest(stream_ty) => {
+            // Extract the InterfaceType from the StreamType
+            let instance_data = instance.id().get(store.0);
+            let types = InstanceType::new(instance_data);
+            types.types[stream_ty.index()]
+                .payload
+                .ok_or_else(|| crate::format_err!("stream has no payload type"))?
+        }
+        crate::component::concurrent::future_stream_any::PayloadType::Host { .. } => {
+            // For host-originated streams with Val, we don't have a static type
+            // Use Unit as a placeholder since we'll handle Val directly
+            InterfaceType::U32
+        }
+    };
+
+    // Create LiftContext and read values
+    let mut values = Vec::with_capacity(count);
+    let cx = &mut crate::component::func::LiftContext::new(
+        store.0.store_opaque_mut(),
+        options,
+        instance,
+    );
+
+    let abi = cx.types.canonical_abi(&payload_ty);
+    let size = usize::try_from(abi.size32)?;
+    let align = usize::try_from(abi.align32)?;
+
+    for i in 0..count {
+        let offset = address + (i * size);
+        if offset % align != 0 {
+            bail!("stream data not aligned");
+        }
+
+        let val = lift_val(cx, payload_ty, offset)?;
+        values.push(val);
+    }
+
+    // Mark the items as read by updating guest_offset in ReadState
+    let concurrent_state = store.0.concurrent_state_mut();
+    let transmit = concurrent_state.get_mut(state)?;
+    if let ReadState::HostReady { guest_offset, .. } = &mut transmit.read {
+        guest_offset.inc(count)?;
+    }
+
+    // Check if stream is closed
+    let is_closed = matches!(&transmit.write, WriteState::Dropped);
+
+    Ok((values, is_closed))
+}
+
+/// Write `Val` values to a stream.
+///
+/// This function writes the provided `Val` values to a `StreamAny`, converting them
+/// to the appropriate type without requiring compile-time type knowledge.
+///
+/// # Arguments
+///
+/// * `store` - The store to use for the operation
+/// * `stream` - The stream to write to
+/// * `values` - The values to write
+///
+/// # Errors
+///
+/// Returns an error if the stream has been closed, if the stream doesn't
+/// belong to the store, or if values cannot be converted to the stream's type.
+///
+/// # Panics
+///
+/// Panics if the `store` does not own the stream.
+pub fn stream_write_val<S: AsContextMut>(
+    mut store: S,
+    stream: &mut StreamAny,
+    values: &[Val],
+) -> Result<()> {
+    let mut store = store.as_context_mut();
+    let (instance, caller_thread, options, address, count, state) = {
+        let concurrent_state = store.0.concurrent_state_mut();
+        let handle = concurrent_state.get_mut(stream.id)?;
+        let state = handle.state;
+        let transmit = concurrent_state.get_mut(state)?;
+
+        // Check if we can write - need the read end to be GuestReady
+        let (instance, _caller_instance, caller_thread, options, address, count, _ty) =
+            match &transmit.read {
+                ReadState::GuestReady {
+                    ty,
+                    caller_instance,
+                    caller_thread,
+                    instance,
+                    options,
+                    address,
+                    count,
+                    ..
+                } => (
+                    instance,
+                    caller_instance,
+                    caller_thread,
+                    options,
+                    address,
+                    count,
+                    ty,
+                ),
+                ReadState::Dropped => bail!("stream closed - read end dropped"),
+                _ => bail!("stream not ready for writing"),
+            };
+        (*instance, *caller_thread, *options, *address, count, state)
+    };
+
+    let count = std::cmp::min(count.as_usize(), values.len());
+    if count == 0 {
+        return Ok(());
+    }
+
+    // Get the payload type from the stream's PayloadType
+    let payload_ty = match &stream.ty {
+        crate::component::concurrent::future_stream_any::PayloadType::Guest(stream_ty) => {
+            // Extract the InterfaceType from the StreamType
+            let instance_data = instance.id().get(store.0);
+            let types = InstanceType::new(instance_data);
+            types.types[stream_ty.index()]
+                .payload
+                .ok_or_else(|| crate::format_err!("stream has no payload type"))?
+        }
+        crate::component::concurrent::future_stream_any::PayloadType::Host { .. } => {
+            // For host-originated streams with Val, we don't have a static type
+            // Use Unit as a placeholder since we'll handle Val directly
+            InterfaceType::U32
+        }
+    };
+
+    // Create LowerContext and write values
+    let instance_data = instance.id().get(store.0);
+    let abi = instance_data.component().types().canonical_abi(&payload_ty);
+    let size = usize::try_from(abi.size32)?;
+    let align = usize::try_from(abi.align32)?;
+
+    for (i, val) in values.iter().take(count).enumerate() {
+        let offset = address + (i * size);
+        if offset % align != 0 {
+            bail!("stream data not aligned");
+        }
+
+        lower_val(
+            &mut store,
+            instance,
+            caller_thread,
+            options,
+            payload_ty,
+            offset,
+            val,
+        )?;
+    }
+
+    // Mark the items as written by updating guest_offset in WriteState
+    let concurrent_state = store.0.concurrent_state_mut();
+    let transmit = concurrent_state.get_mut(state)?;
+    if let WriteState::HostReady { guest_offset, .. } = &mut transmit.write {
+        guest_offset.inc(count)?;
+    }
+
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Engine, Store};
+    use crate::component::{FutureAny, StreamAny};
     use core::future::pending;
     use core::pin::pin;
     use std::sync::LazyLock;
+    use std::string::ToString;
 
-    static ENGINE: LazyLock<Engine> = LazyLock::new(Engine::default);
+    static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
+        let mut config = crate::Config::default();
+        config.concurrency_support(true);
+        Engine::new(&config).unwrap()
+    });
 
     fn poll_future_producer<T>(rx: Pin<&mut T>, finish: bool) -> Poll<Result<Option<T::Item>>>
     where
@@ -5054,5 +5531,65 @@ mod tests {
             poll_future_producer(rx.as_mut(), true),
             Poll::Ready(Err(..)),
         ));
+    }
+
+    #[test]
+    fn test_future_new_val() {
+        let mut store = Store::new(&ENGINE, ());
+        
+        // Test creating a future with a simple Val
+        let val = Val::S32(42);
+        let future = FutureAny::new_val(&mut store, val).unwrap();
+        
+        // Verify the future was created successfully
+        assert!(matches!(future.ty, crate::component::concurrent::future_stream_any::PayloadType::Host { .. }));
+    }
+
+    #[test]
+    fn test_stream_new_val() {
+        let mut store = Store::new(&ENGINE, ());
+        
+        // Test creating a stream with a simple Val
+        let val = Val::S32(42);
+        let stream = StreamAny::new_val(&mut store, val).unwrap();
+        
+        // Verify the stream was created successfully
+        assert!(matches!(stream.ty, crate::component::concurrent::future_stream_any::PayloadType::Host { .. }));
+    }
+
+    #[test]
+    fn test_future_new_val_different_types() {
+        let mut store = Store::new(&ENGINE, ());
+        
+        // Test creating futures with different Val types
+        let val1 = Val::S32(42);
+        let future1 = FutureAny::new_val(&mut store, val1).unwrap();
+        
+        let val2 = Val::String("hello".to_string());
+        let future2 = FutureAny::new_val(&mut store, val2).unwrap();
+        
+        let val3 = Val::Float64(3.14);
+        let future3 = FutureAny::new_val(&mut store, val3).unwrap();
+        
+        // Verify all futures were created
+        assert!(matches!(future1.ty, crate::component::concurrent::future_stream_any::PayloadType::Host { .. }));
+        assert!(matches!(future2.ty, crate::component::concurrent::future_stream_any::PayloadType::Host { .. }));
+        assert!(matches!(future3.ty, crate::component::concurrent::future_stream_any::PayloadType::Host { .. }));
+    }
+
+    #[test]
+    fn test_stream_new_val_different_types() {
+        let mut store = Store::new(&ENGINE, ());
+        
+        // Test creating streams with different Val types
+        let val1 = Val::U32(100);
+        let stream1 = StreamAny::new_val(&mut store, val1).unwrap();
+        
+        let val2 = Val::Bool(true);
+        let stream2 = StreamAny::new_val(&mut store, val2).unwrap();
+        
+        // Verify all streams were created
+        assert!(matches!(stream1.ty, crate::component::concurrent::future_stream_any::PayloadType::Host { .. }));
+        assert!(matches!(stream2.ty, crate::component::concurrent::future_stream_any::PayloadType::Host { .. }));
     }
 }
