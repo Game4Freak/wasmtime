@@ -1,17 +1,28 @@
 //! Implementation of [`FutureAny`] and [`StreamAny`].
 
-use crate::component::concurrent::futures_and_streams::{self, TransmitOrigin};
+use crate::StoreContextMut;
+use crate::component::concurrent::futures_and_streams::{
+    self, Destination, Source, StreamResult, TransmitKind, TransmitOrigin,
+};
 use crate::component::concurrent::{TableId, TransmitHandle};
 use crate::component::func::{LiftContext, LowerContext, bad_type_info, desc};
 use crate::component::matching::InstanceType;
 use crate::component::types::{self, FutureType, StreamType};
 use crate::component::{
-    ComponentInstanceId, ComponentType, FutureReader, Lift, Lower, StreamReader,
+    ComponentInstanceId, ComponentType, FutureReader, Lift, Lower, StreamReader, Val,
 };
 use crate::store::StoreOpaque;
-use crate::{AsContextMut, Result, bail, error::Context};
+use crate::{AsContextMut, Result, bail, error::Context as _};
+use core::any::Any;
+use core::marker::PhantomData;
+use core::mem::MaybeUninit;
+use core::pin::Pin;
+use core::task::{Context, Poll, ready};
 use std::any::TypeId;
-use std::mem::MaybeUninit;
+use std::boxed::Box;
+use std::io::Cursor;
+use std::vec::Vec;
+use wasmtime_core::ensure;
 use wasmtime_environ::component::{
     CanonicalAbiInfo, InterfaceType, TypeFutureTableIndex, TypeStreamTableIndex,
 };
@@ -119,6 +130,129 @@ impl FutureAny {
             // be reasonable to ascribe as the type here regardless.
             ty: PayloadType::Guest(FutureType::from(ty, &cx.instance_type())),
         })
+    }
+
+    /// Create a new future with the specified producer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the resource table for this store is full or if
+    /// [`Config::concurrency_support`] is not enabled.
+    ///
+    /// [`Config::concurrency_support`]: crate::Config::concurrency_support
+    pub fn new<S: crate::AsContextMut>(
+        mut store: S,
+        producer: impl FutureAnyProducer<S::Data>,
+    ) -> Result<Self> {
+        ensure!(
+            store.as_context().0.concurrency_support(),
+            "concurrency support is not enabled"
+        );
+
+        struct Producer<P>(P);
+
+        impl<D, P: FutureAnyProducer<D>> StreamAnyProducer<D> for Producer<P> {
+            type Buffer = Option<Val>;
+
+            fn poll_produce<'a>(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                store: StoreContextMut<D>,
+                mut destination: Destination<'a, Val, Self::Buffer>,
+                finish: bool,
+            ) -> Poll<Result<StreamResult>> {
+                // SAFETY: This is a standard pin-projection, and we never move
+                // out of `self`.
+                let producer = unsafe { self.map_unchecked_mut(|v| &mut v.0) };
+
+                Poll::Ready(Ok(
+                    if let Some(value) = ready!(producer.poll_produce(cx, store, finish))? {
+                        destination.set_buffer(Some(value));
+
+                        // Here we return `StreamResult::Completed` even though
+                        // we've produced the last item we'll ever produce.
+                        // That's because the ABI expects
+                        // `ReturnCode::Completed(1)` rather than
+                        // `ReturnCode::Dropped(1)`.  In any case, we won't be
+                        // called again since the future will have resolved.
+                        StreamResult::Completed
+                    } else {
+                        StreamResult::Cancelled
+                    },
+                ))
+            }
+        }
+
+        let id = store
+            .as_context_mut()
+            .new_transmit_val(TransmitKind::Future, Producer(producer))?;
+        // For host-originating Val futures, we use a dummy type since Val is type-erased
+        let ty = PayloadType::new_host::<()>();
+        Ok(FutureAny { id, ty })
+    }
+
+    pub(super) fn new_(id: TableId<TransmitHandle>) -> Self {
+        Self {
+            id,
+            ty: PayloadType::new_host::<()>(),
+        }
+    }
+
+    pub(super) fn id(&self) -> TableId<TransmitHandle> {
+        self.id
+    }
+
+    /// Set the consumer that accepts the result of this future.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this future has already been closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this future does not belong to `store`.
+    pub fn pipe<S: crate::AsContextMut>(
+        self,
+        mut store: S,
+        consumer: impl FutureAnyConsumer<S::Data> + Unpin,
+    ) -> Result<()> {
+        struct Consumer<C>(C);
+
+        impl<D: 'static, C: FutureAnyConsumer<D>> StreamAnyConsumer<D> for Consumer<C> {
+            fn poll_consume(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                mut store: StoreContextMut<D>,
+                mut source: Source<Val>,
+                finish: bool,
+            ) -> Poll<Result<StreamResult>> {
+                // SAFETY: This is a standard pin-projection, and we never move
+                // out of `self`.
+                let consumer = unsafe { self.map_unchecked_mut(|v| &mut v.0) };
+
+                ready!(consumer.poll_consume(
+                    cx,
+                    store.as_context_mut(),
+                    source.reborrow(),
+                    finish
+                ))?;
+
+                Poll::Ready(Ok(if source.remaining(store) == 0 {
+                    // Here we return `StreamResult::Completed` even though
+                    // we've consumed the last item we'll ever consume.  That's
+                    // because the ABI expects `ReturnCode::Completed(1)` rather
+                    // than `ReturnCode::Dropped(1)`.  In any case, we won't be
+                    // called again since the future will have resolved.
+                    StreamResult::Completed
+                } else {
+                    StreamResult::Cancelled
+                }))
+            }
+        }
+
+        store
+            .as_context_mut()
+            .set_consumer_val(self.id, TransmitKind::Future, Consumer(consumer))
     }
 
     /// Close this `FutureAny`.
@@ -291,6 +425,60 @@ impl StreamAny {
         })
     }
 
+    /// Create a new stream with the specified producer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the resource table for this store is full or if
+    /// [`Config::concurrency_support`] is not enabled.
+    ///
+    /// [`Config::concurrency_support`]: crate::Config::concurrency_support
+    pub fn new<S: crate::AsContextMut>(
+        mut store: S,
+        producer: impl StreamAnyProducer<S::Data>,
+    ) -> Result<Self> {
+        ensure!(
+            store.as_context().0.concurrency_support(),
+            "concurrency support is not enabled",
+        );
+        let id = store
+            .as_context_mut()
+            .new_transmit_val(TransmitKind::Stream, producer)?;
+        // For host-originating Val streams, we use a dummy type since Val is type-erased
+        let ty = PayloadType::new_host::<()>();
+        Ok(StreamAny { id, ty })
+    }
+
+    pub(super) fn new_(id: TableId<TransmitHandle>) -> Self {
+        Self {
+            id,
+            ty: PayloadType::new_host::<()>(),
+        }
+    }
+
+    pub(super) fn id(&self) -> TableId<TransmitHandle> {
+        self.id
+    }
+
+    /// Set the consumer that accepts the items delivered to this stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this stream has already been closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this stream does not belong to `store`.
+    pub fn pipe<S: crate::AsContextMut>(
+        self,
+        mut store: S,
+        consumer: impl StreamAnyConsumer<S::Data>,
+    ) -> Result<()> {
+        store
+            .as_context_mut()
+            .set_consumer_val(self.id, TransmitKind::Stream, consumer)
+    }
+
     /// Close this `StreamAny`.
     ///
     /// This will close this stream and cause any write that happens later to
@@ -453,6 +641,169 @@ impl<T> PayloadType<T> {
                     bail!("future payload types differ")
                 }
             }
+        }
+    }
+}
+
+/// Represents the host-owned write end of a type-erased stream.
+pub trait StreamAnyProducer<D>: Send + 'static {
+    /// The `WriteBuffer` type to use when delivering items.
+    type Buffer: futures_and_streams::WriteBuffer<Val> + Default;
+
+    /// Handle a host- or guest-initiated read by delivering zero or more items
+    /// to the specified destination.
+    ///
+    /// This is the type-erased version of [`futures_and_streams::StreamProducer`],
+    /// using [`Val`] instead of a generic `Item` type.
+    ///
+    /// See [`futures_and_streams::StreamProducer::poll_produce`] for detailed
+    /// documentation on the behavior and return values.
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: crate::StoreContextMut<'a, D>,
+        destination: Destination<'a, Val, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<Result<StreamResult>>;
+
+    /// Attempt to convert the specified object into a `Box<dyn Any>` which may
+    /// be downcast to the specified type.
+    ///
+    /// The implementation must ensure that, if it returns `Ok(_)`, a downcast
+    /// to the specified type is guaranteed to succeed.
+    fn try_into(me: Pin<Box<Self>>, _ty: TypeId) -> Result<Box<dyn Any>, Pin<Box<Self>>> {
+        Err(me)
+    }
+}
+
+/// Represents the host-owned read end of a type-erased stream.
+pub trait StreamAnyConsumer<D>: Send + 'static {
+    /// Handle a host- or guest-initiated write by accepting zero or more items
+    /// from the specified source.
+    ///
+    /// This is the type-erased version of [`futures_and_streams::StreamConsumer`],
+    /// using [`Val`] instead of a generic `Item` type.
+    ///
+    /// See [`futures_and_streams::StreamConsumer::poll_consume`] for detailed
+    /// documentation on the behavior and return values.
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: crate::StoreContextMut<D>,
+        source: Source<'_, Val>,
+        finish: bool,
+    ) -> Poll<Result<StreamResult>>;
+}
+
+/// Represents the host-owned write end of a type-erased future.
+pub trait FutureAnyProducer<D>: Send + 'static {
+    /// Handle a host- or guest-initiated read by producing a value.
+    ///
+    /// This is the type-erased version of [`futures_and_streams::FutureProducer`],
+    /// using [`Val`] instead of a generic `Item` type.
+    ///
+    /// See [`futures_and_streams::FutureProducer::poll_produce`] for detailed
+    /// documentation on the behavior and return values.
+    fn poll_produce(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: crate::StoreContextMut<D>,
+        finish: bool,
+    ) -> Poll<Result<Option<Val>>>;
+}
+
+/// Represents the host-owned read end of a type-erased future.
+pub trait FutureAnyConsumer<D>: Send + 'static {
+    /// Handle a host- or guest-initiated write by consuming a value.
+    ///
+    /// This is the type-erased version of [`futures_and_streams::FutureConsumer`],
+    /// using [`Val`] instead of a generic `Item` type.
+    ///
+    /// See [`futures_and_streams::FutureConsumer::poll_consume`] for detailed
+    /// documentation on the behavior and return values.
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: crate::StoreContextMut<D>,
+        source: Source<'_, Val>,
+        finish: bool,
+    ) -> Poll<Result<()>>;
+}
+
+impl<D> StreamAnyProducer<D> for core::iter::Empty<Val> {
+    type Buffer = Option<Val>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: crate::StoreContextMut<'a, D>,
+        _: Destination<'a, Val, Self::Buffer>,
+        _: bool,
+    ) -> Poll<Result<StreamResult>> {
+        Poll::Ready(Ok(StreamResult::Dropped))
+    }
+}
+
+impl<D> StreamAnyProducer<D> for futures::stream::Empty<Val> {
+    type Buffer = Option<Val>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: crate::StoreContextMut<'a, D>,
+        _: Destination<'a, Val, Self::Buffer>,
+        _: bool,
+    ) -> Poll<Result<StreamResult>> {
+        Poll::Ready(Ok(StreamResult::Dropped))
+    }
+}
+
+impl<D> StreamAnyProducer<D> for Vec<Val> {
+    type Buffer = futures_and_streams::VecBuffer<Val>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: crate::StoreContextMut<'a, D>,
+        mut dst: Destination<'a, Val, Self::Buffer>,
+        _: bool,
+    ) -> Poll<Result<StreamResult>> {
+        dst.set_buffer(std::mem::take(self.get_mut()).into());
+        Poll::Ready(Ok(StreamResult::Dropped))
+    }
+}
+
+impl<D> StreamAnyProducer<D> for Box<[Val]> {
+    type Buffer = futures_and_streams::VecBuffer<Val>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: crate::StoreContextMut<'a, D>,
+        mut dst: Destination<'a, Val, Self::Buffer>,
+        _: bool,
+    ) -> Poll<Result<StreamResult>> {
+        dst.set_buffer(std::mem::take(self.get_mut()).into_vec().into());
+        Poll::Ready(Ok(StreamResult::Dropped))
+    }
+}
+
+impl<E, D, Fut> FutureAnyProducer<D> for Fut
+where
+    E: Into<crate::Error>,
+    Fut: core::future::Future<Output = Result<Val, E>> + ?Sized + Send + 'static,
+{
+    fn poll_produce(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: crate::StoreContextMut<D>,
+        finish: bool,
+    ) -> Poll<Result<Option<Val>>> {
+        match self.poll(cx) {
+            Poll::Ready(Ok(v)) => Poll::Ready(Ok(Some(v))),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
+            Poll::Pending if finish => Poll::Ready(Ok(None)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

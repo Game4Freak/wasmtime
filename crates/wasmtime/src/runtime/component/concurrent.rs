@@ -94,7 +94,10 @@ use wasmtime_environ::packed_option::ReservedValue;
 use wasmtime_environ::{NUM_COMPONENT_CONTEXT_SLOTS, Trap};
 
 pub use abort::JoinHandle;
-pub use future_stream_any::{FutureAny, StreamAny};
+pub use future_stream_any::{
+    FutureAny, FutureAnyConsumer, FutureAnyProducer, StreamAny, StreamAnyConsumer,
+    StreamAnyProducer,
+};
 pub use futures_and_streams::{
     Destination, DirectDestination, DirectSource, ErrorContext, FutureConsumer, FutureProducer,
     FutureReader, GuardedFutureReader, GuardedStreamReader, ReadBuffer, Source, StreamConsumer,
