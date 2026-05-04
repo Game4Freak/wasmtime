@@ -187,14 +187,14 @@ impl FutureAny {
             .as_context_mut()
             .new_transmit_val(TransmitKind::Future, Producer(producer))?;
         // For host-originating Val futures, we use a dummy type since Val is type-erased
-        let ty = PayloadType::new_host::<()>();
+        let ty = PayloadType::new_host_val();
         Ok(FutureAny { id, ty })
     }
 
     pub(super) fn new_(id: TableId<TransmitHandle>) -> Self {
         Self {
             id,
-            ty: PayloadType::new_host::<()>(),
+            ty: PayloadType::new_host_val(),
         }
     }
 
@@ -445,14 +445,14 @@ impl StreamAny {
             .as_context_mut()
             .new_transmit_val(TransmitKind::Stream, producer)?;
         // For host-originating Val streams, we use a dummy type since Val is type-erased
-        let ty = PayloadType::new_host::<()>();
+        let ty = PayloadType::new_host_val();
         Ok(StreamAny { id, ty })
     }
 
     pub(super) fn new_(id: TableId<TransmitHandle>) -> Self {
         Self {
             id,
-            ty: PayloadType::new_host::<()>(),
+            ty: PayloadType::new_host_val(),
         }
     }
 
@@ -605,6 +605,13 @@ impl<T> PayloadType<T> {
         PayloadType::Host {
             typecheck: types::typecheck_payload::<P>,
             id: TypeId::of::<P>(),
+        }
+    }
+
+    fn new_host_val() -> Self {
+        PayloadType::Host {
+            typecheck: |_, _| Ok(()),
+            id: TypeId::of::<Val>(),
         }
     }
 
