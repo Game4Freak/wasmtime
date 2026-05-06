@@ -17,19 +17,19 @@ interface many {
   }
 
   foo: async func(a: string,
-            b: u32,
-            c: list<u8>,
-            d: tuple<u64, u64>,
-            e: stuff,
-            f: option<stuff>,
-            g: result<stuff>)
-    -> tuple<string,
-             u32,
-             list<u8>,
-             tuple<u64, u64>,
-             stuff,
-             option<stuff>,
-             result<stuff>>;
+  b: u32,
+  c: list<u8>,
+  d: tuple<u64, u64>,
+  e: stuff,
+  f: option<stuff>,
+  g: result<stuff>)
+  -> tuple<string, 
+  u32,
+  list<u8>,
+  tuple<u64, u64>,
+  stuff,
+  option<stuff>,
+  result<stuff>>;
 }
 
 world round-trip-many {
@@ -76,9 +76,9 @@ interface transmit {
   }
 
   exchange: async func(control: stream<control>,
-                 caller-stream: stream<string>,
-                 caller-future1: future<string>,
-                 caller-future2: future<string>) -> tuple<stream<string>, future<string>, future<string>>;
+  caller-stream: stream<string>,
+  caller-future1: future<string>,
+  caller-future2: future<string>) -> tuple<stream<string>, future<string>, future<string>>;
 }
 
 interface post-return {
@@ -181,6 +181,10 @@ interface yield-post-return {
 
 interface closed-stream {
   get: func() -> stream<u8>;
+}
+
+interface count-stream {
+  get: async func(count: u32) -> stream<u32>;
 }
 
 interface short-reads {
@@ -363,4 +367,8 @@ world closed-stream-guest {
 
 world short-reads-guest {
   export short-reads;
+}
+
+world count-stream-guest {
+  export count-stream;
 }

@@ -2,7 +2,10 @@ use {
     super::util::{config, make_component},
     component_async_tests::{
         Ctx, closed_streams,
-        util::{OneshotConsumer, OneshotProducer, PipeConsumer, PipeProducer, yield_times},
+        util::{
+            OneshotConsumer, OneshotProducer, PipeAnyConsumer, PipeConsumer, PipeProducer,
+            yield_times,
+        },
     },
     futures::{
         FutureExt, Sink, SinkExt, Stream, StreamExt,
@@ -473,6 +476,60 @@ async fn test_async_short_reads(delay: bool) -> Result<()> {
 
 // ------------ VAL ----------------
 
+#[tokio::test]
+pub async fn async_closed_stream_val() -> Result<()> {
+    let engine = Engine::new(&config())?;
+
+    let component = make_component(
+        &engine,
+        &[test_programs_artifacts::ASYNC_CLOSED_STREAM_COMPONENT],
+    )
+    .await?;
+
+    let mut linker = Linker::new(&engine);
+
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+
+    let mut store = Store::new(
+        &engine,
+        Ctx {
+            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+            table: ResourceTable::default(),
+            continue_: false,
+        },
+    );
+
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let closed_stream_instance_idx = instance
+        .get_export_index(&mut store, None, "local:local/closed-stream")
+        .unwrap();
+    let closed_stream_get_idx = instance
+        .get_export_index(&mut store, Some(&closed_stream_instance_idx), "get")
+        .unwrap();
+    let closed_stream_get = instance
+        .get_func(&mut store, closed_stream_get_idx)
+        .unwrap();
+
+    store
+        .run_concurrent(async move |accessor| {
+            let mut results = vec![Val::Bool(false)];
+            closed_stream_get
+                .call_concurrent(accessor, &vec![], &mut results)
+                .await?;
+            let stream = match results.into_iter().next().unwrap() {
+                Val::Stream(stream) => stream,
+                _ => panic!("expected stream"),
+            };
+
+            let (tx, mut rx) = mpsc::channel(1);
+            accessor.with(move |store| stream.pipe(store, PipeAnyConsumer::new(tx)))?;
+            assert!(rx.next().await.is_none());
+
+            Ok(())
+        })
+        .await?
+}
+
 struct VecAnyProducer {
     source: Vec<Val>,
     maybe_yield: Pin<Box<dyn Future<Output = ()> + Send>>,
@@ -669,4 +726,125 @@ async fn test_async_short_reads_val(delay: bool) -> Result<()> {
             wasmtime::error::Ok(())
         })
         .await?
+}
+
+mod count_stream {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "count-stream-guest",
+        exports: { default: async },
+    });
+}
+
+#[tokio::test]
+pub async fn async_count_stream() -> Result<()> {
+    let config = config();
+
+    let engine = Engine::new(&config)?;
+
+    let component = make_component(
+        &engine,
+        &[test_programs_artifacts::ASYNC_COUNT_STREAM_COMPONENT],
+    )
+    .await?;
+
+    let mut linker = Linker::new(&engine);
+
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+
+    let mut store = Store::new(
+        &engine,
+        Ctx {
+            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+            table: ResourceTable::default(),
+            continue_: false,
+        },
+    );
+
+    let guest =
+        count_stream::CountStreamGuest::instantiate_async(&mut store, &component, &linker).await?;
+
+    // Start `count` concurrent calls and then join them all:
+    store
+        .run_concurrent(async |store| {
+            let count = 4;
+
+            let stream = guest
+                .local_local_count_stream()
+                .call_get(store, count)
+                .await?;
+
+            let (tx, mut rx) = mpsc::channel(1);
+            store.with(|store| stream.pipe(store, PipeConsumer::new(tx)))?;
+
+            for c in 1..count {
+                assert_eq!(rx.next().await, Some(c));
+            }
+
+            wasmtime::error::Ok(())
+        })
+        .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+pub async fn async_count_stream_val() -> Result<()> {
+    let config = config();
+
+    let engine = Engine::new(&config)?;
+
+    let component = make_component(
+        &engine,
+        &[test_programs_artifacts::ASYNC_COUNT_STREAM_COMPONENT],
+    )
+    .await?;
+
+    let mut linker = Linker::new(&engine);
+
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+
+    let mut store = Store::new(
+        &engine,
+        Ctx {
+            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+            table: ResourceTable::default(),
+            continue_: false,
+        },
+    );
+
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let count_stream_instance_idx = instance
+        .get_export_index(&mut store, None, "local:local/count-stream")
+        .unwrap();
+    let get_idx = instance
+        .get_export_index(&mut store, Some(&count_stream_instance_idx), "get")
+        .unwrap();
+    let get = instance.get_func(&mut store, get_idx).unwrap();
+
+    // Start `count` concurrent calls and then join them all:
+    store
+        .run_concurrent(async |store| {
+            let count = 4;
+
+            let mut results = vec![Val::Bool(false)];
+            get.call_concurrent(store, &vec![Val::U32(count)], &mut results)
+                .await?;
+            let stream = match results.into_iter().next().unwrap() {
+                Val::Stream(stream) => stream,
+                _ => panic!("expected stream"),
+            };
+
+            let (tx, mut rx) = mpsc::channel(1);
+            store.with(|store| stream.pipe(store, PipeAnyConsumer::new(tx)))?;
+
+            for c in 1..count {
+                assert_eq!(rx.next().await, Some(Val::U32(c)));
+            }
+
+            wasmtime::error::Ok(())
+        })
+        .await??;
+
+    Ok(())
 }

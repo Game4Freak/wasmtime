@@ -1059,32 +1059,46 @@ impl<'a> Source<'a, Val> {
             };
 
             let cx = &mut LiftContext::new(store.0.store_opaque_mut(), options, instance);
-            let ty = ty.payload(cx.types).unwrap();
+            let ty = ty.payload(cx.types);
             let old_remaining = buffer.remaining_capacity();
+            /*if let Some(ty) = ty.payload(cx.types) {
+                // Load Val values from memory
+                let abi = cx.types.canonical_abi(ty);
+                let size32 = usize::try_from(abi.size32).unwrap();
+                let align32 = usize::try_from(abi.align32).unwrap();
 
-            // Load Val values from memory
-            let abi = cx.types.canonical_abi(ty);
-            let size32 = usize::try_from(abi.size32).unwrap();
-            let align32 = usize::try_from(abi.align32).unwrap();
+                let start_address = address + (size32 * guest_offset.as_usize());
+                let items_to_read =
+                    (count.as_usize() - guest_offset.as_usize()).min(buffer.remaining_capacity());
 
-            let start_address = address + (size32 * guest_offset.as_usize());
-            let items_to_read =
-                (count.as_usize() - guest_offset.as_usize()).min(buffer.remaining_capacity());
+                if start_address % align32 != 0 {
+                    bail!("read pointer not aligned");
+                }
 
-            if start_address % align32 != 0 {
-                bail!("read pointer not aligned");
-            }
+                let memory = cx.memory();
+                let bytes = memory
+                    .get(start_address..)
+                    .and_then(|b| b.get(..size32 * items_to_read))
+                    .ok_or_else(|| crate::format_err!("read pointer out of bounds of memory"))?;
 
-            let memory = cx.memory();
-            let bytes = memory
-                .get(start_address..)
-                .and_then(|b| b.get(..size32 * items_to_read))
-                .ok_or_else(|| crate::format_err!("read pointer out of bounds of memory"))?;
-
-            for i in 0..items_to_read {
-                let item_bytes = &bytes[i * size32..(i + 1) * size32];
-                let val = Val::load(cx, *ty, item_bytes)?;
-                buffer.extend(std::iter::once(val));
+                for i in 0..items_to_read {
+                    let item_bytes = &bytes[i * size32..(i + 1) * size32];
+                    let val = Val::load(cx, *ty, item_bytes)?;
+                    buffer.extend(std::iter::once(val));
+                }
+            }*/
+            if let Some(ty) = ty.copied() {
+                let abi = cx.types.canonical_abi(&ty);
+                let size32 = usize::try_from(abi.size32)?;
+                lift_val::<B>(
+                    cx,
+                    ty,
+                    buffer,
+                    address + (size32 * guest_offset.as_usize()),
+                    count.as_usize() - guest_offset.as_usize(),
+                )?;
+            } else {
+                buffer.extend(std::iter::once(Val::Tuple(vec![])));
             }
 
             let transmit = store.0.concurrent_state_mut().get_mut(self.id)?;
