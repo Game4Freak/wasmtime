@@ -4,7 +4,10 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use wasmtime::Result;
+use wasmtime::{
+    Result,
+    component::{FutureAnyConsumer, FutureAnyProducer, StreamAnyConsumer, StreamAnyProducer, Val},
+};
 use wasmtime::{
     StoreContextMut,
     component::{
@@ -157,6 +160,140 @@ impl<D, T: Lift + Send + 'static> FutureConsumer<D> for OneshotConsumer<T> {
     ) -> Poll<Result<()>> {
         let value = &mut None;
         source.read(store, value)?;
+        _ = self.get_mut().0.take().unwrap().send(value.take().unwrap());
+        Poll::Ready(Ok(()))
+    }
+}
+
+pub struct PipeAnyProducer<S>(S);
+
+impl<S> PipeAnyProducer<S> {
+    pub fn new(rx: S) -> Self {
+        Self(rx)
+    }
+}
+
+impl<D, S: Stream<Item = Val> + Send + 'static> StreamAnyProducer<D> for PipeAnyProducer<S> {
+    type Buffer = Option<Val>;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: StoreContextMut<D>,
+        mut destination: Destination<'a, Val, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<Result<StreamResult>> {
+        // SAFETY: This is a standard pin-projection, and we never move
+        // out of `self`.
+        let stream = unsafe { self.map_unchecked_mut(|v| &mut v.0) };
+
+        match stream.poll_next(cx) {
+            Poll::Pending => {
+                if finish {
+                    Poll::Ready(Ok(StreamResult::Cancelled))
+                } else {
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(Some(item)) => {
+                destination.set_buffer(Some(item));
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
+        }
+    }
+}
+
+pub struct PipeAnyConsumer<S>(S, PhantomData<fn() -> Val>);
+
+impl<S> PipeAnyConsumer<S> {
+    pub fn new(tx: S) -> Self {
+        Self(tx, PhantomData)
+    }
+}
+
+impl<D, S: Sink<Val, Error: std::error::Error + Send + Sync> + Send + 'static> StreamAnyConsumer<D>
+    for PipeAnyConsumer<S>
+{
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        mut source: Source<Val>,
+        finish: bool,
+    ) -> Poll<Result<StreamResult>> {
+        // SAFETY: This is a standard pin-projection, and we never move
+        // out of `self`.
+        let mut sink = unsafe { self.map_unchecked_mut(|v| &mut v.0) };
+
+        let on_pending = || {
+            if finish {
+                Poll::Ready(Ok(StreamResult::Cancelled))
+            } else {
+                Poll::Pending
+            }
+        };
+
+        match sink.as_mut().poll_flush(cx) {
+            Poll::Pending => on_pending(),
+            Poll::Ready(result) => {
+                result?;
+                match sink.as_mut().poll_ready(cx) {
+                    Poll::Pending => on_pending(),
+                    Poll::Ready(result) => {
+                        result?;
+                        let item = &mut None;
+                        source.read_val(store, item)?;
+                        sink.start_send(item.take().unwrap())?;
+                        Poll::Ready(Ok(StreamResult::Completed))
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct OneshotAnyProducer(oneshot::Receiver<Val>);
+
+impl OneshotAnyProducer {
+    pub fn new(rx: oneshot::Receiver<Val>) -> Self {
+        Self(rx)
+    }
+}
+
+impl<D> FutureAnyProducer<D> for OneshotAnyProducer {
+    fn poll_produce(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: StoreContextMut<D>,
+        finish: bool,
+    ) -> Poll<Result<Option<Val>>> {
+        match Pin::new(&mut self.get_mut().0).poll(cx) {
+            Poll::Pending if finish => Poll::Ready(Ok(None)),
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => Poll::Ready(Ok(Some(result?))),
+        }
+    }
+}
+
+pub struct OneshotAnyConsumer(Option<oneshot::Sender<Val>>);
+
+impl OneshotAnyConsumer {
+    pub fn new(tx: oneshot::Sender<Val>) -> Self {
+        Self(Some(tx))
+    }
+}
+
+impl<D> FutureAnyConsumer<D> for OneshotAnyConsumer {
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        mut source: Source<'_, Val>,
+        _: bool,
+    ) -> Poll<Result<()>> {
+        let value = &mut None;
+        source.read_val(store, value)?;
         _ = self.get_mut().0.take().unwrap().send(value.take().unwrap());
         Poll::Ready(Ok(()))
     }

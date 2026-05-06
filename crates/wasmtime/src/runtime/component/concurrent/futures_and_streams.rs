@@ -289,6 +289,49 @@ fn lower<T: func::Lower + Send + 'static, B: WriteBuffer<T>, U: 'static>(
     Ok(())
 }
 
+fn lower_val<B: WriteBuffer<Val>, U: 'static>(
+    mut store: StoreContextMut<U>,
+    instance: Instance,
+    caller_thread: QualifiedThreadId,
+    options: OptionsIndex,
+    ty: TransmitIndex,
+    address: usize,
+    count: usize,
+    buffer: &mut B,
+) -> Result<()> {
+    let count = buffer.remaining().len().min(count);
+
+    // If lowering may call realloc in the guest, then the guest may need
+    // to access its thread context, so we need to set the current thread before lowering
+    // and restore the old one afterward.
+    let old_thread = store.0.set_thread(caller_thread)?;
+    let lower = &mut LowerContext::new(store.as_context_mut(), options, instance);
+
+    if let Some(ty) = ty.payload(lower.types) {
+        let abi = lower.types.canonical_abi(ty);
+
+        if address % usize::try_from(abi.align32)? != 0 {
+            bail!("read pointer not aligned");
+        }
+        let size32 = usize::try_from(abi.size32)?;
+        lower
+            .as_slice_mut()
+            .get_mut(address..)
+            .and_then(|b| b.get_mut(..size32 * count))
+            .ok_or_else(|| crate::format_err!("read pointer out of bounds of memory"))?;
+
+        for (num, val) in buffer.remaining()[..count].iter().enumerate() {
+            val.store(lower, *ty, address + num * size32)?;
+        }
+    }
+
+    store.0.set_thread(old_thread)?;
+
+    buffer.skip(count);
+
+    Ok(())
+}
+
 fn lift<T: func::Lift + Send + 'static, B: ReadBuffer<T>>(
     lift: &mut LiftContext<'_>,
     ty: Option<InterfaceType>,
@@ -320,6 +363,34 @@ fn lift<T: func::Lift + Send + 'static, B: ReadBuffer<T>>(
         let list = &WasmList::new(address, count, lift, ty)?;
         T::linear_lift_into_from_memory(lift, list, &mut Extender(buffer))?
     }
+    Ok(())
+}
+
+fn lift_val<B: ReadBuffer<Val>>(
+    lift: &mut LiftContext<'_>,
+    ty: InterfaceType,
+    buffer: &mut B,
+    address: usize,
+    count: usize,
+) -> Result<()> {
+    let count = count.min(buffer.remaining_capacity());
+
+    let abi = lift.types.canonical_abi(&ty);
+    if address % usize::try_from(abi.align32)? != 0 {
+        bail!("write pointer not aligned");
+    }
+    let size32 = usize::try_from(abi.size32)?;
+    let memory = lift
+        .memory()
+        .get(address..)
+        .and_then(|b| b.get(..size32 * count))
+        .ok_or_else(|| crate::format_err!("write pointer out of bounds of memory"))?;
+
+    let mut dst = Extender(buffer);
+    for (num, mem) in memory.chunks_exact(size32).enumerate() {
+        dst.extend(Val::load(lift, ty, mem));
+    }
+
     Ok(())
 }
 
@@ -3613,8 +3684,6 @@ async fn write_val<D: 'static, P: Send + 'static, B: WriteBuffer<crate::componen
     pair: Arc<LockedState<(P, B)>>,
     kind: TransmitKind,
 ) -> Result<()> {
-    // This is a simplified version of write() that works with Val directly
-    // by using Val's existing lower/store methods
     let (read, guest_offset) = tls::get(|store| {
         let transmit = store.concurrent_state_mut().get_mut(id)?;
 
@@ -3631,45 +3700,143 @@ async fn write_val<D: 'static, P: Send + 'static, B: WriteBuffer<crate::componen
     })?;
 
     match read {
-        ReadState::GuestReady { .. } => {
-            // For Val, we need to handle the guest memory case differently
-            // since we can't use the standard lower() helper
-            // This is a placeholder - the actual implementation would need to
-            // handle Val's lowering to guest memory directly
-            bail!("Val write to guest memory not yet implemented")
-        }
-        ReadState::HostToHost { .. } => {
-            // Host-to-host case - just move the buffer
+        ReadState::GuestReady {
+            ty,
+            flat_abi,
+            options,
+            address,
+            count,
+            handle,
+            instance,
+            caller_instance,
+            caller_thread,
+        } => {
+            let guest_offset = match guest_offset {
+                Some(i) => i,
+                None => bail_bug!("guest_offset should be present if ready"),
+            };
+
+            if let TransmitKind::Future = kind {
+                tls::get(|store| {
+                    store.concurrent_state_mut().get_mut(id)?.done = true;
+                    crate::error::Ok(())
+                })?;
+            }
+
             let old_remaining = pair.with(|p| p.1.remaining().len())?;
             let accept = {
                 let pair = pair.clone();
                 move |mut store: StoreContextMut<D>| {
+                    let lower = &mut LowerContext::new(store.as_context_mut(), options, instance);
+                    let ty_ty = match ty.payload(lower.types) {
+                        Some(ty) => ty,
+                        None => bail!("Type is required for val"),
+                    };
+                    let size32 = usize::try_from(lower.types.canonical_abi(ty_ty).size32)?;
+
                     let mut state = pair.take()?;
-                    // For Val, we would need to handle the buffer transfer
-                    // This is simplified for now
+                    lower_val::<B, D>(
+                        store.as_context_mut(),
+                        instance,
+                        caller_thread,
+                        options,
+                        ty,
+                        address + (size32 * guest_offset.as_usize()),
+                        count.as_usize() - guest_offset.as_usize(),
+                        &mut state.1,
+                    )?;
                     crate::error::Ok(())
                 }
             };
-            tls::get(|store| accept(token.as_context_mut(store)))?;
+
+            if guest_offset < count {
+                // For payloads which may require a realloc call, use a
+                // oneshot::channel and background task.  This is
+                // necessary because calling the guest while there are
+                // host embedder frames on the stack is unsound.
+                let (tx, rx) = oneshot::channel();
+                tls::get(move |store| {
+                    store
+                        .concurrent_state_mut()
+                        .push_high_priority(WorkItem::WorkerFunction(AlwaysMut::new(Box::new(
+                            move |store| {
+                                _ = tx.send(accept(token.as_context_mut(store))?);
+                                Ok(())
+                            },
+                        ))))
+                });
+                rx.await?
+            }
+
+            tls::get(|store| {
+                let count = old_remaining - pair.with(|p| p.1.remaining().len())?;
+
+                let transmit = store.concurrent_state_mut().get_mut(id)?;
+
+                let WriteState::HostReady { guest_offset, .. } = &mut transmit.write else {
+                    bail_bug!("expected WriteState::HostReady")
+                };
+
+                guest_offset.inc(count)?;
+
+                transmit.read = ReadState::GuestReady {
+                    ty,
+                    flat_abi,
+                    options,
+                    address,
+                    count: ItemCount::new_usize(count)?,
+                    handle,
+                    instance,
+                    caller_instance,
+                    caller_thread,
+                };
+
+                crate::error::Ok(())
+            })?;
+
+            Ok(())
         }
-        _ => bail_bug!("invalid read state for write"),
+
+        ReadState::HostToHost {
+            accept,
+            mut buffer,
+            limit,
+        } => {
+            let mut state = StreamResult::Completed;
+            let mut position = 0;
+
+            while !matches!(state, StreamResult::Dropped) && position < limit {
+                let mut slice_buffer = SliceBuffer::new(buffer, position, limit);
+                state = accept(&mut UntypedWriteBuffer::new(&mut slice_buffer)).await?;
+                (buffer, position, _) = slice_buffer.into_parts();
+            }
+
+            {
+                let mut pair = pair.take()?;
+                let (_, buffer) = &mut *pair;
+
+                while !(matches!(state, StreamResult::Dropped) || buffer.remaining().is_empty()) {
+                    state = accept(&mut UntypedWriteBuffer::new(buffer)).await?;
+                }
+            }
+
+            tls::get(|store| {
+                store.concurrent_state_mut().get_mut(id)?.read = match state {
+                    StreamResult::Dropped => ReadState::Dropped,
+                    StreamResult::Completed | StreamResult::Cancelled => ReadState::HostToHost {
+                        accept,
+                        buffer,
+                        limit: 0,
+                    },
+                };
+
+                crate::error::Ok(())
+            })?;
+            Ok(())
+        }
+
+        _ => bail_bug!("unexpected read state"),
     }
-
-    tls::get(|store| {
-        let count = pair.with(|p| p.1.remaining().len())?;
-        let transmit = store.concurrent_state_mut().get_mut(id)?;
-
-        let WriteState::HostReady { guest_offset, .. } = &mut transmit.write else {
-            bail_bug!("expected WriteState::HostReady")
-        };
-
-        guest_offset.inc(count)?;
-        transmit.read = read;
-
-        Ok(())
-    })?;
-
-    Ok(())
 }
 
 impl Instance {

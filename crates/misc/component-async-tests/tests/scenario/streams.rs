@@ -19,8 +19,9 @@ use {
     wasmtime::{
         Engine, Result, Store, StoreContextMut,
         component::{
-            Destination, FutureReader, Lift, Linker, ResourceTable, Source, StreamConsumer,
-            StreamProducer, StreamReader, StreamResult, VecBuffer,
+            Destination, FutureReader, Lift, Linker, ResourceTable, Source, StreamAny,
+            StreamAnyConsumer, StreamAnyProducer, StreamConsumer, StreamProducer, StreamReader,
+            StreamResult, Val, VecBuffer,
         },
     },
     wasmtime_wasi::WasiCtxBuilder,
@@ -462,6 +463,206 @@ async fn test_async_short_reads(delay: bool) -> Result<()> {
                 &received_strings
                     .iter()
                     .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+            );
+
+            wasmtime::error::Ok(())
+        })
+        .await?
+}
+
+// ------------ VAL ----------------
+
+struct VecAnyProducer {
+    source: Vec<Val>,
+    maybe_yield: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl VecAnyProducer {
+    fn new(source: Vec<Val>, delay: bool) -> Self {
+        Self {
+            source,
+            maybe_yield: if delay {
+                yield_times(5).boxed()
+            } else {
+                async {}.boxed()
+            },
+        }
+    }
+}
+
+impl<D> StreamAnyProducer<D> for VecAnyProducer {
+    type Buffer = VecBuffer<Val>;
+
+    fn poll_produce(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: StoreContextMut<D>,
+        mut destination: Destination<Val, Self::Buffer>,
+        _: bool,
+    ) -> Poll<Result<StreamResult>> {
+        let maybe_yield = &mut self.as_mut().get_mut().maybe_yield;
+        task::ready!(maybe_yield.as_mut().poll(cx));
+        *maybe_yield = async {}.boxed();
+
+        destination.set_buffer(mem::take(&mut self.get_mut().source).into());
+        Poll::Ready(Ok(StreamResult::Dropped))
+    }
+}
+
+struct OneAtATimeAny {
+    destination: Arc<Mutex<Vec<Val>>>,
+    maybe_yield: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl OneAtATimeAny {
+    fn new(destination: Arc<Mutex<Vec<Val>>>, delay: bool) -> Self {
+        Self {
+            destination,
+            maybe_yield: if delay {
+                yield_times(5).boxed()
+            } else {
+                async {}.boxed()
+            },
+        }
+    }
+}
+
+impl<D> StreamAnyConsumer<D> for OneAtATimeAny {
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        mut source: Source<Val>,
+        _: bool,
+    ) -> Poll<Result<StreamResult>> {
+        let maybe_yield = &mut self.as_mut().get_mut().maybe_yield;
+        task::ready!(maybe_yield.as_mut().poll(cx));
+        *maybe_yield = async {}.boxed();
+
+        let value = &mut None;
+        source.read_val(store, value)?;
+        self.destination.lock().unwrap().push(value.take().unwrap());
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
+#[tokio::test]
+pub async fn async_short_reads_val() -> Result<()> {
+    test_async_short_reads_val(false).await
+}
+
+#[tokio::test]
+async fn async_short_reads_val_with_delay() -> Result<()> {
+    test_async_short_reads_val(true).await
+}
+
+async fn test_async_short_reads_val(delay: bool) -> Result<()> {
+    let engine = Engine::new(&config())?;
+
+    let component = make_component(
+        &engine,
+        &[test_programs_artifacts::ASYNC_SHORT_READS_COMPONENT],
+    )
+    .await?;
+
+    let mut linker = Linker::new(&engine);
+
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+
+    let mut store = Store::new(
+        &engine,
+        Ctx {
+            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+            table: ResourceTable::default(),
+            continue_: false,
+        },
+    );
+
+    let guest = linker.instantiate_async(&mut store, &component).await?;
+    let short_reads_instance_idx = guest
+        .get_export_index(&mut store, None, "local:local/short-reads")
+        .unwrap();
+    let thing_constructor_idx = guest
+        .get_export_index(
+            &mut store,
+            Some(&short_reads_instance_idx),
+            "[constructor]thing",
+        )
+        .unwrap();
+    let thing_constructor = guest.get_func(&mut store, thing_constructor_idx).unwrap();
+    let thing_get_idx = guest
+        .get_export_index(
+            &mut store,
+            Some(&short_reads_instance_idx),
+            "[method]thing.get",
+        )
+        .unwrap();
+    let thing_get = guest.get_func(&mut store, thing_get_idx).unwrap();
+
+    let strings = ["a", "b", "c", "d", "e"];
+    let mut things = Vec::with_capacity(strings.len());
+    for string in strings {
+        let mut results = vec![Val::Bool(false)];
+        thing_constructor
+            .call_async(&mut store, &[Val::String(string.to_string())], &mut results)
+            .await?;
+        things.push(results.into_iter().next().unwrap());
+    }
+
+    let short_reads_idx = guest
+        .get_export_index(&mut store, Some(&short_reads_instance_idx), "short-reads")
+        .unwrap();
+    let short_reads = guest.get_func(&mut store, short_reads_idx).unwrap();
+
+    store
+        .run_concurrent(async |store| {
+            let count = things.len();
+            let stream =
+                store.with(|store| StreamAny::new(store, VecAnyProducer::new(things, delay)))?;
+
+            let mut results = vec![Val::Bool(false)];
+            short_reads
+                .call_concurrent(store, &[Val::Stream(stream)], &mut results)
+                .await?;
+            let stream = match results.into_iter().next().unwrap() {
+                Val::Stream(stream) => stream,
+                _ => panic!("expected stream"),
+            };
+
+            let received_things = Arc::new(Mutex::new(Vec::<Val>::with_capacity(count)));
+            // Read just one item at a time from the guest, forcing it to
+            // re-take ownership of any unwritten items.
+            store.with(|store| {
+                stream.pipe(store, OneAtATimeAny::new(received_things.clone(), delay))
+            })?;
+
+            for i in 0.. {
+                assert!(i < 1000);
+                if count == received_things.lock().unwrap().len() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+
+            let mut received_strings = Vec::with_capacity(strings.len());
+            let received_things = mem::take(received_things.lock().unwrap().deref_mut());
+            for it in received_things {
+                let mut results = vec![Val::Bool(false)];
+                thing_get
+                    .call_concurrent(store, &[it], &mut results)
+                    .await?;
+                received_strings.push(results.into_iter().next().unwrap());
+            }
+
+            assert_eq!(
+                &strings[..],
+                &received_strings
+                    .iter()
+                    .map(|s| match s {
+                        Val::String(s) => s.as_str(),
+                        _ => panic!("expected string"),
+                    })
                     .collect::<Vec<_>>()
             );
 
