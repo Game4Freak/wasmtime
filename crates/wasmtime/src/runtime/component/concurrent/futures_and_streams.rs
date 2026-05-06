@@ -3030,7 +3030,7 @@ impl<T> StoreContextMut<'_, T> {
                                             || host_offset > 0
                                         {
                                             bail!(
-                                                "StreamProducer::poll_produce returned Poll::Pending \
+                                                "StreamAnyProducer::poll_produce returned Poll::Pending \
                                                  after producing at least one item"
                                             )
                                         }
@@ -3071,7 +3071,7 @@ impl<T> StoreContextMut<'_, T> {
                                 && host_offset == 0
                             {
                                 bail!(
-                                    "StreamProducer::poll_produce returned StreamResult::Completed \
+                                    "StreamAnyProducer::poll_produce returned StreamResult::Completed \
                                      without producing any items"
                                 );
                             }
@@ -3079,7 +3079,7 @@ impl<T> StoreContextMut<'_, T> {
                         StreamResult::Cancelled => {
                             if !cancelled {
                                 bail!(
-                                    "StreamProducer::poll_produce returned StreamResult::Cancelled \
+                                    "StreamAnyProducer::poll_produce returned StreamResult::Cancelled \
                                      without being given a `finish` parameter value of true"
                                 );
                             }
@@ -3414,7 +3414,7 @@ impl<T> StoreContextMut<'_, T> {
                                 .unwrap_or(false)
                         {
                             bail!(
-                                "StreamConsumer::poll_consume returned StreamResult::Completed \
+                                "StreamAnyConsumer::poll_consume returned StreamResult::Completed \
                                  without consuming any items"
                             );
                         }
@@ -3429,7 +3429,7 @@ impl<T> StoreContextMut<'_, T> {
                     StreamResult::Cancelled => {
                         if !cancelled {
                             bail!(
-                                "StreamConsumer::poll_consume returned StreamResult::Cancelled \
+                                "StreamAnyConsumer::poll_consume returned StreamResult::Cancelled \
                                  without being given a `finish` parameter value of true"
                             );
                         }

@@ -777,7 +777,7 @@ pub async fn async_count_stream() -> Result<()> {
             let (tx, mut rx) = mpsc::channel(1);
             store.with(|store| stream.pipe(store, PipeConsumer::new(tx)))?;
 
-            for c in 1..count {
+            for c in 0..count {
                 assert_eq!(rx.next().await, Some(c));
             }
 
@@ -786,6 +786,23 @@ pub async fn async_count_stream() -> Result<()> {
         .await??;
 
     Ok(())
+}
+
+pub struct StreamLog {}
+
+impl<T> StreamAnyConsumer<T> for StreamLog {
+    fn poll_consume(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        mut store: StoreContextMut<T>,
+        mut source: wasmtime::component::Source<'_, Val>,
+        finish: bool,
+    ) -> std::task::Poll<Result<wasmtime::component::StreamResult>> {
+        let mut buffer = Option::None;
+        source.read_val(&mut store, &mut buffer)?;
+        println!("Consumed val: {:?}", buffer);
+        std::task::Poll::Ready(Ok(wasmtime::component::StreamResult::Completed))
+    }
 }
 
 #[tokio::test]
@@ -838,7 +855,7 @@ pub async fn async_count_stream_val() -> Result<()> {
             let (tx, mut rx) = mpsc::channel(1);
             store.with(|store| stream.pipe(store, PipeAnyConsumer::new(tx)))?;
 
-            for c in 1..count {
+            for c in 0..count {
                 assert_eq!(rx.next().await, Some(Val::U32(c)));
             }
 
