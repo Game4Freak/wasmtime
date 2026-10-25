@@ -35,11 +35,16 @@ For explanations of what each tier means see below.
 | WebAssembly Proposal | [`reference-types`]                        |
 | WebAssembly Proposal | [`simd`]                                   |
 | WebAssembly Proposal | [`component-model`]                        |
+| WebAssembly Proposal | [`component-model-async`]                  |
 | WebAssembly Proposal | [`relaxed-simd`]                           |
 | WebAssembly Proposal | [`multi-memory`]                           |
 | WebAssembly Proposal | [`tail-call`]                              |
 | WebAssembly Proposal | [`extended-const`]                         |
 | WebAssembly Proposal | [`memory64`]                               |
+| WebAssembly Proposal | [`function-references`]                    |
+| WebAssembly Proposal | [`gc`]                                     |
+| WebAssembly Proposal | [`exception-handling`]                     |
+| WebAssembly Proposal | [`wide-arithmetic`]                        |
 | WASI Proposal        | [`wasi-io`]                                |
 | WASI Proposal        | [`wasi-clocks`]                            |
 | WASI Proposal        | [`wasi-filesystem`]                        |
@@ -58,6 +63,9 @@ For explanations of what each tier means see below.
 [`bulk-memory`]: https://github.com/WebAssembly/bulk-memory-operations/blob/master/proposals/bulk-memory-operations/Overview.md
 [`extended-const`]: https://github.com/WebAssembly/extended-const
 [`reference-types`]: https://github.com/WebAssembly/reference-types/blob/master/proposals/reference-types/Overview.md
+[`memory64`]: https://github.com/WebAssembly/memory64/blob/master/proposals/memory64/Overview.md
+[`function-references`]: https://github.com/WebAssembly/function-references/blob/main/proposals/function-references/Overview.md
+[`gc`]: https://github.com/WebAssembly/gc
 [`simd`]: https://github.com/WebAssembly/simd/blob/master/proposals/simd/SIMD.md
 [`wasi-clocks`]: https://github.com/WebAssembly/wasi-clocks
 [`wasi-filesystem`]: https://github.com/WebAssembly/wasi-filesystem
@@ -66,10 +74,13 @@ For explanations of what each tier means see below.
 [`wasi-sockets`]: https://github.com/WebAssembly/wasi-sockets
 [`wasi-http`]: https://github.com/WebAssembly/wasi-http
 [`tail-call`]: https://github.com/WebAssembly/tail-call/blob/main/proposals/tail-call/Overview.md
+[`exception-handling`]: https://github.com/WebAssembly/exception-handling
 
 [^support]: Compiler support is further broken down [below](#compiler-support)
   into finer-grained target/wasm proposal combinations. Compilers are not
-  required to support the full matrix of all tier 1 targets/proposals.
+  required to support the full matrix of all tier 1 targets/proposals, and not
+  all wasm proposals which have support in a compiler are mature enough to be
+  enabled by default and therefore supported as tier 1.
 
 #### Tier 2
 
@@ -81,23 +92,17 @@ For explanations of what each tier means see below.
 | Target               | `x86_64-pc-windows-gnu`    | Clear owner of the target   |
 | Target               | Support for `#![no_std]`   | Support beyond CI checks    |
 | WebAssembly Proposal | [`custom-page-sizes`]      | Unstable wasm proposal      |
-| WebAssembly Proposal | [`exception-handling`]     | fuzzing, dependence on GC   |
-| WebAssembly Proposal | [`function-references`]    | production quality          |
-| WebAssembly Proposal | [`gc`]                     | production quality          |
 | WebAssembly Proposal | [`threads`]                | fuzzing, API quality        |
-| WebAssembly Proposal | [`wide-arithmetic`]        | Unstable wasm proposal      |
 | Execution Backend    | Pulley                     | More time fuzzing/baking    |
 | Embedding API        | C++                        | Full-time maintainer        |
 
-[`memory64`]: https://github.com/WebAssembly/memory64/blob/master/proposals/memory64/Overview.md
 [`custom-page-sizes`]: https://github.com/WebAssembly/custom-page-sizes
 [`multi-memory`]: https://github.com/WebAssembly/multi-memory/blob/master/proposals/multi-memory/Overview.md
 [`threads`]: https://github.com/WebAssembly/threads
 [`component-model`]: https://github.com/WebAssembly/component-model/blob/main/design/mvp/Explainer.md
+[`component-model-async`]: https://github.com/WebAssembly/component-model/blob/main/design/mvp/Concurrency.md
 [`relaxed-simd`]: https://github.com/WebAssembly/relaxed-simd/blob/main/proposals/relaxed-simd/Overview.md
-[`function-references`]: https://github.com/WebAssembly/function-references/blob/main/proposals/function-references/Overview.md
 [`wide-arithmetic`]: https://github.com/WebAssembly/wide-arithmetic/blob/main/proposals/wide-arithmetic/Overview.md
-[`exception-handling`]: https://github.com/WebAssembly/exception-handling
 [`stack-switching`]: https://github.com/WebAssembly/stack-switching
 
 #### Tier 3
@@ -133,7 +138,6 @@ For explanations of what each tier means see below.
 [`wasi-config`]: https://github.com/WebAssembly/wasi-config
 [`wasi-keyvalue`]: https://github.com/WebAssembly/wasi-keyvalue
 [`wasi-tls`]: https://github.com/WebAssembly/wasi-tls
-[`gc`]: https://github.com/WebAssembly/gc
 
 [^1]: This is intended to encompass features that Cranelift supports as a
 general-purpose code generator such as integer value types other than `i32` and
@@ -203,8 +207,9 @@ refined in the below table in their support for various architectures and
 WebAssembly features. Tier 1 WebAssembly feature are required to be supported by
 at least one compiler on all Tier 1 targets, and similarly for Tier 2 features
 and so on.  Note that architecture here is independent of OS, meaning that
-support is uniform across Wasmtime's supported target for each tier. The legend
-here is:
+support is uniform across Wasmtime's supported target for each tier.  Not all
+wasm proposals which have support in a compiler are mature enough to be enabled
+by default and therefore supported as tier 1.  The legend here is:
 
 * ✅ - fully supported
 * 🚧 - work-in-progress
@@ -222,17 +227,18 @@ here is:
 | [`reference-types`]                     | ✅        | ❌[^a] |
 | [`simd`]                                | ✅        | ✅     |
 | [`component-model`]                     | ✅        | ✅     |
+| [`component-model-async`]               | ✅        | ✅     |
 | [`relaxed-simd`]                        | ✅        | ❌     |
 | [`multi-memory`]                        | ✅        | ✅     |
 | [`threads`]                             | ✅        | ✅     |
-| [`tail-call`]                           | ✅        | ❌     |
+| [`tail-call`]                           | ✅        | ✅     |
 | [`extended-const`]                      | ✅        | ✅     |
 | [`memory64`]                            | ✅        | ✅     |
 | [`function-references`]                 | ✅        | ❌     |
 | [`gc`]                                  | ✅        | ❌     |
 | [`wide-arithmetic`]                     | ✅        | ✅     |
 | [`custom-page-sizes`]                   | ✅        | ✅     |
-| [`exception-handling`]                  | ✅        | ❌     |
+| [`exception-handling`]                  | ✅        | ✅     |
 | [`stack-switching`]                     | 🚧        | ❌     |
 
 ##### aarch64
@@ -245,19 +251,20 @@ here is:
 | [`multi-value`]                         | ✅        | ✅        |
 | [`bulk-memory`]                         | ✅        | ✅        |
 | [`reference-types`]                     | ✅        | ❌[^a]    |
-| [`simd`]                                | ✅        | ❌        |
+| [`simd`]                                | ✅        | ✅        |
 | [`component-model`]                     | ✅        | ✅        |
+| [`component-model-async`]               | ✅        | ✅        |
 | [`relaxed-simd`]                        | ✅        | ❌        |
 | [`multi-memory`]                        | ✅        | ✅        |
 | [`threads`]                             | ✅        | ❌        |
-| [`tail-call`]                           | ✅        | ❌        |
+| [`tail-call`]                           | ✅        | ✅        |
 | [`extended-const`]                      | ✅        | ✅        |
 | [`memory64`]                            | ✅        | ✅        |
 | [`function-references`]                 | ✅        | ❌        |
 | [`gc`]                                  | ✅        | ❌        |
 | [`wide-arithmetic`]                     | ✅        | ❌        |
 | [`custom-page-sizes`]                   | ✅        | ✅        |
-| [`exception-handling`]                  | ✅        | ❌        |
+| [`exception-handling`]                  | ✅        | ✅        |
 | [`stack-switching`]                     | ❌        | ❌        |
 
 ##### s390x
@@ -272,6 +279,7 @@ here is:
 | [`reference-types`]                     | ✅        | ❌[^a] |
 | [`simd`]                                | ✅        | ❌     |
 | [`component-model`]                     | ✅        | ❌     |
+| [`component-model-async`]               | ✅        | ❌     |
 | [`relaxed-simd`]                        | ✅        | ❌     |
 | [`multi-memory`]                        | ✅        | ❌     |
 | [`threads`]                             | ✅        | ❌     |
@@ -295,9 +303,10 @@ here is:
 | [`multi-value`]                         | ✅        | ❌     |
 | [`bulk-memory`]                         | ✅        | ❌     |
 | [`reference-types`]                     | ✅        | ❌[^a] |
-| [`simd`]                                | ✅        | ❌     |
+| [`simd`]                                | ✅[^d]    | ❌     |
 | [`component-model`]                     | ✅        | ❌     |
-| [`relaxed-simd`]                        | ✅        | ❌     |
+| [`component-model-async`]               | ✅        | ❌     |
+| [`relaxed-simd`]                        | ✅[^d]    | ❌     |
 | [`multi-memory`]                        | ✅        | ❌     |
 | [`threads`]                             | ✅        | ❌     |
 | [`tail-call`]                           | ✅        | ❌     |
@@ -327,6 +336,7 @@ emitting Pulley bytecode.
 | [`reference-types`]                     | ✅        | ❌[^a] |
 | [`simd`]                                | ✅        | ❌     |
 | [`component-model`]                     | ✅        | ❌     |
+| [`component-model-async`]               | ✅        | ❌     |
 | [`relaxed-simd`]                        | ✅        | ❌     |
 | [`multi-memory`]                        | ✅        | ❌     |
 | [`threads`]                             | ❌[^b]    | ❌     |
@@ -340,13 +350,17 @@ emitting Pulley bytecode.
 | [`exception-handling`]                  | ✅        | ❌     |
 | [`stack-switching`]                     | ❌        | ❌     |
 
-[^a]: Winch supports some features of the [`reference-types`] proposal such as
-  the change to support multiple tables and LEB-encoding table indices in
-  instructions, but it does not support GC types such as `externref` or the
-  new table opcodes in the [`reference-types`] proposal.
+[^a]: Winch supports GC reference values such as `externref` through parameters,
+  results, locals, globals, and calls, including the required stack maps and
+  collector barriers. It also supports multiple tables and LEB-encoded table
+  indices, but does not yet support every table and element-segment case in the
+  [`reference-types`] proposal.
 [^b]: Pulley does not support the [`threads`] proposal because there is no known
   safe way to implement this with Rust's memory model.
 [^c]: Winch's support for aarch64 is complete for Core Wasm.
+[^d]: On riscv64 requires the V extension (the `has_v` Cranelift setting). The
+  proposals are enabled by default, so without it they must be disabled
+  explicitly or creating an engine fails.
 
 ## Tier Details
 

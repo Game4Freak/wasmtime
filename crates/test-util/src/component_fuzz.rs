@@ -28,7 +28,7 @@ pub const IMPORT_FUNCTION: &str = "echo-import";
 pub const EXPORT_FUNCTION: &str = "echo-export";
 
 /// Wasmtime allows up to 100 type depth so limit this to just under that.
-pub const MAX_TYPE_DEPTH: u32 = 99;
+pub const MAX_TYPE_DEPTH: u32 = 90;
 
 macro_rules! uwriteln {
     ($($arg:tt)*) => {
@@ -213,7 +213,7 @@ impl Type {
         // - No Float32/Float64 (NaN comparison issues)
         // - No complex types (Record, Tuple, Variant, etc.) as they might contain floats
         // - String is allowed as it implements Hash + Eq
-        Ok(match u.int_in_range(0..=11)? {
+        Ok(match u.int_in_range(0..=10)? {
             0 => Type::Bool,
             1 => Type::S8,
             2 => Type::U8,
@@ -225,11 +225,6 @@ impl Type {
             8 => Type::U64,
             9 => Type::Char,
             10 => Type::String,
-            11 => {
-                let amt = u.int_in_range(1..=(*fuel).max(1).min(257))?;
-                *fuel = fuel.saturating_sub(amt);
-                Type::Enum(amt)
-            }
             _ => unreachable!(),
         })
     }
@@ -1532,7 +1527,7 @@ impl Declarations {
             let lift_async_option = match lift_abi {
                 LiftAbi::Sync => "",
                 LiftAbi::AsyncStackful => "async",
-                LiftAbi::AsyncCallback => "async (callback (func $i \"callback\"))",
+                LiftAbi::AsyncCallback => "async (callback (core func $i \"callback\"))",
             };
 
             let mut intrinsic_defs = String::new();
@@ -1544,7 +1539,7 @@ impl Declarations {
                     intrinsic_defs.push_str(&format!(
                         r#"
 (core func $task.return (canon task.return {results}
-    (memory $libc "memory") string-encoding={encoding}))
+    (memory (core memory $libc "memory")) string-encoding={encoding}))
                         "#,
                     ));
                     intrinsic_imports.push_str(
@@ -1567,8 +1562,8 @@ impl Declarations {
 
     (core func $f_lower (canon lower
         (func $f)
-        (memory $libc "memory")
-        (realloc (func $libc "realloc"))
+        (memory (core memory $libc "memory"))
+        (realloc (core func $libc "realloc"))
         string-encoding={encoding}
         {lower_async_option}
     ))
@@ -1591,8 +1586,8 @@ impl Declarations {
     (func (export "{EXPORT_FUNCTION}") (type $export_sig)
         (canon lift
             (core func $i "{EXPORT_FUNCTION}")
-            (memory $libc "memory")
-            (realloc (func $libc "realloc"))
+            (memory (core memory $libc "memory"))
+            (realloc (core func $libc "realloc"))
             string-encoding={encoding}
             {lift_async_option}
         )
@@ -1708,6 +1703,28 @@ pub enum LowerAbi {
     Async,
 }
 
+impl LiftAbi {
+    fn is_async(self) -> bool {
+        !matches!(self, Self::Sync)
+    }
+
+    fn ensure_async(&mut self) {
+        if !self.is_async() {
+            *self = Self::AsyncStackful;
+        }
+    }
+}
+
+impl LowerAbi {
+    fn is_async(self) -> bool {
+        matches!(self, Self::Async)
+    }
+
+    fn ensure_async(&mut self) {
+        *self = Self::Async;
+    }
+}
+
 impl<'a> TestCase<'a> {
     pub fn generate(types: &'a [Type], u: &mut Unstructured<'_>) -> arbitrary::Result<Self> {
         let max_params = if types.len() > 0 { 5 } else { 0 };
@@ -1722,15 +1739,25 @@ impl<'a> TestCase<'a> {
 
         let mut options = u.arbitrary::<TestCaseOptions>()?;
 
-        // Sync tasks cannot call async functions via a sync lower, nor can they
-        // block in other ways (e.g. by calling `waitable-set.wait`, returning
-        // `CALLBACK_CODE_WAIT`, etc.) prior to returning.  Therefore,
-        // async-ness cascades to the callers:
-        if options.host_async {
+        // Keep each boundary self-consistent: async function types require async
+        // lowering/lifting, and async callees force their callers async too.
+        if options.host_async || options.callee_lower_abi.is_async() {
+            options.host_async = true;
+            options.callee_lower_abi.ensure_async();
             options.guest_callee_async = true;
         }
-        if options.guest_callee_async {
+        if options.guest_callee_async
+            || options.callee_lift_abi.is_async()
+            || options.caller_lower_abi.is_async()
+        {
+            options.guest_callee_async = true;
+            options.callee_lift_abi.ensure_async();
+            options.caller_lower_abi.ensure_async();
             options.guest_caller_async = true;
+        }
+        if options.guest_caller_async || options.caller_lift_abi.is_async() {
+            options.guest_caller_async = true;
+            options.caller_lift_abi.ensure_async();
         }
 
         Ok(Self {

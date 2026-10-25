@@ -1,6 +1,6 @@
 #![cfg(arc_try_new)]
 
-use wasmtime::{Config, Engine, Module, Result};
+use wasmtime::{Config, Engine, Module, Result, WasmBacktraceDetails};
 use wasmtime_fuzzing::oom::OomTest;
 
 #[test]
@@ -8,6 +8,7 @@ fn module_deserialize() -> Result<()> {
     let module_bytes = {
         let mut config = Config::new();
         config.concurrency_support(false);
+        config.wasm_backtrace_details(WasmBacktraceDetails::Enable);
         let engine = Engine::new(&config)?;
         let module = Module::new(
             &engine,
@@ -17,13 +18,17 @@ fn module_deserialize() -> Result<()> {
 
                     (memory (export "memory") 1)
                     (data (i32.const 0) "a")
+                    (data "a")
 
                     (table (export "table") 1 funcref)
                     (elem (i32.const 0) func 1)
+                    (elem func 1)
 
-                    (func (export "func") (param i32) (result i32)
+                    (func $f (export "func") (param i32) (result i32)
                         (call 0 (local.get 0))
                     )
+
+                    (@custom ".debug_info" "a")
                 )
             "#,
         )?;
@@ -33,6 +38,7 @@ fn module_deserialize() -> Result<()> {
     let mut config = Config::new();
     config.enable_compiler(false);
     config.concurrency_support(false);
+    config.wasm_backtrace_details(WasmBacktraceDetails::Enable);
     let engine = Engine::new(&config)?;
 
     OomTest::new()
@@ -47,4 +53,36 @@ fn module_deserialize() -> Result<()> {
             let _ = Module::deserialize(&engine, &module_bytes)?;
             Ok(())
         })
+}
+
+#[test]
+fn module_deserialize_multiple_rec_groups() -> Result<()> {
+    let module_bytes = {
+        let mut config = Config::new();
+        config.concurrency_support(false);
+        let engine = Engine::new(&config)?;
+        Module::new(
+            &engine,
+            r#"
+                (module
+                    (type (func (param i64 i64 i64 i64 i64 i64 i64 i64
+                                       i64 i64 i64 i64 i64 i64 i64 i64
+                                       i64 i64 i64 i64) (result i64)))
+                    (type (func (param i64 i64 i64 i64 i64 i64 i64) (result i32)))
+                    (global (mut i32) i32.const 1000)
+                )
+            "#,
+        )?
+        .serialize()?
+    };
+
+    let mut config = Config::new();
+    config.enable_compiler(false);
+    config.concurrency_support(false);
+    let engine = Engine::new(&config)?;
+
+    OomTest::new().allow_alloc_after_oom(true).test(|| unsafe {
+        let _ = Module::deserialize(&engine, &module_bytes)?;
+        Ok(())
+    })
 }

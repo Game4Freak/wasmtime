@@ -20,29 +20,33 @@
   (export "memory" (memory 0)))
 
 ;; function u0:0(i64 vmctx, i64, i32, i32) -> f64 tail {
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 215 ""
+;;     region3 = 105 ""
+;;     region4 = 61 ""
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
-;;     gv3 = vmctx
-;;     gv4 = load.i64 notrap aligned gv3+64
-;;     gv5 = load.i64 notrap aligned readonly can_move gv3+56
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32, v3: i32):
-;; @0049                               v5 = f64const 0x1.0000000000000p0
-;; @005d                               trapz v3, user11
-;; @0056                               jump block2
+;; @0049                               v4 = f64const 0x1.0000000000000p0
+;; @0056                               brif v3, block2, block4
 ;;
 ;;                                 block2:
-;; @0058                               v7 = uextend.i64 v2
-;; @0058                               v8 = load.i64 notrap aligned readonly can_move v0+56
-;; @0058                               v9 = iadd v8, v7
-;; @0058                               v10 = sload16.i64 little heap v9
+;; @0058                               v5 = uextend.i64 v2
+;; @0058                               v6 = load.i64 notrap aligned readonly can_move region2 v0+56
+;; @0058                               v7 = iadd v6, v5
+;; @0058                               v8 = sload16.i64 little region4 v7
 ;; @005c                               jump block3
+;;
+;;                                 block4:
+;; @005d                               trap user12
 ;;
 ;;                                 block3:
 ;; @005f                               jump block1
 ;;
 ;;                                 block1:
-;; @005f                               return v5  ; v5 = 0x1.0000000000000p0
+;; @005f                               return v4  ; v4 = 0x1.0000000000000p0
 ;; }

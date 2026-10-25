@@ -2,21 +2,28 @@ use crate::store::{Ctx, MyWasiCtx};
 use std::path::Path;
 use test_programs_artifacts::*;
 use wasmtime::Result;
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime_wasi::p2::add_to_linker_async;
 use wasmtime_wasi::p2::bindings::Command;
+use wasmtime_wasi::{NamedId, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiNamedView, WasiView};
 
-async fn run(path: &str, inherit_stdio: bool) -> Result<()> {
+async fn run(path: &str, with_builder: impl FnOnce(&mut WasiCtxBuilder)) -> Result<()> {
+    run_with_workspace_setup(path, |_| Ok(()), with_builder).await
+}
+
+async fn run_with_workspace_setup(
+    path: &str,
+    setup: impl FnOnce(&Path) -> Result<()>,
+    with_builder: impl FnOnce(&mut WasiCtxBuilder),
+) -> Result<()> {
     let path = Path::new(path);
     let name = path.file_stem().unwrap().to_str().unwrap();
     let engine = test_programs_artifacts::engine(|_config| {});
     let mut linker = Linker::new(&engine);
     add_to_linker_async(&mut linker)?;
 
-    let (mut store, _td) = Ctx::new(&engine, name, |builder| {
-        if inherit_stdio {
-            builder.inherit_stdio();
-        }
+    let (mut store, _td) = Ctx::new_with_workspace_setup(&engine, name, setup, |builder| {
+        with_builder(builder);
         MyWasiCtx::new(builder.build())
     })?;
     let component = Component::from_file(&engine, path)?;
@@ -34,313 +41,208 @@ foreach_p2!(assert_test_exists);
 // Below here is mechanical: there should be one test for every binary in
 // wasi-tests.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_big_random_buf() {
-    run(P1_BIG_RANDOM_BUF_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_clock_time_get() {
-    run(P1_CLOCK_TIME_GET_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_close_preopen() {
-    run(P1_CLOSE_PREOPEN_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_dangling_fd() {
-    run(P1_DANGLING_FD_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_dangling_symlink() {
-    run(P1_DANGLING_SYMLINK_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_directory_seek() {
-    run(P1_DIRECTORY_SEEK_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_dir_fd_op_failures() {
-    run(P1_DIR_FD_OP_FAILURES_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_fd_advise() {
-    run(P1_FD_ADVISE_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_fd_filestat_get() {
-    run(P1_FD_FILESTAT_GET_COMPONENT, false).await.unwrap()
+    run(P1_FD_FILESTAT_GET_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_fd_filestat_set() {
-    run(P1_FD_FILESTAT_SET_COMPONENT, false).await.unwrap()
+async fn p1_stat_extreme_host_mtime() {
+    run_with_workspace_setup(
+        P1_STAT_EXTREME_HOST_MTIME_COMPONENT,
+        crate::store::prepare_extreme_mtime_fixture,
+        |_| {},
+    )
+    .await
+    .unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_fd_flags_set() {
-    run(P1_FD_FLAGS_SET_COMPONENT, false).await.unwrap()
+    run(P1_FD_FLAGS_SET_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_fd_readdir() {
-    run(P1_FD_READDIR_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_file_allocate() {
-    run(P1_FILE_ALLOCATE_COMPONENT, false).await.unwrap()
+    run(P1_FD_READDIR_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_file_pread_pwrite() {
-    run(P1_FILE_PREAD_PWRITE_COMPONENT, false).await.unwrap()
+    run(P1_FILE_PREAD_PWRITE_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_file_read_write() {
-    run(P1_FILE_READ_WRITE_COMPONENT, false).await.unwrap()
+    run(P1_FILE_READ_WRITE_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_file_seek_tell() {
-    run(P1_FILE_SEEK_TELL_COMPONENT, false).await.unwrap()
+    run(P1_FILE_SEEK_TELL_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_file_truncation() {
-    run(P1_FILE_TRUNCATION_COMPONENT, false).await.unwrap()
+    run(P1_FILE_TRUNCATION_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_file_unbuffered_write() {
-    run(P1_FILE_UNBUFFERED_WRITE_COMPONENT, false)
-        .await
-        .unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_interesting_paths() {
-    run(P1_INTERESTING_PATHS_COMPONENT, true).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_regular_file_isatty() {
-    run(P1_REGULAR_FILE_ISATTY_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_nofollow_errors() {
-    run(P1_NOFOLLOW_ERRORS_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_overwrite_preopen() {
-    run(P1_OVERWRITE_PREOPEN_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_exists() {
-    run(P1_PATH_EXISTS_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_filestat() {
-    run(P1_PATH_FILESTAT_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_link() {
-    run(P1_PATH_LINK_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_open_create_existing() {
-    run(P1_PATH_OPEN_CREATE_EXISTING_COMPONENT, false)
-        .await
-        .unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_open_read_write() {
-    run(P1_PATH_OPEN_READ_WRITE_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_open_dirfd_not_dir() {
-    run(P1_PATH_OPEN_DIRFD_NOT_DIR_COMPONENT, false)
-        .await
-        .unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_open_missing() {
-    run(P1_PATH_OPEN_MISSING_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_open_nonblock() {
-    run(P1_PATH_OPEN_NONBLOCK_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_rename_dir_trailing_slashes() {
-    run(P1_PATH_RENAME_DIR_TRAILING_SLASHES_COMPONENT, false)
-        .await
-        .unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_rename() {
-    run(P1_PATH_RENAME_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_symlink_trailing_slashes() {
-    run(P1_PATH_SYMLINK_TRAILING_SLASHES_COMPONENT, false)
+    run(P1_FILE_UNBUFFERED_WRITE_COMPONENT, |_| {})
         .await
         .unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_poll_oneoff_files() {
-    run(P1_POLL_ONEOFF_FILES_COMPONENT, false).await.unwrap()
+    run(P1_POLL_ONEOFF_FILES_COMPONENT, |_| {}).await.unwrap()
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_poll_oneoff_stdio() {
-    run(P1_POLL_ONEOFF_STDIO_COMPONENT, true).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_readlink() {
-    run(P1_READLINK_COMPONENT, false).await.unwrap()
+    run(P1_READLINK_COMPONENT, |_| {}).await.unwrap()
 }
+
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_remove_directory() {
-    run(P1_REMOVE_DIRECTORY_COMPONENT, false).await.unwrap()
+async fn p1_path_rename_trailing_slashes() {
+    let fixture = crate::store::SandboxFixture::new().unwrap();
+    run(P1_PATH_RENAME_TRAILING_SLASHES_COMPONENT, |b| {
+        fixture.configure_wasi(b)
+    })
+    .await
+    .expect("run guest");
+    fixture.assert_secure();
 }
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_remove_nonempty_directory() {
-    run(P1_REMOVE_NONEMPTY_DIRECTORY_COMPONENT, false)
-        .await
-        .unwrap()
-}
+
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_renumber() {
-    run(P1_RENUMBER_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_sched_yield() {
-    run(P1_SCHED_YIELD_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_stdio() {
-    run(P1_STDIO_COMPONENT, false).await.unwrap()
+    run(P1_RENUMBER_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_stdio_isatty() {
     // If the test process is setup such that stdio is a terminal:
     if test_programs_artifacts::stdio_is_terminal() {
         // Inherit stdio, test asserts each is not tty:
-        run(P1_STDIO_ISATTY_COMPONENT, true).await.unwrap()
+        run(P1_STDIO_ISATTY_COMPONENT, |b| {
+            b.inherit_stdio();
+        })
+        .await
+        .unwrap()
     }
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_stdio_not_isatty() {
     // Don't inherit stdio, test asserts each is not tty:
-    run(P1_STDIO_NOT_ISATTY_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_symlink_create() {
-    run(P1_SYMLINK_CREATE_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_symlink_filestat() {
-    run(P1_SYMLINK_FILESTAT_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_symlink_loop() {
-    run(P1_SYMLINK_LOOP_COMPONENT, false).await.unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_unlink_file_trailing_slashes() {
-    run(P1_UNLINK_FILE_TRAILING_SLASHES_COMPONENT, false)
-        .await
-        .unwrap()
-}
-#[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn p1_path_open_preopen() {
-    run(P1_PATH_OPEN_PREOPEN_COMPONENT, false).await.unwrap()
+    run(P1_STDIO_NOT_ISATTY_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_unicode_output() {
-    run(P1_UNICODE_OUTPUT_COMPONENT, true).await.unwrap()
+    run(P1_UNICODE_OUTPUT_COMPONENT, |b| {
+        b.inherit_stdio();
+    })
+    .await
+    .unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_file_write() {
-    run(P1_FILE_WRITE_COMPONENT, false).await.unwrap()
+    run(P1_FILE_WRITE_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_path_open_lots() {
-    run(P1_PATH_OPEN_LOTS_COMPONENT, false).await.unwrap()
+    run(P1_PATH_OPEN_LOTS_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p1_sleep_quickly_but_lots() {
-    run(P1_SLEEP_QUICKLY_BUT_LOTS_COMPONENT, false)
+    run(P1_SLEEP_QUICKLY_BUT_LOTS_COMPONENT, |_| {})
         .await
         .unwrap()
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_sleep() {
-    run(P2_SLEEP_COMPONENT, false).await.unwrap()
+    run(P2_SLEEP_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_random() {
-    run(P2_RANDOM_COMPONENT, false).await.unwrap()
+    run(P2_RANDOM_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_big_random_buf() {
+    run(P2_BIG_RANDOM_BUF_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_ip_name_lookup() {
-    run(P2_IP_NAME_LOOKUP_COMPONENT, false).await.unwrap()
+    run(P2_IP_NAME_LOOKUP_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_tcp_sockopts() {
-    run(P2_TCP_SOCKOPTS_COMPONENT, false).await.unwrap()
+    run(P2_TCP_SOCKOPTS_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_tcp_sample_application() {
-    run(P2_TCP_SAMPLE_APPLICATION_COMPONENT, false)
+    run(P2_TCP_SAMPLE_APPLICATION_COMPONENT, |_| {})
         .await
         .unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_tcp_states() {
-    run(P2_TCP_STATES_COMPONENT, false).await.unwrap()
+    run(P2_TCP_STATES_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_tcp_streams() {
-    run(P2_TCP_STREAMS_COMPONENT, false).await.unwrap()
+    run(P2_TCP_STREAMS_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_tcp_bind() {
-    run(P2_TCP_BIND_COMPONENT, false).await.unwrap()
+    run(P2_TCP_BIND_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_tcp_connect() {
-    run(P2_TCP_CONNECT_COMPONENT, false).await.unwrap()
+    run(P2_TCP_CONNECT_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_tcp_listen() {
-    run(P2_TCP_LISTEN_COMPONENT, false).await.unwrap()
+    run(P2_TCP_LISTEN_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_tcp_busy_poll() {
-    run(P2_TCP_BUSY_POLL_COMPONENT, false).await.unwrap()
+    run(P2_TCP_BUSY_POLL_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_udp_sockopts() {
-    run(P2_UDP_SOCKOPTS_COMPONENT, false).await.unwrap()
+    run(P2_UDP_SOCKOPTS_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_udp_sample_application() {
-    run(P2_UDP_SAMPLE_APPLICATION_COMPONENT, false)
+    run(P2_UDP_SAMPLE_APPLICATION_COMPONENT, |_| {})
         .await
         .unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_udp_states() {
-    run(P2_UDP_STATES_COMPONENT, false).await.unwrap()
+    run(P2_UDP_STATES_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_udp_stream() {
+    run(P2_UDP_STREAM_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_udp_bind() {
-    run(P2_UDP_BIND_COMPONENT, false).await.unwrap()
+    run(P2_UDP_BIND_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_udp_connect() {
-    run(P2_UDP_CONNECT_COMPONENT, false).await.unwrap()
+    run(P2_UDP_CONNECT_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+// See the comment on the `p2::sync` variation of this test; for why this is
+// ignored on macos
+#[cfg_attr(target_os = "macos", ignore)]
+async fn p2_udp_send_to_closed_receiver() {
+    run(P2_UDP_SEND_TO_CLOSED_RECEIVER_COMPONENT, |_| {})
+        .await
+        .unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_stream_pollable_correct() {
-    run(P2_STREAM_POLLABLE_CORRECT_COMPONENT, false)
+    run(P2_STREAM_POLLABLE_CORRECT_COMPONENT, |_| {})
         .await
         .unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_stream_pollable_traps() {
-    let e = run(P2_STREAM_POLLABLE_TRAPS_COMPONENT, false)
+    let e = run(P2_STREAM_POLLABLE_TRAPS_COMPONENT, |_| {})
         .await
         .unwrap_err();
     assert_eq!(
@@ -350,11 +252,11 @@ async fn p2_stream_pollable_traps() {
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_pollable_correct() {
-    run(P2_POLLABLE_CORRECT_COMPONENT, false).await.unwrap()
+    run(P2_POLLABLE_CORRECT_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_pollable_traps() {
-    let e = run(P2_POLLABLE_TRAPS_COMPONENT, false).await.unwrap_err();
+    let e = run(P2_POLLABLE_TRAPS_COMPONENT, |_| {}).await.unwrap_err();
     assert_eq!(
         format!("{}", e.source().expect("trap source")),
         "empty poll list"
@@ -362,19 +264,318 @@ async fn p2_pollable_traps() {
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_adapter_badfd() {
-    run(P2_ADAPTER_BADFD_COMPONENT, false).await.unwrap()
+    run(P2_ADAPTER_BADFD_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_file_read_write() {
-    run(P2_FILE_READ_WRITE_COMPONENT, false).await.unwrap()
+    run(P2_FILE_READ_WRITE_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_close_preopen() {
+    run(P2_CLOSE_PREOPEN_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_nofollow_errors() {
+    run(P2_NOFOLLOW_ERRORS_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_exists() {
+    run(P2_PATH_EXISTS_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_open_create_existing() {
+    run(P2_PATH_OPEN_CREATE_EXISTING_COMPONENT, |_| {})
+        .await
+        .unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_open_missing() {
+    run(P2_PATH_OPEN_MISSING_COMPONENT, |_| {}).await.unwrap()
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_rename_trailing_slashes() {
+    let fixture = crate::store::SandboxFixture::new().unwrap();
+    run(P2_PATH_RENAME_TRAILING_SLASHES_COMPONENT, |b| {
+        fixture.configure_wasi(b)
+    })
+    .await
+    .expect("run guest");
+    fixture.assert_secure();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_remove_nonempty_directory() {
+    run(P2_REMOVE_NONEMPTY_DIRECTORY_COMPONENT, |_| {})
+        .await
+        .unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_symlink_create() {
+    run(P2_SYMLINK_CREATE_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_fd_advise() {
+    run(P2_FD_ADVISE_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_poll_oneoff_stdio() {
+    run(P2_POLL_ONEOFF_STDIO_COMPONENT, |b| {
+        b.inherit_stdio();
+    })
+    .await
+    .unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_symlink_filestat() {
+    run(P2_SYMLINK_FILESTAT_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_remove_directory() {
+    run(P2_REMOVE_DIRECTORY_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_dangling_symlink() {
+    run(P2_DANGLING_SYMLINK_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_dir_fd_op_failures() {
+    run(P2_DIR_FD_OP_FAILURES_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_fd_filestat_set() {
+    run(P2_FD_FILESTAT_SET_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_interesting_paths() {
+    run(P2_INTERESTING_PATHS_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_filestat() {
+    run(P2_PATH_FILESTAT_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_link() {
+    run(P2_PATH_LINK_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_open_dirfd_not_dir() {
+    run(P2_PATH_OPEN_DIRFD_NOT_DIR_COMPONENT, |_| {})
+        .await
+        .unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_open_preopen() {
+    run(P2_PATH_OPEN_PREOPEN_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_open_read_write() {
+    run(P2_PATH_OPEN_READ_WRITE_COMPONENT, |_| {})
+        .await
+        .unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_rename() {
+    run(P2_PATH_RENAME_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_path_symlink_trailing_slashes() {
+    run(P2_PATH_SYMLINK_TRAILING_SLASHES_COMPONENT, |_| {})
+        .await
+        .unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_symlink_loop() {
+    run(P2_SYMLINK_LOOP_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_unlink_file_trailing_slashes() {
+    run(P2_UNLINK_FILE_TRAILING_SLASHES_COMPONENT, |_| {})
+        .await
+        .unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_dangling_fd() {
+    run(P2_DANGLING_FD_COMPONENT, |_| {}).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_udp_send_too_much() {
-    let e = run(P2_UDP_SEND_TOO_MUCH_COMPONENT, false)
+    let e = run(P2_UDP_SEND_TOO_MUCH_COMPONENT, |_| {})
         .await
         .unwrap_err();
     assert_eq!(
         format!("{}", e.source().expect("trap source")),
         "unpermitted: argument exceeds permitted size"
     )
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_write_too_much() {
+    let e = run(P2_WRITE_TOO_MUCH_COMPONENT, |_| {}).await.unwrap_err();
+    assert_eq!(
+        format!("{}", e.source().expect("trap source")),
+        "write exceeded budget"
+    )
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_empty_write() {
+    run(P2_EMPTY_WRITE_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_file_settime_overflow() {
+    run(P2_FILE_SETTIME_OVERFLOW_COMPONENT, |_| {})
+        .await
+        .unwrap()
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p1_file_truncation_readonly() {
+    run_with_readonly_testfile(P1_FILE_TRUNCATION_READONLY_COMPONENT).await
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_file_truncation_readonly() {
+    run_with_readonly_testfile(P2_FILE_TRUNCATION_READONLY_COMPONENT).await
+}
+
+async fn run_with_readonly_testfile(component_path: &str) {
+    use std::path::PathBuf;
+    use wasmtime_wasi::FsPerms;
+
+    let prefix = "wasi_components_ro_";
+    let tempdir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create readonly tempdir");
+    const FILENAME: &str = "test.txt";
+    const EXPECTED_CONTENTS: &[u8] = b"read only test file\n";
+    let mut file: PathBuf = PathBuf::from(tempdir.path());
+    file.push(FILENAME);
+    std::fs::write(&file, EXPECTED_CONTENTS).expect("write read only test file");
+
+    run(component_path, |b| {
+        b.preopened_dir(tempdir.path(), "readonly", FsPerms::ReadOnly)
+            .unwrap();
+    })
+    .await
+    .expect("run guest");
+
+    let contents = std::fs::read(&file).expect("read read only test file");
+    assert_eq!(EXPECTED_CONTENTS, contents);
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p1_file_hardlink_across_perms() {
+    run_with_readonly_testfile(P1_FILE_HARDLINK_ACROSS_PERMS_COMPONENT).await
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_file_hardlink_across_perms() {
+    run_with_readonly_testfile(P2_FILE_HARDLINK_ACROSS_PERMS_COMPONENT).await
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p1_file_rename_across_perms() {
+    run_with_readonly_testfile(P1_FILE_RENAME_ACROSS_PERMS_COMPONENT).await
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_file_rename_across_perms() {
+    run_with_readonly_testfile(P2_FILE_RENAME_ACROSS_PERMS_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_file_stream_not_permitted() {
+    file_stream_not_permitted(P2_FILE_STREAM_NOT_PERMITTED_COMPONENT).await
+}
+
+async fn file_stream_not_permitted(component_path: &str) {
+    use wasmtime_wasi::FsPerms;
+
+    let readonly = tempfile::Builder::new()
+        .prefix("wasi_components_stream_np_ro_")
+        .tempdir()
+        .expect("create readonly tempdir");
+
+    const RO_CONTENTS: &[u8] = b"stream permission test\n";
+    std::fs::write(readonly.path().join("stream-perms.txt"), RO_CONTENTS)
+        .expect("write readonly test file");
+
+    run(component_path, |b| {
+        b.preopened_dir(readonly.path(), "readonly", FsPerms::ReadOnly)
+            .unwrap();
+    })
+    .await
+    .expect("run p2_file_stream_not_permitted guest");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_clocks_zero_wait() {
+    run(P2_CLOCKS_ZERO_WAIT_COMPONENT, |_| {}).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_clock_time_get() {
+    run(P2_CLOCK_TIME_GET_COMPONENT, |_| {}).await.unwrap()
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_environment_named_imports() -> Result<()> {
+    struct StoreData {
+        default: WasiCtx,
+        a: WasiCtx,
+        b: WasiCtx,
+        table: ResourceTable,
+    }
+
+    impl WasiView for Ctx<StoreData> {
+        fn ctx(&mut self) -> WasiCtxView<'_> {
+            WasiCtxView {
+                ctx: &mut self.wasi.default,
+                table: &mut self.wasi.table,
+            }
+        }
+    }
+
+    impl WasiNamedView for Ctx<StoreData> {
+        fn ctx(&mut self, id: NamedId) -> WasiCtxView<'_> {
+            WasiCtxView {
+                ctx: match id.0 {
+                    0 => &mut self.wasi.a,
+                    1 => &mut self.wasi.b,
+                    _ => panic!("unexpected id: {}", id.0),
+                },
+                table: &mut self.wasi.table,
+            }
+        }
+    }
+
+    let path = Path::new(P2_ENVIRONMENT_NAMED_IMPORTS_COMPONENT);
+    let name = path.file_stem().unwrap().to_str().unwrap();
+    let engine = test_programs_artifacts::engine(|config| {
+        config.wasm_component_model_implements(true);
+    });
+    let component = Component::from_file(&engine, path)?;
+    let mut linker = Linker::new(&engine);
+    add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p2::add_named_to_linker_async(&mut linker, &component, |i, name| {
+        assert_eq!(i, wasmtime_wasi::p2::Interface::CliEnvironment);
+        Ok(match name {
+            "a" => NamedId(0),
+            "b" => NamedId(1),
+            _ => panic!("unexpected name: {name}"),
+        })
+    })?;
+
+    let (mut store, _td) = Ctx::new_with_workspace_setup(
+        &engine,
+        name,
+        |_| Ok(()),
+        |builder| StoreData {
+            default: builder.env("DEFAULT", "0").build(),
+            a: WasiCtx::builder().env("A", "0").build(),
+            b: WasiCtx::builder().env("B", "0").build(),
+            table: ResourceTable::default(),
+        },
+    )?;
+    let command = Command::instantiate_async(&mut store, &component, &linker).await?;
+    command
+        .wasi_cli_run()
+        .call_run(&mut store)
+        .await?
+        .map_err(|()| wasmtime::format_err!("run returned a failure"))
 }

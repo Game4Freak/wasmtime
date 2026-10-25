@@ -1,6 +1,6 @@
 use crate::{CExternType, handle_result, wasm_externtype_t, wasm_limits_t, wasmtime_error_t};
 use std::convert::TryFrom;
-use std::{cell::OnceCell, mem::MaybeUninit};
+use std::{mem::MaybeUninit, sync::OnceLock};
 use wasmtime::{MemoryType, MemoryTypeBuilder};
 
 #[repr(transparent)]
@@ -14,7 +14,7 @@ wasmtime_c_api_macros::declare_ty!(wasm_memorytype_t);
 #[derive(Clone)]
 pub(crate) struct CMemoryType {
     pub(crate) ty: MemoryType,
-    limits_cache: OnceCell<wasm_limits_t>,
+    limits_cache: OnceLock<wasm_limits_t>,
 }
 
 impl wasm_memorytype_t {
@@ -43,17 +43,15 @@ impl CMemoryType {
     pub(crate) fn new(ty: MemoryType) -> CMemoryType {
         CMemoryType {
             ty,
-            limits_cache: OnceCell::new(),
+            limits_cache: OnceLock::new(),
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wasm_memorytype_new(limits: &wasm_limits_t) -> Box<wasm_memorytype_t> {
-    Box::new(wasm_memorytype_t::new(MemoryType::new(
-        limits.min,
-        limits.max(),
-    )))
+pub extern "C" fn wasm_memorytype_new(limits: &wasm_limits_t) -> Option<Box<wasm_memorytype_t>> {
+    let ty = MemoryType::new(limits.min, limits.max()).ok()?;
+    Some(Box::new(wasm_memorytype_t::new(ty)))
 }
 
 #[unsafe(no_mangle)]
@@ -61,7 +59,7 @@ pub extern "C" fn wasm_memorytype_limits(mt: &wasm_memorytype_t) -> &wasm_limits
     let mt = mt.ty();
     mt.limits_cache.get_or_init(|| wasm_limits_t {
         min: u32::try_from(mt.ty.minimum()).unwrap(),
-        max: u32::try_from(mt.ty.maximum().unwrap_or(u64::from(u32::max_value()))).unwrap(),
+        max: u32::try_from(mt.ty.maximum().unwrap_or(u64::from(u32::MAX))).unwrap(),
     })
 }
 

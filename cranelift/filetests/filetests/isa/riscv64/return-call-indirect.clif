@@ -6,7 +6,8 @@ target riscv64
 
 function %callee_i64(i64) -> i64 tail {
 block0(v0: i64):
-    v1 = iadd_imm.i64 v0, 10
+    v2 = iconst.i64 10
+    v1 = iadd v0, v2
     return v1
 }
 
@@ -83,7 +84,7 @@ block0(v0: i64):
 ;   mv s0, sp
 ; block1: ; offset 0x10
 ;   auipc t0, 0 ; reloc_external RiscvPCRelHi20 %callee_i64 0
-;   mv t0, t0 ; reloc_external RiscvPCRelLo12I func+16 0
+;   mv t0, t0 ; reloc_external RiscvPCRelLo12I func+0x10 0
 ;   ld ra, 8(sp)
 ;   ld s0, 0(sp)
 ;   addi sp, sp, 0x10
@@ -248,8 +249,8 @@ block0:
 ;   mv fp,sp
 ;   addi sp,sp,-144
 ;   sd ra,8(sp)
-;   ld fp,144(sp)
-;   sd fp,0(sp)
+;   ld t6,144(sp)
+;   sd t6,0(sp)
 ;   mv fp,sp
 ;   addi sp,sp,-128
 ;   sd s1,120(sp)
@@ -326,8 +327,8 @@ block0:
 ;   mv s0, sp
 ;   addi sp, sp, -0x90
 ;   sd ra, 8(sp)
-;   ld s0, 0x90(sp)
-;   sd s0, 0(sp)
+;   ld t6, 0x90(sp)
+;   sd t6, 0(sp)
 ;   mv s0, sp
 ;   addi sp, sp, -0x80
 ;   sd s1, 0x78(sp)

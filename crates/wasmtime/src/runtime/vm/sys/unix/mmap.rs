@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use crate::runtime::vm::sys::vm::MemoryImageSource;
 use crate::runtime::vm::{HostAlignedByteCount, SendSyncPtr};
 use rustix::mm::{MprotectFlags, mprotect};
 use std::ops::Range;
@@ -18,8 +17,8 @@ pub struct Mmap {
     memory: SendSyncPtr<[u8]>,
 }
 
-cfg_if::cfg_if! {
-    if #[cfg(any(target_os = "illumos", target_os = "linux"))] {
+cfg_select! {
+    any(target_os = "illumos", target_os = "linux") => {
         // On illumos, by default, mmap reserves what it calls "swap space" ahead of time, so that
         // memory accesses a`re guaranteed not to fail once mmap succeeds. NORESERVE is for cases
         // where that memory is never meant to be accessed -- e.g. memory that's used as guard
@@ -30,7 +29,8 @@ cfg_if::cfg_if! {
         // physical memory.
         pub(super) const MMAP_NORESERVE_FLAG: rustix::mm::MapFlags =
             rustix::mm::MapFlags::NORESERVE;
-    } else {
+    }
+    _ => {
         pub(super) const MMAP_NORESERVE_FLAG: rustix::mm::MapFlags = rustix::mm::MapFlags::empty();
     }
 }
@@ -209,28 +209,6 @@ impl Mmap {
             mprotect(base, len, MprotectFlags::READ | MprotectFlags::WRITE)?;
         }
 
-        Ok(())
-    }
-
-    pub unsafe fn map_image_at(
-        &self,
-        image_source: &MemoryImageSource,
-        source_offset: u64,
-        memory_offset: HostAlignedByteCount,
-        memory_len: HostAlignedByteCount,
-    ) -> Result<()> {
-        unsafe {
-            let map_base = self.memory.as_ptr().byte_add(memory_offset.byte_count());
-            let ptr = rustix::mm::mmap(
-                map_base.cast(),
-                memory_len.byte_count(),
-                rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
-                rustix::mm::MapFlags::PRIVATE | rustix::mm::MapFlags::FIXED,
-                image_source.as_file(),
-                source_offset,
-            )?;
-            assert_eq!(map_base.cast(), ptr);
-        };
         Ok(())
     }
 }

@@ -8,25 +8,35 @@ mod disabled;
 #[cfg(not(feature = "gc"))]
 pub use disabled::*;
 
+#[cfg(feature = "stack-switching")]
+mod cont_ref;
+mod data;
 mod func_ref;
 mod gc_ref;
 mod gc_runtime;
 mod host_data;
 mod i31;
 
+#[cfg(feature = "stack-switching")]
+pub use cont_ref::*;
+pub use data::*;
 pub use func_ref::*;
 pub use gc_ref::*;
 pub use gc_runtime::*;
 pub use host_data::*;
 pub use i31::*;
 
+use crate::bail_bug;
+use crate::hash_map::HashMap;
+use crate::module::ModuleRegistry;
 use crate::prelude::*;
 use crate::runtime::vm::{GcHeapAllocationIndex, VMMemoryDefinition};
 use crate::store::Asyncness;
+use crate::type_registry::RegisteredType;
 use core::any::Any;
 use core::mem::MaybeUninit;
 use core::{alloc::Layout, num::NonZeroU32};
-use wasmtime_environ::{GcArrayLayout, GcStructLayout, VMGcKind, VMSharedTypeIndex};
+use wasmtime_environ::{GcArrayLayout, GcLayout, GcStructLayout, VMGcKind, VMSharedTypeIndex};
 
 /// GC-related data that is one-to-one with a `wasmtime::Store`.
 ///
@@ -49,6 +59,10 @@ pub struct GcStore {
     /// The function-references table for this GC heap.
     pub func_ref_table: FuncRefTable,
 
+    /// The continuation references table for this GC heap.
+    #[cfg(feature = "stack-switching")]
+    pub cont_ref_table: ContRefTable,
+
     /// The total allocated bytes recorded after the last GC collection.
     /// `None` if no collection has been performed yet. Used by the
     /// grow-or-collect heuristic.
@@ -66,6 +80,22 @@ pub struct GcStore {
     gc_zeal_alloc_counter_init: Option<NonZeroU32>,
 }
 
+/// Convenience type definition for the storage, within a `Store`, of
+/// host-allocated types that are one-off used for host allocation.
+pub type StoreGcHostAllocTypes = HashMap<VMSharedTypeIndex, (RegisteredType, Option<TraceInfo>)>;
+
+/// Contextual information used when performing a GC to trace GC references as
+/// necesary.
+pub struct GcStoreTraceState<'a> {
+    /// The backing data of `externref`s, deleted from when a GC reference is
+    /// reclaimed, for example.
+    pub host_data_table: &'a mut ExternRefHostDataTable,
+    /// All known modules in this store.
+    pub modules: &'a ModuleRegistry,
+    /// All known host-registered types in this store.
+    pub gc_host_alloc_types: &'a StoreGcHostAllocTypes,
+}
+
 impl GcStore {
     /// Create a new `GcStore`.
     pub fn new(
@@ -75,6 +105,8 @@ impl GcStore {
     ) -> Self {
         let host_data_table = ExternRefHostDataTable::default();
         let func_ref_table = FuncRefTable::default();
+        #[cfg(feature = "stack-switching")]
+        let cont_ref_table = ContRefTable::default();
 
         let _ = &gc_zeal_alloc_counter;
 
@@ -83,6 +115,8 @@ impl GcStore {
             gc_heap,
             host_data_table,
             func_ref_table,
+            #[cfg(feature = "stack-switching")]
+            cont_ref_table,
             last_post_gc_allocated_bytes: None,
             #[cfg(gc_zeal)]
             gc_zeal_alloc_counter,
@@ -106,25 +140,36 @@ impl GcStore {
         &mut self,
         asyncness: Asyncness,
         roots: GcRootsIter<'_>,
+        modules: &ModuleRegistry,
+        gc_host_alloc_types: &StoreGcHostAllocTypes,
         yield_fn: impl AsyncFn(),
-    ) {
-        let collection = self.gc_heap.gc(roots, &mut self.host_data_table);
-        collect_async(collection, asyncness, yield_fn).await;
+    ) -> Result<()> {
+        let mut trace_state = GcStoreTraceState {
+            host_data_table: &mut self.host_data_table,
+            modules,
+            gc_host_alloc_types,
+        };
+        let collection = self.gc_heap.gc(roots, &mut trace_state);
+        collect_async(collection, asyncness, yield_fn).await?;
         self.last_post_gc_allocated_bytes = Some({
             let size = self.gc_heap.allocated_bytes();
-            log::trace!("After collection, GC heap size = {size} bytes");
+            log::trace!("After collection, GC heap's allocated bytes = {size:#x} bytes");
             size
         });
+        Ok(())
     }
 
     /// Get the kind of the given GC reference.
-    pub fn kind(&self, gc_ref: &VMGcRef) -> VMGcKind {
+    pub fn kind(&self, gc_ref: &VMGcRef) -> Result<VMGcKind> {
         debug_assert!(!gc_ref.is_i31());
-        self.header(gc_ref).kind()
+        match self.header(gc_ref)?.kind() {
+            Some(kind) => Ok(kind),
+            None => bail_bug!("invalid `VMGcKind`"),
+        }
     }
 
     /// Get the header of the given GC reference.
-    pub fn header(&self, gc_ref: &VMGcRef) -> &VMGcHeader {
+    pub fn header(&self, gc_ref: &VMGcRef) -> Result<&VMGcHeader> {
         debug_assert!(!gc_ref.is_i31());
         self.gc_heap.header(gc_ref)
     }
@@ -144,11 +189,11 @@ impl GcStore {
         &mut self,
         destination: &mut MaybeUninit<Option<VMGcRef>>,
         source: Option<&VMGcRef>,
-    ) {
+    ) -> Result<()> {
         // Initialize the destination to `None`, at which point the regular GC
         // write barrier is safe to reuse.
         let destination = destination.write(None);
-        self.write_gc_ref(destination, source);
+        self.write_gc_ref(destination, source)
     }
 
     /// Dynamically tests whether a `init_gc_ref` is needed to write `gc_ref`
@@ -180,32 +225,37 @@ impl GcStore {
         store: Option<&mut Self>,
         dest: &mut Option<VMGcRef>,
         gc_ref: Option<&VMGcRef>,
-    ) {
+    ) -> Result<()> {
         if Self::needs_write_barrier(dest, gc_ref) {
             store.unwrap().write_gc_ref(dest, gc_ref)
         } else {
             *dest = gc_ref.map(|r| r.copy_i31());
+            Ok(())
         }
     }
 
     /// Write the `source` GC reference into the `destination` slot, performing
     /// write barriers as necessary.
-    pub fn write_gc_ref(&mut self, destination: &mut Option<VMGcRef>, source: Option<&VMGcRef>) {
+    pub fn write_gc_ref(
+        &mut self,
+        destination: &mut Option<VMGcRef>,
+        source: Option<&VMGcRef>,
+    ) -> Result<()> {
         // If neither the source nor destination actually point to a GC object
         // (that is, they are both either null or `i31ref`s) then we can skip
         // the GC barrier.
         if Self::needs_write_barrier(destination, source) {
-            self.gc_heap
-                .write_gc_ref(&mut self.host_data_table, destination, source);
+            self.gc_heap.write_gc_ref(destination, source)?;
         } else {
             *destination = source.map(|s| s.copy_i31());
         }
+        Ok(())
     }
 
     /// Drop the given GC reference, performing drop barriers as necessary.
     pub fn drop_gc_ref(&mut self, gc_ref: VMGcRef) {
         if !gc_ref.is_i31() {
-            self.gc_heap.drop_gc_ref(&mut self.host_data_table, gc_ref);
+            self.gc_heap.drop_gc_ref(gc_ref);
         }
     }
 
@@ -214,13 +264,13 @@ impl GcStore {
     /// Returns the raw representation of this GC ref, ready to be passed to
     /// Wasm.
     #[must_use]
-    pub fn expose_gc_ref_to_wasm(&mut self, gc_ref: VMGcRef) -> NonZeroU32 {
+    pub fn expose_gc_ref_to_wasm(&mut self, gc_ref: VMGcRef) -> Result<NonZeroU32> {
         let raw = gc_ref.as_raw_non_zero_u32();
         if !gc_ref.is_i31() {
             log::trace!("exposing GC ref to Wasm: {gc_ref:p}");
-            self.gc_heap.expose_gc_ref_to_wasm(gc_ref);
+            self.gc_heap.expose_gc_ref_to_wasm(gc_ref)?;
         }
-        raw
+        Ok(raw)
     }
 
     /// Allocate a new `externref`.
@@ -241,7 +291,7 @@ impl GcStore {
         let host_data_id = self.host_data_table.alloc(value);
         match self.gc_heap.alloc_externref(host_data_id)? {
             Ok(x) => Ok(Ok(x)),
-            Err(n) => Ok(Err((self.host_data_table.dealloc(host_data_id), n))),
+            Err(n) => Ok(Err((self.host_data_table.dealloc(host_data_id)?, n))),
         }
     }
 
@@ -250,8 +300,8 @@ impl GcStore {
     /// Passing invalid `VMExternRef`s (eg garbage values or `externref`s
     /// associated with a different heap is memory safe but will lead to general
     /// incorrectness such as panics and wrong results.
-    pub fn externref_host_data(&self, externref: &VMExternRef) -> &(dyn Any + Send + Sync) {
-        let host_data_id = self.gc_heap.externref_host_data(externref);
+    pub fn externref_host_data(&self, externref: &VMExternRef) -> Result<&(dyn Any + Send + Sync)> {
+        let host_data_id = self.gc_heap.externref_host_data(externref)?;
         self.host_data_table.get(host_data_id)
     }
 
@@ -263,8 +313,8 @@ impl GcStore {
     pub fn externref_host_data_mut(
         &mut self,
         externref: &VMExternRef,
-    ) -> &mut (dyn Any + Send + Sync) {
-        let host_data_id = self.gc_heap.externref_host_data(externref);
+    ) -> Result<&mut (dyn Any + Send + Sync)> {
+        let host_data_id = self.gc_heap.externref_host_data(externref)?;
         self.host_data_table.get_mut(host_data_id)
     }
 
@@ -308,27 +358,15 @@ impl GcStore {
     }
 
     /// Deallocate an uninitialized struct.
-    pub fn dealloc_uninit_struct(&mut self, structref: VMStructRef) {
+    pub fn dealloc_uninit_struct(&mut self, structref: VMStructRef) -> Result<()> {
         self.gc_heap.dealloc_uninit_struct_or_exn(structref.into())
     }
 
     /// Get the data for the given object reference.
     ///
     /// Panics when the structref and its size is out of the GC heap bounds.
-    pub fn gc_object_data(&mut self, gc_ref: &VMGcRef) -> &mut VMGcObjectData {
+    pub fn gc_object_data(&mut self, gc_ref: &VMGcRef) -> Result<&mut VMGcObjectData> {
         self.gc_heap.gc_object_data_mut(gc_ref)
-    }
-
-    /// Get the object datas for the given pair of object references.
-    ///
-    /// Panics if `a` and `b` are the same reference or either is out of bounds.
-    pub fn gc_object_data_pair(
-        &mut self,
-        a: &VMGcRef,
-        b: &VMGcRef,
-    ) -> (&mut VMGcObjectData, &mut VMGcObjectData) {
-        assert_ne!(a, b);
-        self.gc_heap.gc_object_data_pair(a, b)
     }
 
     /// Allocate an uninitialized array with the given type index.
@@ -347,12 +385,12 @@ impl GcStore {
     }
 
     /// Deallocate an uninitialized array.
-    pub fn dealloc_uninit_array(&mut self, arrayref: VMArrayRef) {
-        self.gc_heap.dealloc_uninit_array(arrayref);
+    pub fn dealloc_uninit_array(&mut self, arrayref: VMArrayRef) -> Result<()> {
+        self.gc_heap.dealloc_uninit_array(arrayref)
     }
 
     /// Get the length of the given array.
-    pub fn array_len(&self, arrayref: &VMArrayRef) -> u32 {
+    pub fn array_len(&self, arrayref: &VMArrayRef) -> Result<u32> {
         self.gc_heap.array_len(arrayref)
     }
 
@@ -374,15 +412,61 @@ impl GcStore {
     }
 
     /// Deallocate an uninitialized exception object.
-    pub fn dealloc_uninit_exn(&mut self, exnref: VMExnRef) {
-        self.gc_heap.dealloc_uninit_struct_or_exn(exnref.into());
+    pub fn dealloc_uninit_exn(&mut self, exnref: VMExnRef) -> Result<()> {
+        self.gc_heap.dealloc_uninit_struct_or_exn(exnref.into())
     }
 
     #[cfg(feature = "gc")]
-    pub(crate) fn reset_gc_zeal_alloc_counter(&mut self) {
+    pub(crate) fn replace_gc_zeal_alloc_counter(
+        &mut self,
+        new_value: Option<NonZeroU32>,
+    ) -> Option<NonZeroU32> {
         #[cfg(gc_zeal)]
+        return core::mem::replace(&mut self.gc_zeal_alloc_counter, new_value);
+
+        #[cfg(not(gc_zeal))]
         {
-            self.gc_zeal_alloc_counter = self.gc_zeal_alloc_counter_init;
+            let _ = new_value;
+            return None;
+        }
+    }
+}
+
+/// How to trace a GC object.
+#[derive(Debug)]
+pub enum TraceInfo {
+    /// How to trace an array.
+    Array {
+        /// Whether this array type's elements are GC references, and need
+        /// tracing.
+        #[cfg_attr(
+            not(feature = "gc-drc"),
+            allow(dead_code, reason = "easier not to cfg on/off")
+        )]
+        gc_ref_elems: bool,
+    },
+
+    /// How to trace a struct.
+    Struct {
+        /// The offsets of each GC reference field that needs tracing in
+        /// instances of this struct type.
+        gc_ref_offsets: Box<[u32]>,
+    },
+}
+
+impl TraceInfo {
+    pub(crate) fn new(gc_layout: &GcLayout) -> Self {
+        match gc_layout {
+            GcLayout::Array(l) => TraceInfo::Array {
+                gc_ref_elems: l.elems_are_gc_refs,
+            },
+            GcLayout::Struct(l) => TraceInfo::Struct {
+                gc_ref_offsets: l
+                    .fields
+                    .iter()
+                    .filter_map(|f| if f.is_gc_ref { Some(f.offset) } else { None })
+                    .collect(),
+            },
         }
     }
 }

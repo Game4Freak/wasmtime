@@ -13,11 +13,11 @@
         ;; Import the threading builtins and the table from libc
         (import "" "thread.new-indirect" (func $thread-new-indirect (param i32 i32) (result i32)))
         (import "" "thread.suspend" (func $thread-suspend (result i32)))
-        (import "" "thread.yield-to-suspended" (func $thread-yield-to-suspended (param i32) (result i32)))
-        (import "" "thread.suspend-to-suspended" (func $thread-suspend-to-suspended (param i32) (result i32)))
+        (import "" "thread.yield-then-resume" (func $thread-yield-then-resume (param i32) (result i32)))
+        (import "" "thread.suspend-then-resume" (func $thread-suspend-then-resume (param i32) (result i32)))
         (import "" "thread.yield" (func $thread-yield (result i32)))
         (import "" "thread.index" (func $thread-index (result i32)))
-        (import "" "thread.unsuspend" (func $thread-unsuspend (param i32)))
+        (import "" "thread.resume-later" (func $thread-resume-later (param i32)))
         (import "libc" "__indirect_function_table" (table $indirect-function-table 1 funcref))
 
         ;; A global that we will set from the spawned thread
@@ -29,17 +29,17 @@
             ;; Set the global to the context value
             (global.set $g (local.get 0))
             ;; The main thread switched to us, so is no longer scheduled, so we explicitly schedule it
-            (call $thread-unsuspend (global.get $main-thread-index))
+            (call $thread-resume-later (global.get $main-thread-index))
             ;; Yield back to the main thread (since that is the only other one)
             (drop (call $thread-yield)
             ;; Increment the global
             (global.set $g (i32.add (global.get $g) (i32.const 1)))
             ;; The main thread will have explicitly requested suspension, so yield to it directly
-            (drop (call $thread-yield-to-suspended (global.get $main-thread-index)))
+            (drop (call $thread-yield-then-resume (global.get $main-thread-index)))
             ;; Increment the global again
             (global.set $g (i32.add (global.get $g) (i32.const 1)))
             ;; Reschedule the main thread so that it runs after we exit
-            (call $thread-unsuspend (global.get $main-thread-index))))
+            (call $thread-resume-later (global.get $main-thread-index))))
         (export "thread-start" (func $thread-start))
 
         ;; Initialize the function table with our thread-start function; this will be
@@ -53,7 +53,7 @@
             (global.set $main-thread-index (call $thread-index))
             ;; Create a new thread, which starts suspended, and switch to it
             (drop
-                (call $thread-suspend-to-suspended
+                (call $thread-suspend-then-resume
                     (call $thread-new-indirect (i32.const 0) (i32.const 42))))
             ;; After the thread yields back to us, check that the global was set to 42
             (if (i32.ne (global.get $g) (i32.const 42)) (then unreachable))
@@ -75,12 +75,12 @@
     (alias core export $libc "__indirect_function_table" (core table $indirect-function-table))
 
     (core func $thread-new-indirect
-        (canon thread.new-indirect $start-func-ty (table $indirect-function-table)))
+        (canon thread.new-indirect $start-func-ty (core table $indirect-function-table)))
     (core func $thread-yield (canon thread.yield))
     (core func $thread-index (canon thread.index))
-    (core func $thread-yield-to-suspended (canon thread.yield-to-suspended))
-    (core func $thread-unsuspend (canon thread.unsuspend))
-    (core func $thread-suspend-to-suspended (canon thread.suspend-to-suspended))
+    (core func $thread-yield-then-resume (canon thread.yield-then-resume))
+    (core func $thread-resume-later (canon thread.resume-later))
+    (core func $thread-suspend-then-resume (canon thread.suspend-then-resume))
     (core func $thread-suspend (canon thread.suspend))
 
     ;; Instantiate the main module
@@ -89,11 +89,11 @@
             (with "" (instance
                 (export "thread.new-indirect" (func $thread-new-indirect))
                 (export "thread.index" (func $thread-index))
-                (export "thread.yield-to-suspended" (func $thread-yield-to-suspended))
+                (export "thread.yield-then-resume" (func $thread-yield-then-resume))
                 (export "thread.yield" (func $thread-yield))
-                (export "thread.suspend-to-suspended" (func $thread-suspend-to-suspended))
+                (export "thread.suspend-then-resume" (func $thread-suspend-then-resume))
                 (export "thread.suspend" (func $thread-suspend))
-                (export "thread.unsuspend" (func $thread-unsuspend))))
+                (export "thread.resume-later" (func $thread-resume-later))))
             (with "libc" (instance $libc))))
 
     ;; Export the main entry point
@@ -101,7 +101,7 @@
 
 (assert_return (invoke "run") (u32.const 42))
 
-;; Test that `thread.index` is exempt from may-leave checks
+;; Test that `thread.index` is not exempt from may-leave checks
 (component
   (core func $thread.index (canon thread.index))
 
@@ -115,7 +115,36 @@
     (export "thread.index" (func $thread.index))
   ))))
   (func (export "run")
-    (canon lift (core func $dm "run") (post-return (func $dm "post-return"))))
+    (canon lift (core func $dm "run") (post-return (core func $dm "post-return"))))
 )
 
-(assert_return (invoke "run"))
+(assert_trap (invoke "run") "cannot leave component instance")
+
+(component
+  (core module $m
+    (import "" "thread.index" (func $thread-index (result i32)))
+    (global $index (mut i32) (i32.const 0))
+    (memory (export "memory") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+       (global.set $index (call $thread-index))
+       (if (i32.eqz (global.get $index)) (then unreachable))
+       (i32.const 100)
+    )
+    (func (export "run") (param i32 i32)
+       (local $index i32)
+       (local.set $index (call $thread-index))
+       (if (i32.eqz (local.get $index)) (then unreachable))
+       (if (i32.ne (local.get $index) (global.get $index)) (then unreachable))
+    )
+  )
+  (core func $thread-index (canon thread.index))
+  (core instance $m (instantiate $m (with "" (instance
+    (export "thread.index" (func $thread-index))
+  ))))
+  (func (export "run") (param "s" string) (canon lift
+    (core func $m "run")
+    (memory (core memory $m "memory"))
+    (realloc (core func $m "realloc"))
+  ))
+)
+(assert_trap (invoke "run" (str.const "x")) "cannot leave component instance")

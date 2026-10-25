@@ -26,7 +26,13 @@ pub enum Reloc {
     Abs8,
     /// x86 PC-relative 4-byte
     X86PCRel4,
-    /// x86 call to PC-relative 4-byte
+    /// x86 call to PC-relative 4-byte.
+    ///
+    /// This relocation is only ever applied to the displacement of a `call`
+    /// or `jmp` instruction, never to address materialization (e.g. `lea`,
+    /// which uses [`Reloc::X86PCRel4`] instead). Consumers may therefore
+    /// redirect the control transfer through a veneer when the target is out
+    /// of range of the 32-bit displacement.
     X86CallPCRel4,
     /// x86 call to PLT-relative 4-byte
     X86CallPLTRel4,
@@ -138,6 +144,53 @@ pub enum Reloc {
     /// this relocation needs to fill the 8-bit immediate that's part of the
     /// `call_indirect_host` opcode (an opaque identifier used by the host).
     PulleyCallIndirectHost,
+}
+
+impl Reloc {
+    /// The number of bytes from the relocation's offset that applying it, or a
+    /// linker relaxing it, may read or write.
+    ///
+    /// This runs to the end of the instruction, or of the whole sequence for
+    /// relocations such as [`Reloc::ElfX86_64TlsGd`] that a linker rewrites
+    /// together. Bytes before the offset are not counted.
+    pub fn patched_len(self) -> u32 {
+        match self {
+            Self::Abs4
+            | Self::X86PCRel4
+            | Self::X86CallPCRel4
+            | Self::X86CallPLTRel4
+            | Self::X86GOTPCRel4
+            | Self::X86SecRel
+            | Self::Arm32Call
+            | Self::Arm64Call
+            | Self::S390xPCRel32Dbl
+            | Self::S390xPLTRel32Dbl
+            | Self::MachOX86_64Tlv
+            | Self::MachOAarch64TlsAdrPage21
+            | Self::MachOAarch64TlsAdrPageOff12
+            | Self::Aarch64TlsDescAdrPage21
+            | Self::Aarch64TlsDescLd64Lo12
+            | Self::Aarch64TlsDescAddLo12
+            | Self::Aarch64TlsDescCall
+            | Self::Aarch64AdrGotPage21
+            | Self::Aarch64AdrPrelPgHi21
+            | Self::Aarch64AddAbsLo12Nc
+            | Self::Aarch64Ld64GotLo12Nc
+            | Self::RiscvTlsGdHi20
+            | Self::RiscvPCRelLo12I
+            | Self::RiscvGotHi20
+            | Self::RiscvPCRelHi20
+            | Self::PulleyPcRel
+            | Self::PulleyCallIndirectHost => 4,
+            // The `lea` displacement and the `call` after it. The linker rewrites
+            // the whole general-dynamic sequence when it relaxes it.
+            Self::ElfX86_64TlsGd => 12,
+            // The `brasl` that the marker is attached to.
+            Self::S390xTlsGdCall => 6,
+            // `RiscvCallPlt` patches the `auipc` and `jalr` pair of a call.
+            Self::Abs8 | Self::S390xTlsGd64 | Self::RiscvCallPlt => 8,
+        }
+    }
 }
 
 impl fmt::Display for Reloc {

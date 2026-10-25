@@ -1,8 +1,11 @@
 //! Implementation of a standard AArch64 ABI.
 
+use core::cmp::Reverse;
+
 use crate::CodegenResult;
+use crate::FxHashSet;
 use crate::ir;
-use crate::ir::MemFlags;
+use crate::ir::MemFlagsData;
 use crate::ir::types;
 use crate::ir::types::*;
 use crate::ir::{ExternalName, LibCall, Signature, dynamic_to_fixed};
@@ -76,6 +79,46 @@ fn compute_clobber_size(
     };
 
     int_save_bytes + vec_save_bytes
+}
+
+/// The compact unwinding encoding can only represent pushes and pops of adjacent register pairs,
+/// so unused callee-saved registers may also need to be pushed.
+fn add_macho_compact_unwind_paired_regs(regs: &mut Vec<Writable<RealReg>>) {
+    let int_regs: FxHashSet<_> = regs
+        .iter()
+        .filter_map(|r| {
+            if r.to_reg().class() == RegClass::Int {
+                Some(r.to_reg().hw_enc())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (a, b) in [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)] {
+        if int_regs.contains(&a) && !int_regs.contains(&b) {
+            regs.push(Writable::from_reg(xreg(b).to_real_reg().unwrap()))
+        } else if int_regs.contains(&b) && !int_regs.contains(&a) {
+            regs.push(Writable::from_reg(xreg(a).to_real_reg().unwrap()))
+        }
+    }
+
+    let fp_regs: FxHashSet<_> = regs
+        .iter()
+        .filter_map(|r| {
+            if r.to_reg().class() == RegClass::Float {
+                Some(r.to_reg().hw_enc())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (a, b) in [(8, 9), (10, 11), (12, 13), (14, 15)] {
+        if fp_regs.contains(&a) && !fp_regs.contains(&b) {
+            regs.push(Writable::from_reg(vreg(b).to_real_reg().unwrap()))
+        } else if fp_regs.contains(&b) && !fp_regs.contains(&a) {
+            regs.push(Writable::from_reg(vreg(a).to_real_reg().unwrap()))
+        }
+    }
 }
 
 /// AArch64-specific ABI behavior. This struct just serves as an implementation
@@ -192,7 +235,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 );
             }
 
-            let (rcs, reg_types) = Inst::rc_for_type(param.value_type)?;
+            let (rcs, reg_types) = Inst::rc_for_type(&param.value_type)?;
 
             if let ir::ArgumentPurpose::StructReturn = param.purpose {
                 assert!(
@@ -292,6 +335,18 @@ impl ABIMachineSpec for AArch64MachineDeps {
                     next_xreg += 2;
                     remaining_reg_vals -= 2;
                     continue;
+                }
+
+                // (Stage C.13) When a composite argument is passed on the
+                // stack, the NGRN is set to 8, so all later integer
+                // arguments are passed on the stack as well.
+                if args_or_rets == ArgsOrRets::Args
+                    && matches!(
+                        call_conv,
+                        isa::CallConv::SystemV | isa::CallConv::AppleAarch64
+                    )
+                {
+                    next_xreg = max_per_class_reg_vals;
                 }
             } else {
                 // Single Register parameters
@@ -413,11 +468,11 @@ impl ABIMachineSpec for AArch64MachineDeps {
     }
 
     fn gen_load_stack(mem: StackAMode, into_reg: Writable<Reg>, ty: Type) -> Inst {
-        Inst::gen_load(into_reg, mem.into(), ty, MemFlags::trusted())
+        Inst::gen_load(into_reg, mem.into(), ty, MemFlagsData::trusted())
     }
 
     fn gen_store_stack(mem: StackAMode, from_reg: Reg, ty: Type) -> Inst {
-        Inst::gen_store(mem.into(), from_reg, ty, MemFlags::trusted())
+        Inst::gen_store(mem.into(), from_reg, ty, MemFlagsData::trusted())
     }
 
     fn gen_move(to_reg: Writable<Reg>, from_reg: Reg, ty: Type) -> Inst {
@@ -431,14 +486,20 @@ impl ABIMachineSpec for AArch64MachineDeps {
         from_bits: u8,
         to_bits: u8,
     ) -> Inst {
-        assert!(from_bits < to_bits);
-        Inst::Extend {
-            rd: to_reg,
-            rn: from_reg,
-            signed,
-            from_bits,
-            to_bits,
-        }
+        let (op, to) = match (signed, from_bits, to_bits) {
+            (false, 8, 32) => (ExtendOp::UXTB, OperandSize::Size32),
+            (false, 8, 64) => (ExtendOp::UXTB, OperandSize::Size64),
+            (false, 16, 32) => (ExtendOp::UXTH, OperandSize::Size32),
+            (false, 16, 64) => (ExtendOp::UXTH, OperandSize::Size64),
+            (false, 32, 64) => (ExtendOp::UXTW, OperandSize::Size64),
+            (true, 8, 32) => (ExtendOp::SXTB, OperandSize::Size32),
+            (true, 8, 64) => (ExtendOp::SXTB, OperandSize::Size64),
+            (true, 16, 32) => (ExtendOp::SXTH, OperandSize::Size32),
+            (true, 16, 64) => (ExtendOp::SXTH, OperandSize::Size64),
+            (true, 32, 64) => (ExtendOp::SXTW, OperandSize::Size64),
+            _ => unimplemented!("cannot extend {from_bits} to {to_bits} as signed? {signed}"),
+        };
+        Inst::gen_extend(to_reg, from_reg, op, to)
     }
 
     fn gen_args(args: Vec<ArgPair>) -> Inst {
@@ -518,7 +579,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
             rn: base,
             off: offset as i64,
         };
-        Inst::gen_load(into_reg, mem, ty, MemFlags::trusted())
+        Inst::gen_load(into_reg, mem, ty, MemFlagsData::trusted())
     }
 
     fn gen_store_base_offset(base: Reg, offset: i32, from_reg: Reg, ty: Type) -> Inst {
@@ -526,7 +587,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
             rn: base,
             off: offset as i64,
         };
-        Inst::gen_store(mem, from_reg, ty, MemFlags::trusted())
+        Inst::gen_store(mem, from_reg, ty, MemFlagsData::trusted())
     }
 
     fn gen_sp_reg_adjust(amount: i32) -> SmallInstVec<Inst> {
@@ -617,7 +678,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 mem: PairAMode::SPPreIndexed {
                     simm7: SImm7Scaled::maybe_from_i64(-16, types::I64).unwrap(),
                 },
-                flags: MemFlags::trusted(),
+                flags: MemFlagsData::trusted(),
             });
 
             if flags.unwind_info() {
@@ -666,14 +727,17 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 mem: PairAMode::SPPostIndexed {
                     simm7: SImm7Scaled::maybe_from_i64(16, types::I64).unwrap(),
                 },
-                flags: MemFlags::trusted(),
+                flags: MemFlagsData::trusted(),
             });
         }
 
-        if call_conv == isa::CallConv::Tail && frame_layout.tail_args_size > 0 {
-            insts.extend(Self::gen_sp_reg_adjust(
-                frame_layout.tail_args_size.try_into().unwrap(),
-            ));
+        let callee_pop_size = match call_conv {
+            isa::CallConv::Tail => frame_layout.tail_args_size,
+            isa::CallConv::Winch => frame_layout.incoming_args_size,
+            _ => 0,
+        };
+        if callee_pop_size > 0 {
+            insts.extend(Self::gen_sp_reg_adjust(callee_pop_size.try_into().unwrap()));
         }
 
         insts
@@ -738,6 +802,22 @@ impl ABIMachineSpec for AArch64MachineDeps {
         let mut insts = SmallVec::new();
         let setup_frame = frame_layout.setup_area_size > 0;
 
+        if flags.unwind_info() && setup_frame {
+            // The *unwind* frame (but not the actual frame) starts at the
+            // clobbers, just below the saved FP/LR pair.
+            //
+            // This is emitted before the incoming argument area is resized
+            // below so that the CFA is defined in terms of FP while the saved
+            // FP/LR pair is being moved: FP keeps pointing at the original pair
+            // until it has been copied, and then points at the new copy.
+            insts.push(Inst::Unwind {
+                inst: UnwindInst::DefineNewFrame {
+                    offset_downward_to_clobbers: frame_layout.clobber_size,
+                    offset_upward_to_caller_sp: frame_layout.setup_area_size,
+                },
+            });
+        }
+
         // When a return_call within this function required more stack arguments than we have
         // present, resize the incoming argument area of the frame to accommodate those arguments.
         let incoming_args_diff = frame_layout.tail_args_size - frame_layout.incoming_args_size;
@@ -754,24 +834,26 @@ impl ABIMachineSpec for AArch64MachineDeps {
 
             // Move fp and lr down.
             if setup_frame {
-                // Reload the frame pointer from the stack.
+                // Reload the saved frame pointer from the stack. This uses a
+                // temporary rather than FP itself so that FP keeps pointing at
+                // a valid frame record until the copy below is complete.
                 insts.push(Inst::ULoad64 {
-                    rd: regs::writable_fp_reg(),
+                    rd: writable_spilltmp_reg(),
                     mem: AMode::SPOffset {
                         off: i64::from(incoming_args_diff),
                     },
-                    flags: MemFlags::trusted(),
+                    flags: MemFlagsData::trusted(),
                 });
 
-                // Store the frame pointer and link register again at the new SP
+                // Store the saved frame pointer and link register again at the new SP
                 insts.push(Inst::StoreP64 {
-                    rt: fp_reg(),
+                    rt: spilltmp_reg(),
                     rt2: link_reg(),
                     mem: PairAMode::SignedOffset {
                         reg: regs::stack_reg(),
                         simm7: SImm7Scaled::maybe_from_i64(0, types::I64).unwrap(),
                     },
-                    flags: MemFlags::trusted(),
+                    flags: MemFlagsData::trusted(),
                 });
 
                 // Keep the frame pointer in sync
@@ -781,17 +863,6 @@ impl ABIMachineSpec for AArch64MachineDeps {
                     types::I64,
                 ));
             }
-        }
-
-        if flags.unwind_info() && setup_frame {
-            // The *unwind* frame (but not the actual frame) starts at the
-            // clobbers, just below the saved FP/LR pair.
-            insts.push(Inst::Unwind {
-                inst: UnwindInst::DefineNewFrame {
-                    offset_downward_to_clobbers: frame_layout.clobber_size,
-                    offset_upward_to_caller_sp: frame_layout.setup_area_size,
-                },
-            });
         }
 
         // We use pre-indexed addressing modes here, rather than the possibly
@@ -821,7 +892,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 mem: AMode::SPPreIndexed {
                     simm9: SImm9::maybe_from_i64(-clobber_offset_change).unwrap(),
                 },
-                flags: MemFlags::trusted(),
+                flags: MemFlagsData::trusted(),
             });
 
             if flags.unwind_info() {
@@ -852,7 +923,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 mem: PairAMode::SPPreIndexed {
                     simm7: SImm7Scaled::maybe_from_i64(-clobber_offset_change, types::I64).unwrap(),
                 },
-                flags: MemFlags::trusted(),
+                flags: MemFlagsData::trusted(),
             });
 
             if flags.unwind_info() {
@@ -880,7 +951,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                     mem: AMode::SPPreIndexed {
                         simm9: SImm9::maybe_from_i64(-clobber_offset_change).unwrap(),
                     },
-                    flags: MemFlags::trusted(),
+                    flags: MemFlagsData::trusted(),
                 };
                 insts.push(inst);
                 // N.B.: no unwind info: we don't have a way to
@@ -892,7 +963,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 mem: AMode::SPPreIndexed {
                     simm9: SImm9::maybe_from_i64(-clobber_offset_change).unwrap(),
                 },
-                flags: MemFlags::trusted(),
+                flags: MemFlagsData::trusted(),
             };
             let iter = clobbered_vec.chunks_exact(2);
 
@@ -924,7 +995,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                             simm7: SImm7Scaled::maybe_from_i64(-clobber_offset_change, F64)
                                 .unwrap(),
                         },
-                        flags: MemFlags::trusted(),
+                        flags: MemFlagsData::trusted(),
                     },
                     clobber_offset_change as u32,
                 )
@@ -995,7 +1066,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                     mem: AMode::SPPostIndexed {
                         simm9: SImm9::maybe_from_i64(16).unwrap(),
                     },
-                    flags: MemFlags::trusted(),
+                    flags: MemFlagsData::trusted(),
                 };
                 insts.push(inst);
                 // N.B.: no unwind info; we don't have a way to
@@ -1007,7 +1078,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 mem: AMode::SPPostIndexed {
                     simm9: SImm9::maybe_from_i64(16).unwrap(),
                 },
-                flags: MemFlags::trusted(),
+                flags: MemFlagsData::trusted(),
             };
             let load_vec_reg_half_pair = |rt, rt2| Inst::FpuLoadP64 {
                 rt,
@@ -1015,7 +1086,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 mem: PairAMode::SPPostIndexed {
                     simm7: SImm7Scaled::maybe_from_i64(16, F64).unwrap(),
                 },
-                flags: MemFlags::trusted(),
+                flags: MemFlagsData::trusted(),
             };
 
             let mut iter = clobbered_vec.chunks_exact(2);
@@ -1054,7 +1125,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 mem: PairAMode::SPPostIndexed {
                     simm7: SImm7Scaled::maybe_from_i64(16, I64).unwrap(),
                 },
-                flags: MemFlags::trusted(),
+                flags: MemFlagsData::trusted(),
             });
         }
 
@@ -1070,7 +1141,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 mem: AMode::SPPostIndexed {
                     simm9: SImm9::maybe_from_i64(16).unwrap(),
                 },
-                flags: MemFlags::trusted(),
+                flags: MemFlagsData::trusted(),
             });
         }
 
@@ -1155,6 +1226,9 @@ impl ABIMachineSpec for AArch64MachineDeps {
             // Wasmtime).
             (isa::CallConv::PreserveAll, true) => ALL_CLOBBERS,
             (isa::CallConv::SystemV, _) => DEFAULT_AAPCS_CLOBBERS,
+            // On Mach-O, the compact unwind info properly describes how are callee-save
+            // registers restored during unwinding.
+            (isa::CallConv::AppleAarch64, true) => DEFAULT_AAPCS_CLOBBERS,
             (isa::CallConv::PreserveAll, _) => NO_CLOBBERS,
             (_, false) => DEFAULT_AAPCS_CLOBBERS,
             (_, true) => panic!("unimplemented clobbers for exn abi of {call_conv:?}"),
@@ -1164,8 +1238,14 @@ impl ABIMachineSpec for AArch64MachineDeps {
     fn get_ext_mode(
         call_conv: isa::CallConv,
         specified: ir::ArgumentExtension,
+        location: ABIArgLocation,
     ) -> ir::ArgumentExtension {
-        if call_conv == isa::CallConv::AppleAarch64 {
+        // Apple's AArch64 ABI only requires the caller to sign/zero-extend
+        // arguments in registers; stack-passed arguments use their natural
+        // (possibly sub-word) size and are not extended. See "Pass arguments
+        // to functions correctly" in:
+        // https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
+        if call_conv == isa::CallConv::AppleAarch64 && location == ABIArgLocation::Reg {
             specified
         } else {
             ir::ArgumentExtension::None
@@ -1192,9 +1272,20 @@ impl ABIMachineSpec for AArch64MachineDeps {
             })
             .collect();
 
-        // Sort registers for deterministic code output. We can do an unstable
-        // sort because the registers will be unique (there are no dups).
-        regs.sort_unstable();
+        if call_conv == isa::CallConv::AppleAarch64 && flags.enable_compact_unwind_abi() {
+            add_macho_compact_unwind_paired_regs(&mut regs);
+            // For Mach-O compact unwind, these pushes/pops must be emitted in
+            // the fixed expected order. The encoding specifies only which
+            // callee-saved register pairs are preserved; the order is mandatory.
+            regs.sort_unstable_by_key(|r| {
+                let reg = r.to_reg();
+                (reg.class(), Reverse(reg.hw_enc()))
+            });
+        } else {
+            // Sort registers for deterministic code output. We can do an unstable
+            // sort because the registers will be unique (there are no dups).
+            regs.sort_unstable();
+        }
 
         // Compute clobber size.
         let clobber_size = compute_clobber_size(call_conv, &regs);
@@ -1239,9 +1330,10 @@ impl ABIMachineSpec for AArch64MachineDeps {
     fn exception_payload_regs(call_conv: isa::CallConv) -> &'static [Reg] {
         const PAYLOAD_REGS: &'static [Reg] = &[regs::xreg(0), regs::xreg(1)];
         match call_conv {
-            isa::CallConv::SystemV | isa::CallConv::Tail | isa::CallConv::PreserveAll => {
-                PAYLOAD_REGS
-            }
+            isa::CallConv::SystemV
+            | isa::CallConv::Tail
+            | isa::CallConv::PreserveAll
+            | isa::CallConv::AppleAarch64 => PAYLOAD_REGS,
             _ => &[],
         }
     }
@@ -1263,7 +1355,7 @@ impl AArch64MachineDeps {
                 AMode::SPOffset { off: 0 },
                 zero_reg(),
                 I32,
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
             ));
         }
 

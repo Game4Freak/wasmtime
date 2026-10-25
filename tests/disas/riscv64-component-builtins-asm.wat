@@ -27,10 +27,10 @@
 ;;       ld      a2, 8(s0)
 ;;       sd      a2, 0x38(a1)
 ;;       lw      a1, 0x20(a0)
-;;       andi    a1, a1, 1
+;;       sext.w  a1, a1
 ;;       bnez    a1, 8
 ;;       .byte   0x00, 0x00, 0x00, 0x00
-;;       ╰─╼ trap: CannotLeaveComponent
+;;       ╰─╼ trap: Normal(CannotLeaveComponent)
 ;;       ld      a1, 8(a0)
 ;;       ld      a5, 0x10(a1)
 ;;       mv      a4, zero
@@ -53,7 +53,7 @@
 ;;       ret
 ;;       mv      a1, s4
 ;;       ld      a0, 0x10(a1)
-;;       ld      a2, 0x198(a0)
+;;       ld      a2, 0x148(a0)
 ;;       mv      a0, a1
 ;;       jalr    a2
 ;;       .byte   0x00, 0x00, 0x00, 0x00

@@ -23,6 +23,8 @@ fn test_tail_call_default() -> Result<()> {
             true,
             Config::new()
                 .strategy(Strategy::Cranelift)
+                .wasm_simd(false)
+                .wasm_relaxed_simd(false)
                 .target("riscv64")?,
         ),
         (
@@ -41,6 +43,22 @@ fn test_tail_call_default() -> Result<()> {
             line!(),
             false,
             Config::new().strategy(Strategy::Winch).target("aarch64")?,
+        ),
+        (
+            line!(),
+            false,
+            Config::new()
+                .strategy(Strategy::Winch)
+                .wasm_tail_call(false)
+                .target("x86_64")?,
+        ),
+        (
+            line!(),
+            false,
+            Config::new()
+                .strategy(Strategy::Winch)
+                .wasm_tail_call(false)
+                .target("aarch64")?,
         ),
         (
             line!(),

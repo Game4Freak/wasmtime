@@ -30,7 +30,10 @@
 use crate::component::*;
 use crate::error::Result;
 use crate::prelude::*;
-use crate::{EntityIndex, EntityRef, ModuleInternedTypeIndex, PrimaryMap, WasmValType};
+use crate::{
+    EntityIndex, EntityRef, ModuleInternedTypeIndex, PanicOnOom as _, PrimaryMap, Trap, WasmValType,
+};
+use cranelift_entity::EntitySet;
 use cranelift_entity::packed_option::PackedOption;
 use indexmap::IndexMap;
 use info::LinearMemoryOptions;
@@ -43,13 +46,13 @@ use wasmparser::component_types::ComponentCoreModuleTypeId;
 #[derive(Default)]
 pub struct ComponentDfg {
     /// Same as `Component::import_types`
-    pub import_types: PrimaryMap<ImportIndex, (String, TypeDef)>,
+    pub import_types: PrimaryMap<ImportIndex, (String, ComponentExtern)>,
 
     /// Same as `Component::imports`
     pub imports: PrimaryMap<RuntimeImportIndex, (ImportIndex, Vec<String>)>,
 
     /// Same as `Component::exports`
-    pub exports: IndexMap<String, Export>,
+    pub exports: IndexMap<String, (Export, ComponentExternData)>,
 
     /// All trampolines and their type signature which will need to get
     /// compiled by Cranelift.
@@ -143,13 +146,17 @@ pub struct ComponentDfg {
     ///
     /// Currently all side effects are either instantiating core wasm modules or
     /// declaring a resource. These side effects affect the dataflow processing
-    /// of this component by idnicating what order operations should be
+    /// of this component by indicating what order operations should be
     /// performed during instantiation.
     pub side_effects: Vec<SideEffect>,
 
     /// Interned map of id-to-`CanonicalOptions`, or all sets-of-options used by
     /// this component.
     pub options: Intern<OptionsId, CanonicalOptions>,
+
+    /// The set of fused adapters which may skip their
+    /// `{enter,exit}-sync-call` window.
+    pub transparent_adapters: EntitySet<AdapterId>,
 }
 
 /// Possible side effects that are possible with instantiating this component.
@@ -254,7 +261,7 @@ pub enum Export {
     },
     Instance {
         ty: TypeComponentInstanceIndex,
-        exports: IndexMap<String, Export>,
+        exports: IndexMap<String, (Export, ComponentExternData)>,
     },
     Type(TypeDef),
 }
@@ -267,7 +274,6 @@ pub enum CoreDef {
     InstanceFlags(RuntimeComponentInstanceIndex),
     Trampoline(TrampolineIndex),
     UnsafeIntrinsic(ModuleInternedTypeIndex, UnsafeIntrinsic),
-    TaskMayBlock,
 
     /// This is a special variant not present in `info::CoreDef` which
     /// represents that this definition refers to a fused adapter function. This
@@ -295,6 +301,14 @@ where
 pub struct CoreExport<T> {
     pub instance: InstanceId,
     pub item: ExportItem<T>,
+}
+
+/// Same as `info::ExportItem`
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[expect(missing_docs, reason = "self-describing variants")]
+pub enum ExportItem<T> {
+    Index(T),
+    Name(String),
 }
 
 impl<T> CoreExport<T> {
@@ -368,10 +382,6 @@ pub enum Trampoline {
     },
     WaitableJoin {
         instance: RuntimeComponentInstanceIndex,
-    },
-    ThreadYield {
-        instance: RuntimeComponentInstanceIndex,
-        cancellable: bool,
     },
     SubtaskDrop {
         instance: RuntimeComponentInstanceIndex,
@@ -460,46 +470,48 @@ pub enum Trampoline {
     },
     ResourceTransferOwn,
     ResourceTransferBorrow,
+    ResourceTransferBorrowToOwner,
     PrepareCall {
         memory: Option<MemoryId>,
     },
-    SyncStartCall {
-        callback: Option<CallbackId>,
-    },
-    AsyncStartCall {
+    StartCall {
         callback: Option<CallbackId>,
         post_return: Option<PostReturnId>,
     },
     FutureTransfer,
     StreamTransfer,
     ErrorContextTransfer,
-    Trap,
+    Trap(Trap),
     EnterSyncCall,
     ExitSyncCall,
-    ThreadIndex,
+    ThreadIndex {
+        instance: RuntimeComponentInstanceIndex,
+    },
     ThreadNewIndirect {
         instance: RuntimeComponentInstanceIndex,
-        start_func_ty_idx: ComponentTypeIndex,
+        start_func_ty_idx: ModuleInternedTypeIndex,
         start_func_table_id: TableId,
     },
-    ThreadSuspendToSuspended {
+    ThreadResumeLater {
         instance: RuntimeComponentInstanceIndex,
-        cancellable: bool,
     },
     ThreadSuspend {
         instance: RuntimeComponentInstanceIndex,
-        cancellable: bool,
     },
-    ThreadSuspendTo {
-        instance: RuntimeComponentInstanceIndex,
-        cancellable: bool,
-    },
-    ThreadUnsuspend {
+    ThreadYield {
         instance: RuntimeComponentInstanceIndex,
     },
-    ThreadYieldToSuspended {
+    ThreadSuspendThenResume {
         instance: RuntimeComponentInstanceIndex,
-        cancellable: bool,
+    },
+    ThreadYieldThenResume {
+        instance: RuntimeComponentInstanceIndex,
+    },
+    ThreadSuspendThenPromote {
+        instance: RuntimeComponentInstanceIndex,
+    },
+    ThreadYieldThenPromote {
+        instance: RuntimeComponentInstanceIndex,
     },
 }
 
@@ -537,7 +549,6 @@ pub struct CanonicalOptions {
     pub callback: Option<CallbackId>,
     pub post_return: Option<PostReturnId>,
     pub async_: bool,
-    pub cancellable: bool,
     pub core_type: ModuleInternedTypeIndex,
     pub data_model: CanonicalOptionsDataModel,
 }
@@ -639,10 +650,15 @@ impl ComponentDfg {
         // creating some lowered imports, perhaps some saved modules, etc.
         let mut export_items = PrimaryMap::new();
         let mut exports = NameMap::default();
-        for (name, export) in self.exports.iter() {
+        for (name, (export, data)) in self.exports.iter() {
             let export =
                 linearize.export(export, &mut export_items, wasmtime_types, wasmparser_types)?;
-            exports.insert(name, &mut NameMapNoIntern, false, export)?;
+            exports.insert(
+                name,
+                &mut NameMapNoIntern,
+                false,
+                (export, data.try_clone()?),
+            )?;
         }
 
         // With all those pieces done the results of the dataflow-based
@@ -653,12 +669,12 @@ impl ComponentDfg {
             trampolines: linearize.trampoline_defs,
             component: Component {
                 exports,
-                export_items,
-                initializers: linearize.initializers,
+                export_items: export_items.into(),
+                initializers: linearize.initializers.into(),
                 unsafe_intrinsics: linearize.unsafe_intrinsics,
-                trampolines: linearize.trampolines,
+                trampolines: linearize.trampolines.into(),
                 num_lowerings: linearize.num_lowerings,
-                options: linearize.options,
+                options: linearize.options.into(),
 
                 num_runtime_memories: linearize.runtime_memories.len() as u32,
                 num_runtime_tables: linearize.runtime_tables.len() as u32,
@@ -666,19 +682,30 @@ impl ComponentDfg {
                 num_runtime_reallocs: linearize.runtime_reallocs.len() as u32,
                 num_runtime_callbacks: linearize.runtime_callbacks.len() as u32,
                 num_runtime_instances: linearize.runtime_instances.len() as u32,
-                imports: self.imports,
-                import_types: self.import_types,
+                imports: self
+                    .imports
+                    .into_iter()
+                    .map(|(_, (import, path))| {
+                        let path = path.into_iter().map(TryString::from).try_collect()?;
+                        Ok((import, path))
+                    })
+                    .try_collect::<_, OutOfMemory>()?,
+                import_types: self
+                    .import_types
+                    .into_iter()
+                    .map(|(_, (name, ty))| (TryString::from(name), ty))
+                    .try_collect()?,
                 num_runtime_component_instances: self.num_runtime_component_instances,
                 num_future_tables: self.num_future_tables,
                 num_stream_tables: self.num_stream_tables,
                 num_error_context_tables: self.num_error_context_tables,
                 num_resources: (self.resources.len() + self.imported_resources.len()) as u32,
-                imported_resources: self.imported_resources,
+                imported_resources: self.imported_resources.into(),
                 defined_resource_instances: self
                     .resources
                     .iter()
                     .map(|(_, r)| r.instance)
-                    .collect(),
+                    .try_collect()?,
             },
         })
     }
@@ -687,6 +714,24 @@ impl ComponentDfg {
     /// number of imported resources.
     pub fn resource_index(&self, defined: DefinedResourceIndex) -> ResourceIndex {
         ResourceIndex::from_u32(defined.as_u32() + (self.imported_resources.len() as u32))
+    }
+
+    /// Convert a resource index into a defined index, or `None` if `idx` is for
+    /// an imported resource.
+    pub fn defined_resource_index(&self, idx: ResourceIndex) -> Option<DefinedResourceIndex> {
+        let idx = idx
+            .as_u32()
+            .checked_sub(u32::try_from(self.imported_resources.len()).unwrap())?;
+        Some(DefinedResourceIndex::from_u32(idx))
+    }
+
+    /// Returns the component instance which defines `idx`, or `None` if `idx`
+    /// is for an imported resource.
+    pub fn defined_resource_instance(
+        &self,
+        idx: ResourceIndex,
+    ) -> Option<RuntimeComponentInstanceIndex> {
+        Some(self.resources[self.defined_resource_index(idx)?].instance)
     }
 }
 
@@ -736,7 +781,10 @@ impl LinearizeDfg<'_> {
         let instantiation = match args {
             Instance::Static(index, args) => InstantiateModule::Static(
                 *index,
-                args.iter().map(|def| self.core_def(def)).collect(),
+                args.iter()
+                    .map(|def| self.core_def(def))
+                    .try_collect()
+                    .panic_on_oom(),
             ),
             Instance::Import(index, args) => InstantiateModule::Import(
                 *index,
@@ -744,11 +792,14 @@ impl LinearizeDfg<'_> {
                     .map(|(module, values)| {
                         let values = values
                             .iter()
-                            .map(|(name, def)| (name.clone(), self.core_def(def)))
-                            .collect();
-                        (module.clone(), values)
+                            .map(|(name, def)| {
+                                Ok((TryString::try_from(name.as_str())?, self.core_def(def)))
+                            })
+                            .try_collect::<_, OutOfMemory>()?;
+                        Ok((TryString::try_from(module.as_str())?, values))
                     })
-                    .collect(),
+                    .try_collect::<_, OutOfMemory>()
+                    .panic_on_oom(),
             ),
         };
         let index = RuntimeInstanceIndex::new(self.runtime_instances.len());
@@ -802,10 +853,15 @@ impl LinearizeDfg<'_> {
                 ty: *ty,
                 exports: {
                     let mut map = NameMap::default();
-                    for (name, export) in exports {
+                    for (name, (export, data)) in exports {
                         let export =
                             self.export(export, items, wasmtime_types, wasmparser_types)?;
-                        map.insert(name, &mut NameMapNoIntern, false, export)?;
+                        map.insert(
+                            name,
+                            &mut NameMapNoIntern,
+                            false,
+                            (export, data.try_clone()?),
+                        )?;
                     }
                     map
                 },
@@ -842,7 +898,6 @@ impl LinearizeDfg<'_> {
             callback,
             post_return,
             async_: options.async_,
-            cancellable: options.cancellable,
             core_type: options.core_type,
             data_model,
         };
@@ -907,7 +962,6 @@ impl LinearizeDfg<'_> {
                 }
                 info::CoreDef::UnsafeIntrinsic(*i)
             }
-            CoreDef::TaskMayBlock => info::CoreDef::TaskMayBlock,
         }
     }
 
@@ -997,13 +1051,6 @@ impl LinearizeDfg<'_> {
             },
             Trampoline::WaitableJoin { instance } => info::Trampoline::WaitableJoin {
                 instance: *instance,
-            },
-            Trampoline::ThreadYield {
-                instance,
-                cancellable,
-            } => info::Trampoline::ThreadYield {
-                instance: *instance,
-                cancellable: *cancellable,
             },
             Trampoline::SubtaskDrop { instance } => info::Trampoline::SubtaskDrop {
                 instance: *instance,
@@ -1140,26 +1187,28 @@ impl LinearizeDfg<'_> {
             },
             Trampoline::ResourceTransferOwn => info::Trampoline::ResourceTransferOwn,
             Trampoline::ResourceTransferBorrow => info::Trampoline::ResourceTransferBorrow,
+            Trampoline::ResourceTransferBorrowToOwner => {
+                info::Trampoline::ResourceTransferBorrowToOwner
+            }
             Trampoline::PrepareCall { memory } => info::Trampoline::PrepareCall {
                 memory: memory.map(|v| self.runtime_memory(v)),
             },
-            Trampoline::SyncStartCall { callback } => info::Trampoline::SyncStartCall {
-                callback: callback.map(|v| self.runtime_callback(v)),
-            },
-            Trampoline::AsyncStartCall {
+            Trampoline::StartCall {
                 callback,
                 post_return,
-            } => info::Trampoline::AsyncStartCall {
+            } => info::Trampoline::StartCall {
                 callback: callback.map(|v| self.runtime_callback(v)),
                 post_return: post_return.map(|v| self.runtime_post_return(v)),
             },
             Trampoline::FutureTransfer => info::Trampoline::FutureTransfer,
             Trampoline::StreamTransfer => info::Trampoline::StreamTransfer,
             Trampoline::ErrorContextTransfer => info::Trampoline::ErrorContextTransfer,
-            Trampoline::Trap => info::Trampoline::Trap,
+            Trampoline::Trap(trap) => info::Trampoline::Trap(*trap),
             Trampoline::EnterSyncCall => info::Trampoline::EnterSyncCall,
             Trampoline::ExitSyncCall => info::Trampoline::ExitSyncCall,
-            Trampoline::ThreadIndex => info::Trampoline::ThreadIndex,
+            Trampoline::ThreadIndex { instance } => info::Trampoline::ThreadIndex {
+                instance: *instance,
+            },
             Trampoline::ThreadNewIndirect {
                 instance,
                 start_func_ty_idx,
@@ -1169,37 +1218,35 @@ impl LinearizeDfg<'_> {
                 start_func_ty_idx: *start_func_ty_idx,
                 start_func_table_idx: self.runtime_table(*start_func_table_id),
             },
-            Trampoline::ThreadSuspendToSuspended {
-                instance,
-                cancellable,
-            } => info::Trampoline::ThreadSuspendToSuspended {
-                instance: *instance,
-                cancellable: *cancellable,
-            },
-            Trampoline::ThreadSuspendTo {
-                instance,
-                cancellable,
-            } => info::Trampoline::ThreadSuspendTo {
-                instance: *instance,
-                cancellable: *cancellable,
-            },
-            Trampoline::ThreadSuspend {
-                instance,
-                cancellable,
-            } => info::Trampoline::ThreadSuspend {
-                instance: *instance,
-                cancellable: *cancellable,
-            },
-            Trampoline::ThreadUnsuspend { instance } => info::Trampoline::ThreadUnsuspend {
+            Trampoline::ThreadResumeLater { instance } => info::Trampoline::ThreadResumeLater {
                 instance: *instance,
             },
-            Trampoline::ThreadYieldToSuspended {
-                instance,
-                cancellable,
-            } => info::Trampoline::ThreadYieldToSuspended {
+            Trampoline::ThreadSuspend { instance } => info::Trampoline::ThreadSuspend {
                 instance: *instance,
-                cancellable: *cancellable,
             },
+            Trampoline::ThreadYield { instance } => info::Trampoline::ThreadYield {
+                instance: *instance,
+            },
+            Trampoline::ThreadSuspendThenResume { instance } => {
+                info::Trampoline::ThreadSuspendThenResume {
+                    instance: *instance,
+                }
+            }
+            Trampoline::ThreadYieldThenResume { instance } => {
+                info::Trampoline::ThreadYieldThenResume {
+                    instance: *instance,
+                }
+            }
+            Trampoline::ThreadSuspendThenPromote { instance } => {
+                info::Trampoline::ThreadSuspendThenPromote {
+                    instance: *instance,
+                }
+            }
+            Trampoline::ThreadYieldThenPromote { instance } => {
+                info::Trampoline::ThreadYieldThenPromote {
+                    instance: *instance,
+                }
+            }
         };
         let i1 = self.trampolines.push(*signature);
         let i2 = self.trampoline_defs.push(trampoline);
@@ -1216,7 +1263,10 @@ impl LinearizeDfg<'_> {
         log::trace!("referencing export of {instance:?}");
         info::CoreExport {
             instance: self.runtime_instances[&RuntimeInstance::Normal(instance)],
-            item: export.item.clone(),
+            item: match &export.item {
+                ExportItem::Index(i) => info::ExportItem::Index(i.clone()),
+                ExportItem::Name(name) => info::ExportItem::Name(name.clone().into()),
+            },
         }
     }
 
@@ -1231,7 +1281,7 @@ impl LinearizeDfg<'_> {
         // This adapter is always an export of the instance.
         info::CoreExport {
             instance,
-            item: ExportItem::Index(entity_index),
+            item: info::ExportItem::Index(entity_index),
         }
     }
 
@@ -1242,7 +1292,11 @@ impl LinearizeDfg<'_> {
             |me, _| {
                 log::debug!("instantiating {adapter_module:?}");
                 let (module_index, args) = &me.dfg.adapter_modules[adapter_module];
-                let args = args.iter().map(|arg| me.core_def(arg)).collect();
+                let args = args
+                    .iter()
+                    .map(|arg| me.core_def(arg))
+                    .try_collect()
+                    .panic_on_oom();
                 let instantiate = InstantiateModule::Static(*module_index, args);
                 GlobalInitializer::InstantiateModule(instantiate, None)
             },

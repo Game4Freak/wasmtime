@@ -11,7 +11,7 @@ mod api {
         world: "bytecodealliance:wasmtime/debug-main",
         path: "../../crates/debugger/wit",
         with: {
-            "wasi:io/poll@0.2.6": wasip2::io::poll,
+            "wasi:io/poll@0.2.12": wasip2::io::poll,
         }
     });
 }
@@ -78,7 +78,7 @@ fn test_simple(d: &Debuggee) {
 
     // There should be five PCs and they should each be distinct from the previous.
     assert_eq!(pcs.len(), 5);
-    assert!(pcs.windows(2).all(|p| p[0] != p[1]));
+    assert!(pcs.array_windows().all(|[a, b]| a != b));
 
     eprintln!("OK");
 }

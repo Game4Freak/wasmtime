@@ -41,25 +41,29 @@
 )
 ;; function u0:0(i64 vmctx, i64, i32, i32, i32) tail {
 ;;     ss0 = explicit_slot 4, align = 4
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 42 ""
+;;     region3 = 174 ""
+;;     region4 = 135 ""
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
-;;     gv3 = vmctx
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     sig0 = (i64 vmctx, i64) tail
 ;;     sig1 = (i64 vmctx, i64, i32) tail
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32, v3: i32, v4: i32):
 ;; @0049                               v5 = select v4, v2, v3
-;;                                     v14 = stack_addr.i64 ss0
-;;                                     store notrap v5, v14
-;; @004c                               v8 = load.i64 notrap aligned readonly can_move v0+88
-;; @004c                               v7 = load.i64 notrap aligned readonly can_move v0+104
-;; @004c                               call_indirect sig0, v8(v7, v0), stack_map=[i32 @ ss0+0]
-;;                                     v12 = load.i32 notrap v14
-;; @004e                               v11 = load.i64 notrap aligned readonly can_move v0+56
-;; @004e                               v10 = load.i64 notrap aligned readonly can_move v0+72
-;; @004e                               call_indirect sig1, v11(v10, v0, v12)
+;;                                     v12 = stack_addr.i64 ss0
+;;                                     store notrap aligned region4 v5, v12
+;; @004c                               v7 = load.i64 notrap aligned readonly can_move region3 v0+88
+;; @004c                               v6 = load.i64 notrap aligned readonly can_move region2 v0+104
+;; @004c                               call_indirect sig0, v7(v6, v0), stack_map=[i32 @ ss0+0]
+;;                                     v11 = load.i32 notrap aligned region4 v12
+;; @004e                               v9 = load.i64 notrap aligned readonly can_move region3 v0+56
+;; @004e                               v8 = load.i64 notrap aligned readonly can_move region2 v0+72
+;; @004e                               call_indirect sig1, v9(v8, v0, v11)
 ;; @0050                               jump block1
 ;;
 ;;                                 block1:
@@ -67,22 +71,25 @@
 ;; }
 ;;
 ;; function u0:1(i64 vmctx, i64, i32, i32, i32) tail {
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 42 ""
+;;     region3 = 174 ""
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
-;;     gv3 = vmctx
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     sig0 = (i64 vmctx, i64) tail
 ;;     sig1 = (i64 vmctx, i64, i32) tail
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32, v3: i32, v4: i32):
-;; @005c                               v8 = load.i64 notrap aligned readonly can_move v0+88
-;; @005c                               v7 = load.i64 notrap aligned readonly can_move v0+104
-;; @005c                               call_indirect sig0, v8(v7, v0)
-;; @005e                               v11 = load.i64 notrap aligned readonly can_move v0+56
-;; @005e                               v10 = load.i64 notrap aligned readonly can_move v0+72
+;; @005c                               v7 = load.i64 notrap aligned readonly can_move region3 v0+88
+;; @005c                               v6 = load.i64 notrap aligned readonly can_move region2 v0+104
+;; @005c                               call_indirect sig0, v7(v6, v0)
+;; @005e                               v9 = load.i64 notrap aligned readonly can_move region3 v0+56
+;; @005e                               v8 = load.i64 notrap aligned readonly can_move region2 v0+72
 ;; @0059                               v5 = select v4, v2, v3
-;; @005e                               call_indirect sig1, v11(v10, v0, v5)
+;; @005e                               call_indirect sig1, v9(v8, v0, v5)
 ;; @0060                               jump block1
 ;;
 ;;                                 block1:

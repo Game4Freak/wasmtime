@@ -29,6 +29,19 @@ use core::alloc::Layout;
 /// enabled.
 pub const POISON: u8 = 0b00001111;
 
+/// The bit within a `VMDrcHeader`'s reserved bits that is the mark
+/// bit. Collectively, this bit in all the heap's objects' headers implements
+/// the precise-stack-roots set.
+pub const DRC_HEADER_MARK_BIT: u32 = 1 << 0;
+
+/// The bit within a `VMDrcHeader`'s reserved bits that is the
+/// in-the-over-approximated-stack-roots list bit.
+pub const DRC_HEADER_IN_OVER_APPROX_LIST_BIT: u32 = 1 << 1;
+
+/// The minimum length the over-approximated-stack-roots list must reach
+/// before a read barrier considers forcing a GC.
+pub const DRC_MIN_OVER_APPROX_STACK_ROOTS_GC_THRESHOLD: i64 = 1024;
+
 /// Assert a condition, but only when `gc_zeal` is enabled.
 #[macro_export]
 macro_rules! gc_assert {
@@ -139,9 +152,7 @@ fn common_struct_or_exn_layout(
     fields: &[crate::WasmFieldType],
     header_size: u32,
     header_align: u32,
-) -> (u32, u32, TryVec<GcStructLayoutField>) {
-    use crate::PanicOnOom as _;
-
+) -> Result<(u32, u32, TryVec<GcStructLayoutField>), OutOfMemory> {
     // Process each field, aligning it to its natural alignment.
     //
     // We don't try and do any fancy field reordering to minimize padding (yet?)
@@ -162,15 +173,14 @@ fn common_struct_or_exn_layout(
             let is_gc_ref = f.element_type.is_vmgcref_type_and_not_i31();
             GcStructLayoutField { offset, is_gc_ref }
         })
-        .try_collect::<TryVec<_>, _>()
-        .panic_on_oom();
+        .try_collect::<TryVec<_>, _>()?;
 
     // Ensure that the final size is a multiple of the alignment, for
     // simplicity.
     let align_size_to = align;
     align_up(&mut size, &mut align, align_size_to);
 
-    (size, align, fields)
+    Ok((size, align, fields))
 }
 
 /// Common code to define a GC struct's layout, given the size and alignment of
@@ -180,25 +190,29 @@ fn common_struct_layout(
     ty: &WasmStructType,
     header_size: u32,
     header_align: u32,
-) -> GcStructLayout {
+) -> Result<GcStructLayout, OutOfMemory> {
     assert!(header_size >= crate::VM_GC_HEADER_SIZE);
     assert!(header_align >= crate::VM_GC_HEADER_ALIGN);
 
-    let (size, align, fields) = common_struct_or_exn_layout(&ty.fields, header_size, header_align);
+    let (size, align, fields) = common_struct_or_exn_layout(&ty.fields, header_size, header_align)?;
 
-    GcStructLayout {
+    Ok(GcStructLayout {
         size,
         align,
         fields,
         is_exception: false,
-    }
+    })
 }
 
 /// Common code to define a GC exception object's layout, given the
 /// size and alignment of the collector's GC header and its expected
 /// offset of the array length field.
 #[cfg(any(feature = "gc-null", feature = "gc-drc", feature = "gc-copying"))]
-fn common_exn_layout(ty: &WasmExnType, header_size: u32, header_align: u32) -> GcStructLayout {
+fn common_exn_layout(
+    ty: &WasmExnType,
+    header_size: u32,
+    header_align: u32,
+) -> Result<GcStructLayout, OutOfMemory> {
     assert!(header_size >= crate::VM_GC_HEADER_SIZE);
     assert!(header_align >= crate::VM_GC_HEADER_ALIGN);
 
@@ -207,14 +221,14 @@ fn common_exn_layout(ty: &WasmExnType, header_size: u32, header_align: u32) -> G
     assert!(header_align >= 8);
     let header_size = header_size + 2 * u32::try_from(core::mem::size_of::<u32>()).unwrap();
 
-    let (size, align, fields) = common_struct_or_exn_layout(&ty.fields, header_size, header_align);
+    let (size, align, fields) = common_struct_or_exn_layout(&ty.fields, header_size, header_align)?;
 
-    GcStructLayout {
+    Ok(GcStructLayout {
         size,
         align,
         fields,
         is_exception: true,
-    }
+    })
 }
 
 /// A trait for getting the layout of a Wasm GC struct or array inside a
@@ -244,16 +258,18 @@ pub trait GcTypeLayouts {
     ///
     /// Returns `None` if the type is a function type, as functions are not
     /// managed by the GC.
-    fn gc_layout(&self, ty: &WasmCompositeType) -> Option<GcLayout> {
+    fn gc_layout(&self, ty: &WasmCompositeType) -> Result<Option<GcLayout>, OutOfMemory> {
         assert!(!ty.shared);
         match &ty.inner {
-            WasmCompositeInnerType::Array(ty) => Some(self.array_layout(ty).into()),
-            WasmCompositeInnerType::Struct(ty) => Some(Arc::new(self.struct_layout(ty)).into()),
-            WasmCompositeInnerType::Func(_) => None,
+            WasmCompositeInnerType::Array(ty) => Ok(Some(self.array_layout(ty).into())),
+            WasmCompositeInnerType::Struct(ty) => {
+                Ok(Some(Arc::new(self.struct_layout(ty)?).into()))
+            }
+            WasmCompositeInnerType::Func(_) => Ok(None),
             WasmCompositeInnerType::Cont(_) => {
                 unimplemented!("Stack switching feature not compatible with GC, yet")
             }
-            WasmCompositeInnerType::Exn(ty) => Some(Arc::new(self.exn_layout(ty)).into()),
+            WasmCompositeInnerType::Exn(ty) => Ok(Some(Arc::new(self.exn_layout(ty)?).into())),
         }
     }
 
@@ -261,10 +277,10 @@ pub trait GcTypeLayouts {
     fn array_layout(&self, ty: &WasmArrayType) -> GcArrayLayout;
 
     /// Get this collector's layout for the given struct type.
-    fn struct_layout(&self, ty: &WasmStructType) -> GcStructLayout;
+    fn struct_layout(&self, ty: &WasmStructType) -> Result<GcStructLayout, OutOfMemory>;
 
     /// Get this collector's layout for the given exception type.
-    fn exn_layout(&self, ty: &WasmExnType) -> GcStructLayout;
+    fn exn_layout(&self, ty: &WasmExnType) -> Result<GcStructLayout, OutOfMemory>;
 }
 
 /// The layout of a GC-managed object.
@@ -500,19 +516,14 @@ impl VMGcKind {
 
     /// Convert the given value into a `VMGcKind` by masking off the unused
     /// bottom bits.
+    ///
+    /// Returns `None` if the remaining bits do not name a kind, which most
+    /// callers must be prepared for, since these values come out of the
+    /// untrusted GC heap.
     #[inline]
-    pub fn from_high_bits_of_u32(val: u32) -> VMGcKind {
+    pub fn from_high_bits_of_u32(val: u32) -> Option<VMGcKind> {
         let masked = val & Self::MASK;
-        let result = Self::try_from_u32(masked)
-            .unwrap_or_else(|| panic!("invalid `VMGcKind`: {masked:#032b}"));
-
-        let poison_kind = u32::from_le_bytes([POISON, POISON, POISON, POISON]) & VMGcKind::MASK;
-        debug_assert_ne!(
-            masked, poison_kind,
-            "No valid `VMGcKind` should overlap with the poison pattern"
-        );
-
-        result
+        Self::try_from_u32(masked)
     }
 
     /// Does this kind match the other kind?
@@ -549,7 +560,13 @@ impl VMGcKind {
 #[cfg(test)]
 mod tests {
     use super::VMGcKind::*;
-    use crate::prelude::*;
+    use super::*;
+
+    #[test]
+    fn poison_is_not_a_kind() {
+        let poison = u32::from_le_bytes([POISON, POISON, POISON, POISON]);
+        assert!(VMGcKind::from_high_bits_of_u32(poison).is_none());
+    }
 
     #[test]
     fn kind_matches() {

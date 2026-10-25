@@ -1,11 +1,11 @@
 use crate::p3::bindings::http::types::ErrorCode;
-use crate::p3::body::{Body, GuestBody};
-use crate::p3::{WasiHttpCtxView, WasiHttpView};
-use crate::{FieldMap, get_content_length};
+use crate::p3::body::{Body, BodyExt as _, GuestBody};
+use crate::{Error, FieldMap, WasiHttpCtxView, WasiHttpHooks, WasiHttpView, get_content_length};
 use bytes::Bytes;
 use http::StatusCode;
 use http_body_util::BodyExt as _;
 use http_body_util::combinators::UnsyncBoxBody;
+use tokio::sync::oneshot;
 use wasmtime::AsContextMut;
 use wasmtime::error::Context as _;
 
@@ -45,8 +45,8 @@ impl Response {
     pub fn into_http<T: WasiHttpView + 'static>(
         self,
         store: impl AsContextMut<Data = T>,
-        fut: impl Future<Output = Result<(), ErrorCode>> + Send + 'static,
-    ) -> wasmtime::Result<http::Response<UnsyncBoxBody<Bytes, ErrorCode>>> {
+        fut: impl Future<Output = Result<(), Error>> + Send + 'static,
+    ) -> wasmtime::Result<http::Response<UnsyncBoxBody<Bytes, Error>>> {
         self.into_http_with_getter(store, fut, T::http)
     }
 
@@ -54,36 +54,50 @@ impl Response {
     /// to a [`WasiHttpCtxView`].
     pub fn into_http_with_getter<T: 'static>(
         self,
-        store: impl AsContextMut<Data = T>,
-        fut: impl Future<Output = Result<(), ErrorCode>> + Send + 'static,
-        getter: fn(&mut T) -> WasiHttpCtxView<'_>,
-    ) -> wasmtime::Result<http::Response<UnsyncBoxBody<Bytes, ErrorCode>>> {
+        mut store: impl AsContextMut<Data = T>,
+        fut: impl Future<Output = Result<(), Error>> + Send + 'static,
+        mut getter: impl FnMut(&mut T) -> WasiHttpCtxView<'_> + Clone + Unpin + Send + 'static,
+    ) -> wasmtime::Result<http::Response<UnsyncBoxBody<Bytes, Error>>> {
         let res = http::Response::try_from(self)?;
         let (res, body) = res.into_parts();
+        // `Content-Length` header value is validated in `fields` implementation
+        let content_length =
+            get_content_length(&res.headers).context("failed to parse `content-length`")?;
         let body = match body {
             Body::Guest {
                 contents_rx,
                 trailers_rx,
                 result_tx,
-            } => {
-                // `Content-Length` header value is validated in `fields` implementation
-                let content_length =
-                    get_content_length(&res.headers).context("failed to parse `content-length`")?;
-                GuestBody::new(
-                    store,
-                    contents_rx,
-                    trailers_rx,
-                    result_tx,
-                    fut,
-                    content_length,
-                    ErrorCode::HttpResponseBodySize,
-                    getter,
-                )?
-                .boxed_unsync()
-            }
+            } => GuestBody::new(
+                &mut store,
+                contents_rx,
+                trailers_rx,
+                result_tx,
+                fut,
+                content_length,
+                ErrorCode::HttpResponseBodySize,
+                getter,
+            )?
+            .boxed_unsync(),
             Body::Host { body, result_tx } => {
-                _ = result_tx.send(Box::new(fut));
-                body
+                let is_forbidden = getter(store.as_context_mut().data_mut())
+                    .hooks
+                    .forbidden_header_filter();
+                let body = body.with_filtered_trailers(is_forbidden);
+                if let Some(limit) = content_length {
+                    let (http_result_tx, http_result_rx) = oneshot::channel();
+                    _ = result_tx.send(Box::new(async move {
+                        if let Ok(err) = http_result_rx.await {
+                            return Err(err);
+                        };
+                        fut.await
+                    }));
+                    body.with_content_length(limit, http_result_tx, Error::HttpResponseBodySize)
+                        .boxed_unsync()
+                } else {
+                    _ = result_tx.send(Box::new(fut));
+                    body.boxed_unsync()
+                }
             }
         };
         Ok(http::Response::from_parts(res, body))
@@ -91,21 +105,22 @@ impl Response {
 
     /// Convert [http::Response] into [Response].
     pub fn from_http<T>(
+        hooks: &mut dyn WasiHttpHooks,
         res: http::Response<T>,
     ) -> (
         Self,
-        impl Future<Output = Result<(), ErrorCode>> + Send + 'static,
+        impl Future<Output = Result<(), Error>> + Send + 'static + use<T>,
     )
     where
         T: http_body::Body<Data = Bytes> + Send + 'static,
-        T::Error: Into<ErrorCode>,
+        T::Error: Into<Error>,
     {
         let (parts, body) = res.into_parts();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
         let wasi_response = Response {
             status: parts.status,
-            headers: FieldMap::new_immutable(parts.headers),
+            headers: FieldMap::new_immutable(hooks, parts.headers),
             body: Body::Host {
                 body: body.map_err(Into::into).boxed_unsync(),
                 result_tx,
@@ -126,6 +141,7 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::default_hooks;
     use core::future::Future;
     use core::pin::pin;
     use core::task::{Context, Poll, Waker};
@@ -139,7 +155,7 @@ mod tests {
             .body(Full::new(Bytes::from_static(b"hello wasm")))
             .unwrap();
 
-        let (wasi_resp, io_future) = Response::from_http(http_response);
+        let (wasi_resp, io_future) = Response::from_http(default_hooks(), http_response);
         assert_eq!(wasi_resp.status, StatusCode::OK);
         assert_eq!(
             wasi_resp.headers.get("x-custom-header").unwrap(),

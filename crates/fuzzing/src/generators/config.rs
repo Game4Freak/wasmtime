@@ -138,6 +138,8 @@ impl Config {
             tail_call,
             extended_const,
             wide_arithmetic,
+            branch_hinting,
+            compact_imports,
             component_model_async,
             component_model_more_async_builtins,
             component_model_async_stackful,
@@ -145,7 +147,11 @@ impl Config {
             component_model_error_context,
             component_model_gc,
             component_model_map,
+            component_model_memory64,
             component_model_fixed_length_lists,
+            component_model_implements,
+            component_model_canonical_names,
+            component_model_accessors,
             simd,
             exceptions,
             legacy_exceptions: _,
@@ -172,9 +178,15 @@ impl Config {
             component_model_error_context.unwrap_or(false);
         self.module_config.component_model_gc = component_model_gc.unwrap_or(false);
         self.module_config.component_model_map = component_model_map.unwrap_or(false);
+        self.module_config.component_model_memory64 = component_model_memory64.unwrap_or(false);
         self.module_config.component_model_fixed_length_lists =
             component_model_fixed_length_lists.unwrap_or(false);
+        self.module_config.component_model_implements = component_model_implements.unwrap_or(false);
+        self.module_config.component_model_canonical_names =
+            component_model_canonical_names.unwrap_or(false);
+        self.module_config.component_model_accessors = component_model_accessors.unwrap_or(false);
         self.module_config.stack_switching = stack_switching.unwrap_or(false);
+        self.wasmtime.branch_hinting = branch_hinting.unwrap_or(false);
 
         // Enable/disable proposals that wasm-smith has knobs for which will be
         // read when creating `wasmtime::Config`.
@@ -182,6 +194,7 @@ impl Config {
         config.bulk_memory_enabled = bulk_memory.unwrap_or(false);
         config.multi_value_enabled = true;
         config.wide_arithmetic_enabled = wide_arithmetic.unwrap_or(false);
+        config.compact_imports_enabled = compact_imports.unwrap_or(false);
         config.memory64_enabled = memory64.unwrap_or(false);
         config.relaxed_simd_enabled = relaxed_simd.unwrap_or(false);
         config.simd_enabled = config.relaxed_simd_enabled || simd.unwrap_or(false);
@@ -192,17 +205,26 @@ impl Config {
         config.gc_enabled = gc.unwrap_or(false);
         config.reference_types_enabled = config.gc_enabled
             || self.module_config.function_references_enabled
+            || self.module_config.component_model_async
             || reference_types.unwrap_or(false);
         config.extended_const_enabled = extended_const.unwrap_or(false);
-        config.exceptions_enabled = exceptions.unwrap_or(false);
+        config.exceptions_enabled =
+            self.module_config.stack_switching || exceptions.unwrap_or(false);
         if multi_memory.unwrap_or(false) {
             config.max_memories = limits::MEMORIES_PER_MODULE as usize;
         } else {
             config.max_memories = 1;
         }
 
+        if self.module_config.stack_switching {
+            self.wasmtime.inlining = Some(Inlining::No);
+        }
+
         if let Some(n) = &mut self.wasmtime.memory_config.memory_reservation {
             *n = (*n).max(limits::MEMORY_SIZE as u64);
+        }
+        if let Some(n) = &mut self.wasmtime.memory_config.gc_heap_reservation {
+            *n = (*n).max(limits::GC_HEAP_SIZE as u64);
         }
 
         // FIXME: it might be more ideal to avoid the need for this entirely
@@ -238,7 +260,10 @@ impl Config {
                 .max_memories_per_component
                 .max(limits::MEMORIES_PER_MODULE);
             pooling.total_core_instances = pooling.total_core_instances.max(limits::CORE_INSTANCES);
-            pooling.max_memory_size = pooling.max_memory_size.max(limits::MEMORY_SIZE);
+            pooling.max_memory_size = pooling
+                .max_memory_size
+                .max(limits::MEMORY_SIZE)
+                .max(limits::GC_HEAP_SIZE);
             pooling.table_elements = pooling.table_elements.max(limits::TABLE_ELEMENTS);
             pooling.core_instance_size = pooling.core_instance_size.max(limits::CORE_INSTANCE_SIZE);
             pooling.component_instance_size = pooling
@@ -289,6 +314,7 @@ impl Config {
         cfg.codegen.parallel_compilation = Some(false);
 
         cfg.debug.address_map = Some(self.wasmtime.generate_address_map);
+        cfg.debug.symbols = Some(self.wasmtime.debug_symbols);
         cfg.opts.opt_level = Some(self.wasmtime.opt_level.to_wasmtime());
         cfg.opts.regalloc_algorithm = Some(self.wasmtime.regalloc_algorithm.to_wasmtime());
         cfg.opts.signals_based_traps = Some(self.wasmtime.signals_based_traps);
@@ -314,9 +340,15 @@ impl Config {
             Some(self.module_config.component_model_error_context);
         cfg.wasm.component_model_gc = Some(self.module_config.component_model_gc);
         cfg.wasm.component_model_map = Some(self.module_config.component_model_map);
+        cfg.wasm.component_model_memory64 = Some(self.module_config.component_model_memory64);
         cfg.wasm.component_model_fixed_length_lists =
             Some(self.module_config.component_model_fixed_length_lists);
+        cfg.wasm.component_model_implements = Some(self.module_config.component_model_implements);
+        cfg.wasm.component_model_canonical_names =
+            Some(self.module_config.component_model_canonical_names);
+        cfg.wasm.component_model_accessors = Some(self.module_config.component_model_accessors);
         cfg.wasm.custom_page_sizes = Some(self.module_config.config.custom_page_sizes_enabled);
+        cfg.wasm.compact_imports = Some(self.module_config.config.compact_imports_enabled);
         cfg.wasm.epoch_interruption = Some(self.wasmtime.epoch_interruption);
         cfg.wasm.extended_const = Some(self.module_config.config.extended_const_enabled);
         cfg.wasm.fuel = self.wasmtime.consume_fuel.then(|| u64::MAX);
@@ -333,13 +365,22 @@ impl Config {
         cfg.wasm.shared_everything_threads =
             Some(self.module_config.config.shared_everything_threads_enabled);
         cfg.wasm.wide_arithmetic = Some(self.module_config.config.wide_arithmetic_enabled);
+        cfg.wasm.branch_hinting = Some(self.wasmtime.branch_hinting);
         cfg.wasm.exceptions = Some(self.module_config.config.exceptions_enabled);
+        // Winch disables GC types by default, but we want to fuzz it
+        if self.wasmtime.compiler_strategy == CompilerStrategy::Winch {
+            cfg.wasm.gc_support = Some(true);
+        }
         cfg.wasm.stack_switching = Some(self.module_config.stack_switching);
         cfg.wasm.shared_memory = Some(self.module_config.shared_memory);
         if !self.module_config.config.simd_enabled {
             cfg.wasm.relaxed_simd = Some(false);
         }
         cfg.codegen.collector = Some(self.wasmtime.collector.to_wasmtime());
+        cfg.codegen.metadata_for_internal_asserts =
+            Some(self.wasmtime.metadata_for_internal_asserts);
+        cfg.codegen.metadata_for_gc_heap_corruption =
+            Some(self.wasmtime.metadata_for_gc_heap_corruption);
 
         let compiler_strategy = &self.wasmtime.compiler_strategy;
         let cranelift_strategy = match compiler_strategy {
@@ -350,7 +391,7 @@ impl Config {
 
         self.wasmtime.codegen.configure(&mut cfg);
 
-        cfg.codegen.inlining = self.wasmtime.inlining;
+        cfg.codegen.inlining = self.wasmtime.inlining.map(|i| i.into());
 
         // If the wasm-smith-generated module use nan canonicalization then we
         // don't need to enable it, but if it doesn't enable it already then we
@@ -360,12 +401,6 @@ impl Config {
         // Only set cranelift specific flags when the Cranelift strategy is
         // chosen.
         if cranelift_strategy {
-            if let Some(option) = self.wasmtime.inlining_intra_module {
-                cfg.codegen.cranelift.push((
-                    "wasmtime_inlining_intra_module".to_string(),
-                    Some(option.to_string()),
-                ));
-            }
             if let Some(size) = self.wasmtime.inlining_small_callee_size {
                 cfg.codegen.cranelift.push((
                     "wasmtime_inlining_small_callee_size".to_string(),
@@ -570,6 +605,7 @@ pub struct WasmtimeConfig {
     opt_level: OptLevel,
     regalloc_algorithm: RegallocAlgorithm,
     debug_info: bool,
+    debug_symbols: bool,
     canonicalize_nans: bool,
     interruptible: bool,
     pub(crate) consume_fuel: bool,
@@ -579,8 +615,7 @@ pub struct WasmtimeConfig {
     force_jump_veneers: bool,
     memory_init_cow: bool,
     memory_guaranteed_dense_image_size: u64,
-    inlining: Option<bool>,
-    inlining_intra_module: Option<IntraModuleInlining>,
+    inlining: Option<Inlining>,
     inlining_small_callee_size: Option<u32>,
     inlining_sum_size_threshold: Option<u32>,
     use_precompiled_cwasm: bool,
@@ -596,6 +631,12 @@ pub struct WasmtimeConfig {
     collector: Collector,
     gc_zeal_alloc_counter: Option<NonZeroU32>,
     table_lazy_init: bool,
+    metadata_for_internal_asserts: bool,
+    metadata_for_gc_heap_corruption: bool,
+    /// Whether the branch-hinting proposal is enabled. wasm-smith does not emit
+    /// `metadata.code.branch_hint` sections, so for generated modules this only
+    /// toggles the (otherwise no-op) parsing path.
+    branch_hinting: bool,
 
     /// Configuration for whether wasm is invoked in an async fashion and how
     /// it's cooperatively time-sliced.
@@ -661,9 +702,7 @@ impl WasmtimeConfig {
                 // module that wasm-smith generates.
                 config.config.relaxed_simd_enabled = false;
                 config.config.gc_enabled = false;
-                config.config.tail_call_enabled = false;
                 config.config.reference_types_enabled = false;
-                config.config.exceptions_enabled = false;
                 config.function_references_enabled = false;
                 config.stack_switching = false;
 
@@ -678,10 +717,8 @@ impl WasmtimeConfig {
                     config.config.simd_enabled = false;
                 }
 
-                // Account for the proposals that are currently only
-                // supported on x64.
+                // Account for the proposals that Winch only supports on x64.
                 if cfg!(target_arch = "aarch64") {
-                    config.config.simd_enabled = false;
                     config.config.wide_arithmetic_enabled = false;
                     config.config.threads_enabled = false;
                 }
@@ -841,13 +878,41 @@ impl WasmtimeConfig {
 
         // When using the pooling allocator, GC heap tunables must match memory
         // tunables.
-        if let InstanceAllocationStrategy::Pooling(_) = &self.strategy {
-            mcfg.gc_heap_reservation = mcfg.memory_reservation;
-            mcfg.gc_heap_guard_size = mcfg.memory_guard_size;
-            mcfg.gc_heap_reservation_for_growth = mcfg.memory_reservation_for_growth;
+        if let InstanceAllocationStrategy::Pooling(pcfg) = &self.strategy {
+            let reservation = mcfg.gc_heap_reservation.max(mcfg.memory_reservation);
+            mcfg.gc_heap_reservation = reservation;
+            mcfg.memory_reservation = reservation;
+
+            let guard_size = mcfg.gc_heap_guard_size.max(mcfg.memory_guard_size);
+            mcfg.gc_heap_guard_size = guard_size;
+            mcfg.memory_guard_size = guard_size;
+
+            let res_for_growth = mcfg
+                .gc_heap_reservation_for_growth
+                .max(mcfg.memory_reservation_for_growth);
+            mcfg.gc_heap_reservation_for_growth = res_for_growth;
+            mcfg.memory_reservation_for_growth = res_for_growth;
+
             // memory_may_move is not in MemoryConfig, but gc_heap_may_move
             // must not conflict. Set it to None so the default matches.
             mcfg.gc_heap_may_move = None;
+
+            // Don't let the initial size of a GC heap exceed the maximum
+            // allowed by the pooling allocator. Note that these sizes are
+            // rounded up to the wasm page size used by GC at this time as
+            // that's what happens internally.
+            if let Some(amt) = mcfg.gc_heap_initial_size {
+                let page_size = 64 * 1024;
+                let amt = amt.next_multiple_of(page_size);
+                // Round down so the GC's round-up-to-page-size doesn't push
+                // this back over the pooling limit.
+                let max = (pcfg.max_memory_size as u64) / page_size * page_size;
+                mcfg.gc_heap_initial_size = Some(amt.min(max));
+            }
+        }
+
+        if !self.debug_symbols {
+            self.debug_info = false;
         }
     }
 }
@@ -892,18 +957,33 @@ impl RegallocAlgorithm {
 }
 
 #[derive(Arbitrary, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum IntraModuleInlining {
+enum Inlining {
     Yes,
+    InterModuleAndIntraGc,
+    InterModule,
+    Intrinsics,
     No,
-    WhenUsingGc,
 }
 
-impl std::fmt::Display for IntraModuleInlining {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IntraModuleInlining::Yes => write!(f, "yes"),
-            IntraModuleInlining::No => write!(f, "no"),
-            IntraModuleInlining::WhenUsingGc => write!(f, "gc"),
+impl From<Inlining> for wasmtime::Inlining {
+    fn from(i: Inlining) -> Self {
+        let ret = match i {
+            Inlining::Yes => wasmtime::Inlining::Yes,
+            Inlining::InterModuleAndIntraGc => wasmtime::Inlining::InterModuleAndIntraGc,
+            Inlining::InterModule => wasmtime::Inlining::InterModule,
+            Inlining::Intrinsics => wasmtime::Inlining::Intrinsics,
+            Inlining::No => wasmtime::Inlining::No,
+        };
+
+        match ret {
+            wasmtime::Inlining::Yes
+            | wasmtime::Inlining::No
+            | wasmtime::Inlining::InterModuleAndIntraGc
+            | wasmtime::Inlining::InterModule
+            | wasmtime::Inlining::Intrinsics
+            // NOTE: if you add another arm here, be sure to update the
+            // `Inlining` enum above.
+            => ret,
         }
     }
 }

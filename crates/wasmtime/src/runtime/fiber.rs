@@ -9,6 +9,13 @@ use core::pin::Pin;
 use core::ptr::{self, NonNull};
 use core::task::{Context, Poll};
 use wasmtime_fiber::{Fiber, FiberStack, Suspend};
+#[cfg(all(feature = "component-model-async", feature = "gc"))]
+use wasmtime_unwinder::Unwind;
+
+#[cfg(all(feature = "component-model-async", feature = "gc"))]
+use super::module::ModuleRegistry;
+#[cfg(all(feature = "component-model-async", feature = "gc"))]
+use super::vm::GcRootsList;
 
 type WasmtimeResume = Result<NonNull<Context<'static>>>;
 type WasmtimeYield = StoreFiberYield;
@@ -85,6 +92,11 @@ pub(crate) struct AsyncState {
     // stack at a time and making the number tunable via `Config`.
     last_fiber_stack: Option<wasmtime_fiber::FiberStack>,
 
+    // Bookkeeping for keeping track of the number of fiber stacks (aka fibers)
+    // actively in use within this store.
+    pub(crate) live_fibers: u32,
+    pub(crate) max_fibers: u32,
+
     /// Whether or not this store has async host functions defined somewhere
     /// within it or some other store-related configuration (e.g. epochs
     /// yielding) which requires that wasm is executed on a fiber, thus async
@@ -108,6 +120,8 @@ impl Default for AsyncState {
             current_suspend: None,
             current_future_cx: None,
             last_fiber_stack: None,
+            live_fibers: 0,
+            max_fibers: 64,
             async_required: false,
         }
     }
@@ -411,7 +425,7 @@ pub(crate) struct StoreFiber<'a> {
     /// Note that using `StoreFiberYield` as the `Yield` type parameter allows
     /// the fiber to indicate whether it needs exclusive access to the store
     /// across suspend points (in which case it will pass `KeepStore` when
-    /// suspending , meaning the store must not be used at all until the fiber
+    /// suspending, meaning the store must not be used at all until the fiber
     /// is resumed again) or whether it is giving up exclusive access (in which
     /// case it will pass `ReleaseStore` when yielding, meaning exclusive access
     /// may be given to another fiber that runs concurrently.
@@ -445,12 +459,33 @@ impl<'a> StoreFiber<'a> {
         self.fiber.take().map(|f| f.into_inner().0.into_stack())
     }
 
-    pub(crate) fn dispose(&mut self, store: &mut StoreOpaque) {
+    /// Cancels this fiber, if it's still in progress, by resuming it with an
+    /// error so that it unwinds and completes.
+    ///
+    /// Returns whether the fiber was in progress and had to be cancelled.
+    pub(crate) fn dispose(&mut self, store: &mut StoreOpaque) -> bool {
         if let Some(fiber) = self.fiber() {
             if !fiber.done() {
                 let result = resume_fiber(store, self, Err(format_err!("future dropped")));
                 debug_assert!(result.is_ok());
+                return true;
             }
+        }
+        false
+    }
+
+    #[cfg(all(feature = "component-model-async", feature = "gc"))]
+    pub(crate) fn trace_gc_roots(
+        &mut self,
+        modules: &ModuleRegistry,
+        unwind: &dyn Unwind,
+        gc_roots_list: &mut GcRootsList,
+    ) {
+        if let Some(state) = &mut self.state {
+            state
+                .get_mut()
+                .tls
+                .trace_gc_roots(modules, unwind, gc_roots_list);
         }
     }
 }
@@ -717,6 +752,12 @@ fn resume_fiber<'a>(
         fn drop(&mut self) {
             self.fiber.state =
                 Some(unsafe { self.state.take().unwrap().replace(self.store).into() });
+
+            // Return a fiber's stack back to the store once it has completed.
+            if self.fiber.fiber().unwrap().done() {
+                let stack = self.fiber.take_fiber_stack().unwrap();
+                self.store.deallocate_fiber_stack(stack);
+            }
         }
     }
     let result = unsafe {
@@ -735,13 +776,8 @@ fn resume_fiber<'a>(
     };
 
     match &result {
-        // The fiber has finished, so recycle its stack by disposing of the
-        // underlying fiber itself.
-        Ok(_) => {
-            if let Some(stack) = fiber.take_fiber_stack() {
-                store.deallocate_fiber_stack(stack);
-            }
-        }
+        // The fiber has finished, nothing more to do.
+        Ok(_) => {}
 
         // The fiber has not yet finished, so it stays as-is.
         Err(_) => {
@@ -836,7 +872,16 @@ where
         let reset = ResetCurrentPointersToNull(store_ref);
 
         fun(reset.0)
-    })?;
+    });
+    let fiber = match fiber {
+        Ok(fiber) => fiber,
+        Err((e, stack)) => {
+            unsafe {
+                (*store).as_store_opaque().deallocate_fiber_stack(stack);
+            }
+            return Err(e);
+        }
+    };
     Ok(StoreFiber {
         state: Some(
             FiberResumeState {
@@ -855,19 +900,6 @@ where
         id,
         fiber: Some(RawFiber(fiber).into()),
     })
-}
-
-/// Safe wrapper around [`make_fiber_unchecked`] which requires that `S` is
-/// `Send`.
-#[cfg(feature = "component-model-async")]
-pub(crate) fn make_fiber<'a, S>(
-    store: &mut S,
-    fun: impl FnOnce(&mut S) -> Result<()> + Send + Sync + 'a,
-) -> Result<StoreFiber<'a>>
-where
-    S: AsStoreOpaque + Send + ?Sized + 'a,
-{
-    unsafe { make_fiber_unchecked(store, fun) }
 }
 
 /// Run the specified function on a newly-created fiber and `.await` its
@@ -989,7 +1021,14 @@ impl<'b> Future for FiberFuture<'_, 'b> {
 impl Drop for FiberFuture<'_, '_> {
     fn drop(&mut self) {
         if let Some(fiber) = &mut self.fiber {
-            fiber.dispose(self.store);
+            let cancelled = fiber.dispose(self.store);
+
+            // If the fiber was cancelled partway through then whatever it was
+            // doing has been abandoned, and whatever it was doing may only be
+            // partially reflected within the store, so lock down the store.
+            if cancelled {
+                self.store.set_trapped();
+            }
         }
     }
 }

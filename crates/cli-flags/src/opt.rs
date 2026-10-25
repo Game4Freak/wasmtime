@@ -5,15 +5,19 @@
 //! specifying options in a struct-like syntax where all other boilerplate about
 //! option parsing is contained exclusively within this module.
 
-use crate::{KeyValuePair, WasiNnGraph};
+use crate::{CompileTimeBuiltin, KeyValuePair, UnsafeIntrinsicsImport, WasiNnGraph};
+#[cfg(feature = "clap")]
 use clap::builder::{StringValueParser, TypedValueParser, ValueParserFactory};
+#[cfg(feature = "clap")]
 use clap::error::{Error, ErrorKind};
+#[cfg(feature = "serde")]
 use serde::de::{self, Visitor};
-use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::fmt;
+use std::num::{NonZeroU32, NonZeroUsize};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
-use std::{fmt, marker};
+use wasmtime::error::Context;
 use wasmtime::{Result, bail, format_err};
 
 /// Characters which can be safely ignored while parsing numeric options to wasmtime
@@ -22,6 +26,7 @@ const IGNORED_NUMBER_CHARS: [char; 1] = ['_'];
 #[macro_export]
 macro_rules! wasmtime_option_group {
     (
+        #[env = $env:tt]
         $(#[$attr:meta])*
         pub struct $opts:ident {
             $(
@@ -43,16 +48,18 @@ macro_rules! wasmtime_option_group {
             ...
         }
     ) => {
-        #[derive(Default, Debug)]
+        #[derive(Default, Debug, PartialEq, Clone)]
+        #[cfg_attr(feature = "serde", derive(serde_derive::Deserialize, serde_derive::Serialize))]
+        #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case", deny_unknown_fields))]
         $(#[$attr])*
         pub struct $opts {
             $(
-                $(#[serde($serde_attr)])*
+                $(#[cfg_attr(feature = "serde", serde($serde_attr))])*
                 $(#[doc($doc_attr)])?
                 pub $opt: $container<$payload>,
             )+
             $(
-                $(#[serde($serde_attr2)])*
+                $(#[cfg_attr(feature = "serde", serde($serde_attr2))])*
                 pub $prefixed: Vec<(String, Option<String>)>,
             )?
         }
@@ -69,6 +76,7 @@ macro_rules! wasmtime_option_group {
         }
 
         impl $crate::opt::WasmtimeOption for $option {
+            const ENV_PREFIX: &'static str = concat!("WASMTIME_", $env);
             const OPTIONS: &'static [$crate::opt::OptionDesc<$option>] = &[
                 $(
                     $crate::opt::OptionDesc {
@@ -121,18 +129,24 @@ macro_rules! wasmtime_option_group {
         }
 
         impl $opts {
-            fn configure_with(&mut self, opts: &[$crate::opt::CommaSeparated<$option>]) {
-                for opt in opts.iter().flat_map(|o| o.0.iter()) {
-                    match opt {
-                        $(
-                            $option::$opt(val) => {
-                                $crate::opt::OptionContainer::push(&mut self.$opt, val.clone());
-                            }
-                        )+
-                        $(
-                            $option::$prefixed(key, val) => self.$prefixed.push((key.clone(), val.clone())),
-                        )?
-                    }
+            fn configure_with(&mut self, opts: &[$crate::opt::CommaSeparated<$option>]) -> Result<()> {
+                let env_opts = <$option as $crate::opt::WasmtimeOption>::parse_env()?;
+                for opt in env_opts.iter().chain(opts.iter().flat_map(|o| o.0.iter())) {
+                    self.configure(opt);
+                }
+                Ok(())
+            }
+
+            fn configure(&mut self, opt: &$option) {
+                match opt {
+                    $(
+                        $option::$opt(val) => {
+                            $crate::opt::OptionContainer::push(&mut self.$opt, val.clone());
+                        }
+                    )+
+                    $(
+                        $option::$prefixed(key, val) => self.$prefixed.push((key.clone(), val.clone())),
+                    )?
                 }
             }
 
@@ -158,6 +172,7 @@ macro_rules! wasmtime_option_group {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommaSeparated<T>(pub Vec<T>);
 
+#[cfg(feature = "clap")]
 impl<T> ValueParserFactory for CommaSeparated<T>
 where
     T: WasmtimeOption,
@@ -165,13 +180,15 @@ where
     type Parser = CommaSeparatedParser<T>;
 
     fn value_parser() -> CommaSeparatedParser<T> {
-        CommaSeparatedParser(marker::PhantomData)
+        CommaSeparatedParser(std::marker::PhantomData)
     }
 }
 
 #[derive(Clone)]
-pub struct CommaSeparatedParser<T>(marker::PhantomData<T>);
+#[cfg(feature = "clap")]
+pub struct CommaSeparatedParser<T>(std::marker::PhantomData<T>);
 
+#[cfg(feature = "clap")]
 impl<T> TypedValueParser for CommaSeparatedParser<T>
 where
     T: WasmtimeOption,
@@ -243,6 +260,62 @@ where
             std::process::exit(0);
         }
 
+        T::parse_csv(&val).map(CommaSeparated).map_err(|e| {
+            Error::raw(
+                ErrorKind::InvalidValue,
+                format!("failed to parse -{arg_short} / --{arg_long} option: {e:?}\n"),
+            )
+        })
+    }
+}
+
+/// Helper trait used by `CommaSeparated` which contains a list of all options
+/// supported by the option group.
+pub trait WasmtimeOption: Sized + Send + Sync + Clone + 'static {
+    const OPTIONS: &'static [OptionDesc<Self>];
+    const ENV_PREFIX: &'static str;
+
+    /// Parse all environment variables that relate to this option, returning
+    /// all parsed variables as a list.
+    ///
+    /// Returns an error if any environment variable has invalid syntax and/or
+    /// failed to parse.
+    fn parse_env() -> Result<Vec<Self>> {
+        let mut ret = Vec::new();
+        if let Some(val) = std::env::var_os(Self::ENV_PREFIX) {
+            let val = match val.to_str() {
+                Some(s) => s,
+                None => bail!("env var `{}` is not valid UTF-8", Self::ENV_PREFIX),
+            };
+            ret.extend(
+                Self::parse_csv(&val)
+                    .with_context(|| format!("failed to parse env var `{}`", Self::ENV_PREFIX))?,
+            );
+        }
+
+        for option in Self::OPTIONS {
+            let key = match &option.name {
+                OptName::Name(s) => format!("{}_{}", Self::ENV_PREFIX, s.to_ascii_uppercase()),
+                OptName::Prefix(_) => continue,
+            };
+            let val = match std::env::var_os(&key) {
+                Some(val) => val,
+                None => continue,
+            };
+            let val = match val.to_str() {
+                Some(s) => s,
+                None => bail!("env var `{key}` is not valid UTF-8"),
+            };
+            ret.push(
+                (option.parse)(&key, Some(val))
+                    .with_context(|| format!("failed to parse env var `{key}`"))?,
+            );
+        }
+        Ok(ret)
+    }
+
+    /// Parses `val` as a comma-separated list of values for `Self::OPTIONS`.
+    fn parse_csv(val: &str) -> Result<Vec<Self>> {
         let mut result = Vec::new();
         for val in val.split(',') {
             // Split `k=v` into `k` and `v` where `v` is optional
@@ -251,7 +324,7 @@ where
             let key_val = iter.next();
 
             // Find `key` within `T::OPTIONS`
-            let option = options
+            let option = Self::OPTIONS
                 .iter()
                 .filter_map(|d| match d.name {
                     OptName::Name(s) => {
@@ -267,32 +340,16 @@ where
 
             let (desc, key) = match option {
                 Some(pair) => pair,
-                None => {
-                    let err = Error::raw(
-                        ErrorKind::InvalidValue,
-                        format!("unknown -{arg_short} / --{arg_long} option: {key}\n"),
-                    );
-                    return Err(err.with_cmd(cmd));
-                }
+                None => bail!("unknown option: {key}\n"),
             };
 
-            result.push((desc.parse)(&key, key_val).map_err(|e| {
-                Error::raw(
-                    ErrorKind::InvalidValue,
-                    format!("failed to parse -{arg_short} option `{val}`: {e:?}\n"),
-                )
-                .with_cmd(cmd)
-            })?)
+            result.push(
+                (desc.parse)(&key, key_val)
+                    .with_context(|| format!("failed to parse option `{val}`"))?,
+            );
         }
-
-        Ok(CommaSeparated(result))
+        Ok(result)
     }
-}
-
-/// Helper trait used by `CommaSeparated` which contains a list of all options
-/// supported by the option group.
-pub trait WasmtimeOption: Sized + Send + Sync + Clone + 'static {
-    const OPTIONS: &'static [OptionDesc<Self>];
 }
 
 pub struct OptionDesc<T> {
@@ -312,6 +369,7 @@ pub enum OptName {
 }
 
 impl OptName {
+    #[cfg(feature = "clap")]
     fn display_string(&self) -> String {
         match self {
             OptName::Name(s) => s.replace('_', "-"),
@@ -382,6 +440,19 @@ impl WasmtimeOptionValue for NonZeroU32 {
     fn parse(val: Option<&str>) -> Result<Self> {
         let n = <u32 as WasmtimeOptionValue>::parse(val)?;
         NonZeroU32::new(n).ok_or_else(|| format_err!("value must be non-zero"))
+    }
+
+    fn display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+impl WasmtimeOptionValue for NonZeroUsize {
+    const VAL_HELP: &'static str = "=N";
+
+    fn parse(val: Option<&str>) -> Result<Self> {
+        let n = <usize as WasmtimeOptionValue>::parse(val)?;
+        NonZeroUsize::new(n).ok_or_else(|| format_err!("value must be non-zero"))
     }
 
     fn display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -590,6 +661,20 @@ impl WasmtimeOptionValue for wasmtime::Enabled {
     }
 }
 
+impl WasmtimeOptionValue for wasmtime::Inlining {
+    const VAL_HELP: &'static str = "[=y|n|gc|inter-module|intrinsics]";
+    fn parse(val: Option<&str>) -> Result<Self> {
+        match val {
+            None => Ok(wasmtime::Inlining::Yes),
+            Some(val) => val.parse(),
+        }
+    }
+
+    fn display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
 impl WasmtimeOptionValue for WasiNnGraph {
     const VAL_HELP: &'static str = "=<format>::<dir>";
     fn parse(val: Option<&str>) -> Result<Self> {
@@ -633,6 +718,63 @@ impl WasmtimeOptionValue for KeyValuePair {
     }
 }
 
+impl WasmtimeOptionValue for UnsafeIntrinsicsImport {
+    const VAL_HELP: &'static str = "[=name]";
+    fn parse(val: Option<&str>) -> Result<Self> {
+        match val {
+            None => Ok(UnsafeIntrinsicsImport("unsafe-intrinsics".to_string())),
+            Some("") => bail!("the unsafe intrinsics import name cannot be empty"),
+            Some(val) => Ok(UnsafeIntrinsicsImport(val.to_string())),
+        }
+    }
+
+    fn display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl WasmtimeOptionValue for CompileTimeBuiltin {
+    const VAL_HELP: &'static str = "=[<name>=]<path>";
+    fn parse(val: Option<&str>) -> Result<Self> {
+        let val = String::parse(val)?;
+
+        if let Some((name, path)) = val.split_once('=') {
+            if name.is_empty() {
+                bail!("the compile-time builtin's name cannot be empty in `{val}`");
+            }
+            if path.is_empty() {
+                bail!("the compile-time builtin's path cannot be empty in `{val}`");
+            }
+            return Ok(CompileTimeBuiltin {
+                name: name.to_string(),
+                path: PathBuf::from(path),
+            });
+        }
+
+        // No `<name>` was given: derive it from the file name of `<path>`, with
+        // its extension removed.
+        let path = PathBuf::from(&val);
+        let name = path
+            .file_stem()
+            .ok_or_else(|| format_err!("cannot derive a compile-time builtin name from `{val}`"))?
+            .to_str()
+            .ok_or_else(|| {
+                format_err!("compile-time builtin name derived from `{val}` is not valid UTF-8")
+            })?
+            .to_string();
+        if name.is_empty() {
+            bail!("compile-time builtin name derived from `{val}` is empty");
+        }
+        Ok(CompileTimeBuiltin { name, path })
+    }
+
+    fn display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Always write the canonical `<name>=<path>` form so that this
+        // round-trips back through `parse` regardless of the file name.
+        write!(f, "{}={}", self.name, Path::display(&self.path))
+    }
+}
+
 pub trait OptionContainer<T> {
     fn push(&mut self, val: T);
     fn get<'a>(&'a self) -> impl Iterator<Item = &'a T>
@@ -668,8 +810,10 @@ impl<T> OptionContainer<T> for Vec<T> {
 // for parsing toml values the same way we parse command line values.
 //
 // Used for wasmtime::Strategy, wasmtime::Collector, wasmtime::OptLevel, wasmtime::RegallocAlgorithm
+#[cfg(feature = "serde")]
 struct ToStringVisitor {}
 
+#[cfg(feature = "serde")]
 impl<'de> Visitor<'de> for ToStringVisitor {
     type Value = String;
 
@@ -700,7 +844,10 @@ impl<'de> Visitor<'de> for ToStringVisitor {
 }
 
 // Deserializer that uses the `WasmtimeOptionValue::parse` to parse toml values
-pub(crate) fn cli_parse_wrapper<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+#[cfg(feature = "serde")]
+pub(crate) fn deserialize_cli_parse_wrapper<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error>
 where
     T: WasmtimeOptionValue,
     D: serde::Deserializer<'de>,
@@ -711,6 +858,18 @@ where
     T::parse(Some(&str))
         .map(Some)
         .map_err(serde::de::Error::custom)
+}
+
+#[cfg(feature = "serde")]
+pub(crate) fn serialize_cli_parse_wrapper<S, T>(val: &Option<T>, ser: S) -> Result<S::Ok, S::Error>
+where
+    T: WasmtimeOptionValue,
+    S: serde::Serializer,
+{
+    match val {
+        Some(val) => ser.serialize_some(&fmt::from_fn(|f| val.display(f)).to_string()),
+        None => ser.serialize_none(),
+    }
 }
 
 #[cfg(test)]

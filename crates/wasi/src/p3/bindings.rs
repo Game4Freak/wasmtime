@@ -23,7 +23,7 @@
 //!         // An example of extending the `wasi:cli/command` world with a
 //!         // custom host interface.
 //!         world my-world {
-//!             include wasi:cli/command@0.3.0-rc-2026-03-15;
+//!             include wasi:cli/command@0.3.0;
 //!
 //!             import custom-host;
 //!         }
@@ -86,9 +86,10 @@ mod generated {
             "wasi:filesystem/types.[method]descriptor.append-via-stream": store | tracing | trappable,
             "wasi:filesystem/types.[method]descriptor.read-directory": store | tracing | trappable,
             "wasi:sockets/types.[method]tcp-socket.bind": async | tracing | trappable,
-            "wasi:sockets/types.[method]tcp-socket.listen":  store | tracing | trappable,
+            "wasi:sockets/types.[method]tcp-socket.listen": async | store | tracing | trappable,
             "wasi:sockets/types.[method]tcp-socket.send": store | tracing | trappable,
             "wasi:sockets/types.[method]tcp-socket.receive": store | tracing | trappable,
+            "wasi:sockets/types.[static]udp-socket.create": async | tracing | trappable,
             "wasi:sockets/types.[method]udp-socket.bind": async | tracing | trappable,
             "wasi:sockets/types.[method]udp-socket.connect": async | tracing | trappable,
             default: tracing | trappable,
@@ -105,10 +106,32 @@ mod generated {
             "wasi:filesystem/types.error-code" => crate::p3::filesystem::FilesystemError,
             "wasi:sockets/types.error-code" => crate::p3::sockets::SocketError,
         },
+        named_imports: {
+            "wasi:clocks/monotonic-clock": crate::NamedId,
+            "wasi:clocks/system-clock": crate::NamedId,
+            "wasi:random/random": crate::NamedId,
+            "wasi:random/insecure": crate::NamedId,
+            "wasi:random/insecure-seed": crate::NamedId,
+            "wasi:cli/exit": crate::NamedId,
+            "wasi:cli/environment": crate::NamedId,
+            "wasi:cli/stdin": crate::NamedId,
+            "wasi:cli/stdout": crate::NamedId,
+            "wasi:cli/stderr": crate::NamedId,
+            "wasi:cli/terminal-input": crate::NamedId,
+            "wasi:cli/terminal-output": crate::NamedId,
+            "wasi:cli/terminal-stdin": crate::NamedId,
+            "wasi:cli/terminal-stdout": crate::NamedId,
+            "wasi:cli/terminal-stderr": crate::NamedId,
+            "wasi:filesystem/types": crate::NamedId,
+            "wasi:filesystem/preopens": crate::NamedId,
+            "wasi:sockets/types": crate::NamedId,
+            "wasi:sockets/ip-name-lookup": crate::NamedId,
+        },
     });
 }
 pub use self::generated::LinkOptions;
 pub use self::generated::exports;
+pub use self::generated::named_imports;
 pub use self::generated::wasi::*;
 
 /// Bindings to execute and run a `wasi:cli/command`.

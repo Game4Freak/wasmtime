@@ -1,5 +1,5 @@
 use crate::{wasm_frame_vec_t, wasm_instance_t, wasm_name_t, wasm_store_t};
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 use wasmtime::{Error, Trap, WasmBacktrace, format_err};
 
 // Help ensure the Rust enum matches the C one.  If any of these assertions
@@ -54,6 +54,13 @@ const _: () = {
     assert!(Trap::ConcurrentFutureStreamOp as u8 == 45);
     assert!(Trap::ReferenceCountOverflow as u8 == 46);
     assert!(Trap::StreamOpTooBig as u8 == 47);
+    assert!(Trap::WaitableSyncAndAsync as u8 == 48);
+    assert!(Trap::UncaughtException as u8 == 49);
+    assert!(Trap::ReadFromDroppedStream as u8 == 50);
+    assert!(Trap::WriteToDroppedStream as u8 == 51);
+    assert!(Trap::WriteToDroppedFuture as u8 == 52);
+    assert!(Trap::LiftDroppedStream as u8 == 53);
+    assert!(Trap::TaskReturnOrCancelSyncLifted as u8 == 54);
 };
 
 #[repr(C)]
@@ -86,8 +93,8 @@ impl wasm_trap_t {
 pub struct wasm_frame_t<'a> {
     trace: &'a WasmBacktrace,
     idx: usize,
-    func_name: OnceCell<Option<wasm_name_t>>,
-    module_name: OnceCell<Option<wasm_name_t>>,
+    func_name: OnceLock<Option<wasm_name_t>>,
+    module_name: OnceLock<Option<wasm_name_t>>,
 }
 
 wasmtime_c_api_macros::declare_own!(wasm_frame_t);
@@ -145,8 +152,8 @@ pub extern "C" fn wasm_trap_origin(raw: &wasm_trap_t) -> Option<Box<wasm_frame_t
         Some(Box::new(wasm_frame_t {
             trace,
             idx: 0,
-            func_name: OnceCell::new(),
-            module_name: OnceCell::new(),
+            func_name: OnceLock::new(),
+            module_name: OnceLock::new(),
         }))
     } else {
         None
@@ -168,8 +175,8 @@ pub(crate) fn error_trace<'a>(error: &'a Error, out: &mut wasm_frame_vec_t<'a>) 
             Some(Box::new(wasm_frame_t {
                 trace,
                 idx,
-                func_name: OnceCell::new(),
-                module_name: OnceCell::new(),
+                func_name: OnceLock::new(),
+                module_name: OnceLock::new(),
             }))
         })
         .collect();

@@ -1,4 +1,3 @@
-use crate::component::RuntimeInstance;
 use crate::component::func::HostFunc;
 use crate::component::matching::InstanceType;
 use crate::component::store::{ComponentInstanceId, StoreComponentInstanceId};
@@ -6,11 +5,12 @@ use crate::component::{
     Component, ComponentExportIndex, ComponentNamedList, Func, Lift, Lower, ResourceType,
     TypedFunc, types::ComponentItem,
 };
+use crate::component::{ExportLookup, RuntimeInstance};
 use crate::instance::OwnedImports;
 use crate::linker::DefinitionType;
 use crate::prelude::*;
 use crate::runtime::vm::component::{ComponentInstance, TypedResource, TypedResourceIndex};
-use crate::runtime::vm::{self, VMFuncRef};
+use crate::runtime::vm::{self, UncaughtException, VMFuncRef, VMStore};
 use crate::store::{AsStoreOpaque, Asyncness, StoreOpaque};
 use crate::{AsContext, AsContextMut, Engine, Module, StoreContextMut};
 use alloc::sync::Arc;
@@ -152,17 +152,13 @@ impl Instance {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_func(
-        &self,
-        mut store: impl AsContextMut,
-        name: impl InstanceExportLookup,
-    ) -> Option<Func> {
+    pub fn get_func(&self, mut store: impl AsContextMut, name: impl ExportLookup) -> Option<Func> {
         let store = store.as_context_mut().0;
         let instance = self.id.get(store);
         let component = instance.component();
 
         // Validate that `name` exists within `self.`
-        let index = name.lookup(component)?;
+        let index = name.lookup(component, None)?;
 
         // Validate that `index` is indeed a lifted function.
         match &component.env_component().export_items[index] {
@@ -171,7 +167,7 @@ impl Instance {
         }
 
         // And package up the indices!
-        Some(Func::from_lifted_func(*self, index))
+        Some(Func::from_lifted_func(store, *self, index))
     }
 
     /// Looks up an exported [`Func`] value by name and with its type.
@@ -192,7 +188,7 @@ impl Instance {
     pub fn get_typed_func<Params, Results>(
         &self,
         mut store: impl AsContextMut,
-        name: impl InstanceExportLookup,
+        name: impl ExportLookup,
     ) -> Result<TypedFunc<Params, Results>>
     where
         Params: ComponentNamedList + Lower,
@@ -224,7 +220,7 @@ impl Instance {
     pub fn get_module(
         &self,
         mut store: impl AsContextMut,
-        name: impl InstanceExportLookup,
+        name: impl ExportLookup,
     ) -> Option<Module> {
         let store = store.as_context_mut().0;
         let (instance, export) = self.lookup_export(store, name)?;
@@ -259,7 +255,7 @@ impl Instance {
     pub fn get_resource(
         &self,
         mut store: impl AsContextMut,
-        name: impl InstanceExportLookup,
+        name: impl ExportLookup,
     ) -> Option<ResourceType> {
         let store = store.as_context_mut().0;
         let (instance, export) = self.lookup_export(store, name)?;
@@ -352,10 +348,10 @@ impl Instance {
     fn lookup_export<'a>(
         &self,
         store: &'a StoreOpaque,
-        name: impl InstanceExportLookup,
+        name: impl ExportLookup,
     ) -> Option<(&'a ComponentInstance, &'a Export)> {
         let data = self.id().get(store);
-        let index = name.lookup(data.component())?;
+        let index = name.lookup(data.component(), None)?;
         Some((data, &data.component().env_component().export_items[index]))
     }
 
@@ -385,7 +381,7 @@ impl Instance {
         rep: u32,
     ) -> Result<u32> {
         store
-            .component_resource_tables(Some(self))
+            .component_resource_tables(Some(self))?
             .resource_new(TypedResource::Component { ty, rep })
     }
 
@@ -398,7 +394,7 @@ impl Instance {
         index: u32,
     ) -> Result<u32> {
         store
-            .component_resource_tables(Some(self))
+            .component_resource_tables(Some(self))?
             .resource_rep(TypedResourceIndex::Component { ty, index })
     }
 
@@ -410,7 +406,7 @@ impl Instance {
         index: u32,
     ) -> Result<Option<u32>> {
         store
-            .component_resource_tables(Some(self))
+            .component_resource_tables(Some(self))?
             .resource_drop(TypedResourceIndex::Component { ty, index })
     }
 
@@ -421,7 +417,7 @@ impl Instance {
         src: TypeResourceTableIndex,
         dst: TypeResourceTableIndex,
     ) -> Result<u32> {
-        let mut tables = store.component_resource_tables(Some(self));
+        let mut tables = store.component_resource_tables(Some(self))?;
         let rep = tables.resource_lift_own(TypedResourceIndex::Component { ty: src, index })?;
         tables.resource_lower_own(TypedResource::Component { ty: dst, rep })
     }
@@ -433,21 +429,25 @@ impl Instance {
         src: TypeResourceTableIndex,
         dst: TypeResourceTableIndex,
     ) -> Result<u32> {
-        let dst_owns_resource = self.id().get(store).resource_owned_by_own_instance(dst);
-        let mut tables = store.component_resource_tables(Some(self));
+        debug_assert!(
+            !self.id().get(store).resource_owned_by_own_instance(dst),
+            "should have used `resource.transfer-borrow-to-owner` instead",
+        );
+        let mut tables = store.component_resource_tables(Some(self))?;
         let rep = tables.resource_lift_borrow(TypedResourceIndex::Component { ty: src, index })?;
-        // Implement `lower_borrow`'s special case here where if a borrow's
-        // resource type is owned by `dst` then the destination receives the
-        // representation directly rather than a handle to the representation.
-        //
-        // This can perhaps become a different libcall in the future to avoid
-        // this check at runtime since we know at compile time whether the
-        // destination type owns the resource, but that's left as a future
-        // refactoring if truly necessary.
-        if dst_owns_resource {
-            return Ok(rep);
-        }
         tables.resource_lower_borrow(TypedResource::Component { ty: dst, rep })
+    }
+
+    /// Variant of `resource_transfer_borrow` for when the destination instance
+    /// owns the resource, and so receives the representation directly.
+    pub(crate) fn resource_transfer_borrow_to_owner(
+        self,
+        store: &mut StoreOpaque,
+        index: u32,
+        src: TypeResourceTableIndex,
+    ) -> Result<u32> {
+        let mut tables = store.component_resource_tables(Some(self))?;
+        tables.resource_lift_borrow(TypedResourceIndex::Component { ty: src, index })
     }
 
     pub(crate) fn lookup_vmdef(&self, store: &mut StoreOpaque, def: &CoreDef) -> vm::Export {
@@ -576,6 +576,12 @@ impl Instance {
             index,
         }
     }
+
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn from_runtime_instance(store: &StoreOpaque, instance: RuntimeInstance) -> Self {
+        let id = StoreComponentInstanceId::new(store.id(), instance.instance);
+        Instance { id }
+    }
 }
 
 /// Translates a `CoreDef`, a definition of a core wasm item, to an
@@ -609,9 +615,6 @@ pub(crate) fn lookup_vmdef(
             // within that store, so it's safe to create a `Func`.
             vm::Export::Function(unsafe { crate::Func::from_vm_func_ref(store.id(), funcref) })
         }
-        CoreDef::TaskMayBlock => vm::Export::Global(crate::Global::from_task_may_block(
-            StoreComponentInstanceId::new(store.id(), id),
-        )),
     }
 }
 
@@ -652,47 +655,6 @@ where
     // SAFETY: the `store_id` owns this instance and all exports contained
     // within.
     unsafe { instance.get_export_by_index_mut(registry, store_id, idx) }
-}
-
-/// Trait used to lookup the export of a component instance.
-///
-/// This trait is used as an implementation detail of [`Instance::get_func`]
-/// and related `get_*` methods. Notable implementors of this trait are:
-///
-/// * `str`
-/// * `String`
-/// * [`ComponentExportIndex`]
-///
-/// Note that this is intended to be a `wasmtime`-sealed trait so it shouldn't
-/// need to be implemented externally.
-pub trait InstanceExportLookup {
-    #[doc(hidden)]
-    fn lookup(&self, component: &Component) -> Option<ExportIndex>;
-}
-
-impl<T> InstanceExportLookup for &T
-where
-    T: InstanceExportLookup + ?Sized,
-{
-    fn lookup(&self, component: &Component) -> Option<ExportIndex> {
-        T::lookup(self, component)
-    }
-}
-
-impl InstanceExportLookup for str {
-    fn lookup(&self, component: &Component) -> Option<ExportIndex> {
-        component
-            .env_component()
-            .exports
-            .get(self, &NameMapNoIntern)
-            .copied()
-    }
-}
-
-impl InstanceExportLookup for String {
-    fn lookup(&self, component: &Component) -> Option<ExportIndex> {
-        str::lookup(self, component)
-    }
 }
 
 struct Instantiator<'a> {
@@ -857,39 +819,69 @@ impl<'a> Instantiator<'a> {
                         }
                     };
 
-                    let exit = if let Some(component_instance) = *component_instance {
-                        store.0.enter_guest_sync_call(
-                            None,
-                            false,
-                            RuntimeInstance {
-                                instance,
-                                index: component_instance,
-                            },
-                        )?;
-                        true
-                    } else {
-                        false
-                    };
+                    let callee =
+                        component_instance.map(|index| RuntimeInstance { instance, index });
 
                     // Note that the unsafety here should be ok because the
                     // validity of the component means that type-checks have
                     // already been performed. This means that the unsafety due
                     // to imports having the wrong type should not happen here.
                     //
-                    // Also note we are calling new_started_impl because we have
-                    // already checked for asyncness and are running on a fiber
-                    // if required.
+                    // Also note we are calling `new_raw` followed by
+                    // `start_raw` and will run the latter on a fiber if
+                    // required per `asyncness`.
 
-                    let i = unsafe {
-                        crate::Instance::new_started(store, module, imports.as_ref(), asyncness)
+                    let (mut instance, needs_startup) = {
+                        let (mut limiter, store) = store.0.resource_limiter_and_store_opaque();
+                        unsafe {
+                            crate::Instance::new_raw(
+                                store,
+                                limiter.as_mut(),
+                                module,
+                                imports.as_ref(),
+                            )
                             .await?
+                        }
                     };
 
-                    if exit {
-                        store.0.exit_guest_sync_call()?;
+                    if needs_startup {
+                        if asyncness == Asyncness::No {
+                            start_raw(store, instance, callee)?;
+                        } else {
+                            #[cfg(feature = "async")]
+                            {
+                                #[cfg(feature = "component-model-async")]
+                                {
+                                    if store.0.concurrency_support() {
+                                        // With concurrency support enabled, we must
+                                        // run the start function inside the store's
+                                        // event loop in case it calls async
+                                        // functions or intrinsics, creates and
+                                        // resumes threads, etc.
+                                        instance = store.start_instance(instance, callee).await?;
+                                    } else {
+                                        store
+                                            .on_fiber(|store| start_raw(store, instance, callee))
+                                            .await??;
+                                    }
+                                }
+                                #[cfg(not(feature = "component-model-async"))]
+                                {
+                                    _ = &mut instance;
+                                    store
+                                        .on_fiber(|store| start_raw(store, instance, callee))
+                                        .await??;
+                                }
+                            }
+                            #[cfg(not(feature = "async"))]
+                            {
+                                _ = &mut instance;
+                                unreachable!();
+                            }
+                        }
                     }
 
-                    self.instance_mut(store.0).push_instance_id(i.id())?;
+                    self.instance_mut(store.0).push_instance_id(instance.id())?;
                 }
 
                 GlobalInitializer::LowerImport { import, index } => {
@@ -1087,6 +1079,25 @@ impl<'a> Instantiator<'a> {
     ) -> &'b mut ImportedResources {
         Arc::get_mut(self.instance_mut(store).resource_types_mut()).unwrap()
     }
+}
+
+/// Runs the start function of the core wasm `instance`.
+///
+/// If `callee` is specified then the start function is run as a sync-lifted
+/// call into that component instance.
+pub(crate) fn start_raw<T>(
+    store: &mut StoreContextMut<'_, T>,
+    instance: crate::Instance,
+    callee: Option<RuntimeInstance>,
+) -> Result<()> {
+    if let Some(callee) = callee {
+        store.0.enter_guest_sync_call(false, callee)?;
+    }
+    instance.start_raw(store, UncaughtException::Trap)?;
+    if callee.is_some() {
+        store.0.exit_guest_sync_call()?;
+    }
+    Ok(())
 }
 
 /// A "pre-instantiated" [`Instance`] which has all of its arguments already

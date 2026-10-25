@@ -1,6 +1,6 @@
 use crate::ErrorExt;
 
-use super::gc_store;
+use super::{gc_engine, gc_store};
 use wasmtime::*;
 
 #[test]
@@ -72,11 +72,12 @@ fn array_new_cross_store_initial_elem() {
 #[test]
 #[should_panic = "wrong store"]
 fn array_new_cross_store_pre() {
-    let mut store1 = gc_store().unwrap();
-    let mut store2 = gc_store().unwrap();
+    let engine = gc_engine().unwrap();
+    let mut store1 = Store::new(&engine, ());
+    let mut store2 = Store::new(&engine, ());
 
     let array_ty = ArrayType::new(
-        store1.engine(),
+        &engine,
         FieldType::new(Mutability::Var, StorageType::ValType(ValType::ANYREF)),
     );
     let pre = ArrayRefPre::new(&mut store2, array_ty);
@@ -157,11 +158,12 @@ fn array_new_fixed_cross_store_initial_elem() {
 #[test]
 #[should_panic = "wrong store"]
 fn array_new_fixed_cross_store_pre() {
-    let mut store1 = gc_store().unwrap();
-    let mut store2 = gc_store().unwrap();
+    let engine = gc_engine().unwrap();
+    let mut store1 = Store::new(&engine, ());
+    let mut store2 = Store::new(&engine, ());
 
     let array_ty = ArrayType::new(
-        store1.engine(),
+        &engine,
         FieldType::new(Mutability::Var, StorageType::ValType(ValType::ANYREF)),
     );
     let pre = ArrayRefPre::new(&mut store2, array_ty);
@@ -880,6 +882,109 @@ fn instantiate_with_array_global() -> Result<()> {
 }
 
 #[test]
+fn arrayref_to_anyref_rooted() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 2)?;
+
+    // Rooted<ArrayRef>::to_anyref upcast
+    let any: Rooted<AnyRef> = a.to_anyref();
+    assert!(any.is_array(&store)?);
+
+    Ok(())
+}
+
+#[test]
+fn arrayref_to_eqref_rooted() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 2)?;
+
+    // Rooted<ArrayRef>::to_eqref upcast
+    let eq: Rooted<EqRef> = a.to_eqref();
+    assert!(eq.is_array(&store)?);
+
+    Ok(())
+}
+
+#[test]
+fn arrayref_owned_to_anyref() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(5), 1)?;
+    let owned = a.to_owned_rooted(&mut store)?;
+
+    // OwnedRooted<ArrayRef>::to_anyref
+    let any_owned: OwnedRooted<AnyRef> = owned.to_anyref();
+    let any = any_owned.to_rooted(&mut store);
+    assert!(any.is_array(&store)?);
+
+    Ok(())
+}
+
+#[test]
+fn arrayref_owned_to_eqref() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(5), 1)?;
+    let owned = a.to_owned_rooted(&mut store)?;
+
+    // OwnedRooted<ArrayRef>::to_eqref
+    let eq_owned: OwnedRooted<EqRef> = owned.to_eqref();
+    let eq = eq_owned.to_rooted(&mut store);
+    assert!(eq.is_array(&store)?);
+
+    Ok(())
+}
+
+#[test]
+fn arrayref_ty() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty.clone());
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 3)?;
+
+    let ty = a.ty(&store)?;
+    assert!(matches!(ty.element_type(), StorageType::ValType(_)));
+
+    Ok(())
+}
+
+#[test]
+fn arrayref_matches_ty() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty.clone());
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 2)?;
+
+    assert!(a.matches_ty(&store, &array_ty)?);
+
+    Ok(())
+}
+
+#[test]
 fn issue_13034_array_layout_overflow() -> Result<()> {
     for (storage, len, val) in [
         (StorageType::I8, u32::MAX, Val::I32(0)),
@@ -894,6 +999,84 @@ fn issue_13034_array_layout_overflow() -> Result<()> {
         let pre = ArrayRefPre::new(&mut store, array_ty);
         let err = ArrayRef::new(&mut store, &pre, &val, len).unwrap_err();
         err.assert_contains("allocation size too large");
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn host_arrayref_has_trace_info_for_gc() -> Result<()> {
+    for collector in [Collector::Copying, Collector::DeferredReferenceCounting] {
+        println!("Using GC collector: {collector:?}");
+
+        let mut config = Config::new();
+        config.wasm_exceptions(true).wasm_gc(true);
+        config.collector(collector);
+
+        let engine = Engine::new(&config)?;
+
+        // Create a store and allocate the GC store by instantiating a module
+        let mut store = Store::new(&engine, ());
+        let module = Module::new(
+            &engine,
+            r#"(module
+              (global (export "g") (mut arrayref) (ref.null array))
+              (table 1 anyref)
+            )"#,
+        )?;
+        let instance = Instance::new(&mut store, &module, &[])?;
+        let g = instance.get_global(&mut store, "g").unwrap();
+
+        // Allocate a host arrayref object in a nested scope and put it into the
+        // module that was just allocated.
+        let array_ty = ArrayType::new(&engine, FieldType::new(Mutability::Const, StorageType::I8));
+        let arraypre = ArrayRefPre::new(&mut store, array_ty.clone());
+        {
+            let mut scope = RootScope::new(&mut store);
+            let array = ArrayRef::new(&mut scope, &arraypre, &Val::I32(29), 1)?;
+            g.set(&mut scope, Val::AnyRef(Some(array.into())))?;
+        }
+
+        // The arrayref should stay alive and be traced properly...
+        store.gc(None)?;
+
+        assert!(matches!(g.get(&mut store), Val::AnyRef(Some(_))));
+    }
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn array_new_type_mismatch_does_not_leak() -> Result<()> {
+    for collector in [Collector::Copying, Collector::DeferredReferenceCounting] {
+        println!("Using GC collector: {collector:?}");
+
+        let mut config = Config::new();
+        config.wasm_gc(true);
+        config.collector(collector);
+        config.gc_heap_may_move(false);
+        config.gc_heap_reservation(64 << 10);
+        config.gc_heap_reservation_for_growth(0);
+        let engine = Engine::new(&config)?;
+        let mut store = Store::new(&engine, ());
+
+        let array_ty = ArrayType::new(
+            &engine,
+            FieldType::new(Mutability::Var, ValType::I32.into()),
+        );
+        let pre = ArrayRefPre::new(&mut store, array_ty);
+        let bad_elems = vec![Val::I64(0); 1000];
+
+        for _ in 0..100 {
+            let err = ArrayRef::new_fixed(&mut store, &pre, &bad_elems).unwrap_err();
+            err.assert_contains("element type mismatch");
+            let err = ArrayRef::new(&mut store, &pre, &Val::I64(0), 1000).unwrap_err();
+            err.assert_contains("element type mismatch");
+
+            let mut scope = RootScope::new(&mut store);
+            ArrayRef::new(&mut scope, &pre, &Val::I32(0), 1000)?;
+        }
     }
     Ok(())
 }

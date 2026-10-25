@@ -34,19 +34,29 @@ pub unsafe fn commit_pages(_addr: *mut u8, _len: usize) -> Result<()> {
     Ok(())
 }
 
+#[allow(non_camel_case_types)] // matching C conventions
 #[cfg(feature = "pooling-allocator")]
-pub unsafe fn decommit_pages(addr: *mut u8, len: usize) -> Result<()> {
-    if len == 0 {
-        return Ok(());
-    }
+pub struct iovec {
+    pub iov_base: *mut u8,
+    pub iov_len: usize,
+}
 
-    unsafe {
-        cvt(capi::wasmtime_mmap_remap(
-            addr,
-            len,
-            capi::PROT_READ | capi::PROT_WRITE,
-        ))
+#[cfg(feature = "pooling-allocator")]
+pub unsafe fn decommit_pages(iov: &[iovec]) -> Result<()> {
+    for iov in iov {
+        if iov.iov_len == 0 {
+            continue;
+        }
+
+        unsafe {
+            cvt(capi::wasmtime_mmap_remap(
+                iov.iov_base,
+                iov.iov_len,
+                capi::PROT_READ | capi::PROT_WRITE,
+            ))?;
+        }
     }
+    Ok(())
 }
 
 pub fn get_page_size() -> usize {
@@ -85,9 +95,16 @@ impl MemoryImageSource {
         }
     }
 
-    #[inline]
-    pub(super) fn image_ptr(&self) -> SendSyncPtr<capi::wasmtime_memory_image> {
-        self.data
+    /// See the documentation of the unix implementation of this method.
+    pub unsafe fn map_at(&self, base: *mut u8, source_offset: u64, len: usize) -> Result<()> {
+        assert_eq!(source_offset, 0);
+        unsafe {
+            cvt(capi::wasmtime_memory_image_map_at(
+                self.data.as_ptr(),
+                base.cast(),
+                len,
+            ))
+        }
     }
 
     pub unsafe fn remap_as_zeros_at(&self, base: *mut u8, len: usize) -> Result<()> {

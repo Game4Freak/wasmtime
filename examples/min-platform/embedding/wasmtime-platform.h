@@ -16,6 +16,7 @@
 //
 // * `WASMTIME_SIGNALS_BASED_TRAPS` - corresponds to `signals-based-traps`
 // * `WASMTIME_CUSTOM_SYNC` - corresponds to `custom-sync-primitives`
+// * `WASMTIME_CUSTOM_FIBER` - corresponds to `custom-fiber`
 //
 // Some more information about this header can additionally be found at
 // <https://docs.wasmtime.dev/stability-platform-support.html>.
@@ -240,19 +241,23 @@ extern void wasmtime_memory_image_free(struct wasmtime_memory_image *image);
 #endif
 
 /**
- * Wasmtime requires a single pointer's space of TLS to be used at runtime,
- * and this function returns the current value of the TLS variable.
+ * Wasmtime requires a small amount of TLS to be used at runtime,
+ * and this function returns the current value of the TLS state.
  *
- * This value should default to `NULL`.
+ * Wasmtime needs at least one pointer's worth of TLS space, and with the
+ * `component-model-async` feature a second pointer's worth of TLS space is
+ * required. The `slot` variable is 0 for the default runtime TLS pointer,
+ * and it is 1 for the component-model-async state. No other value of
+ * `slot` is passed in.
+ *
+ * The values should default to `NULL`.
  */
-extern uint8_t *wasmtime_tls_get(void);
+extern uint8_t *wasmtime_tls_get(uintptr_t slot);
 
 /**
- * Sets the current TLS value for Wasmtime to the provided value.
- *
- * This value should be returned when later calling `wasmtime_tls_get`.
+ * Setter for the TLS space described in `wasmtime_tls_get`.
  */
-extern void wasmtime_tls_set(uint8_t *ptr);
+extern void wasmtime_tls_set(uintptr_t slot, uint8_t *ptr);
 
 #if defined(WASMTIME_CUSTOM_SYNC)
 /**
@@ -326,6 +331,22 @@ extern void wasmtime_sync_rwlock_write_release(uintptr_t *lock);
  * The implementor must handle this case gracefully.
  */
 extern void wasmtime_sync_rwlock_free(uintptr_t *lock);
+#endif
+
+#if defined(WASMTIME_CUSTOM_FIBER)
+/**
+ * Initializes a fiber stack so that switching to it will begin executing `entry`.
+ */
+extern void wasmtime_fiber_init(uint8_t *top_of_stack,
+                                uint8_t *(*entry)(uint8_t*, uint8_t*),
+                                uint8_t *entry_arg0);
+#endif
+
+#if defined(WASMTIME_CUSTOM_FIBER)
+/**
+ * Switches execution to the fiber stack whose top is `top_of_stack`.
+ */
+extern void wasmtime_fiber_switch(uint8_t *top_of_stack);
 #endif
 
 #ifdef __cplusplus

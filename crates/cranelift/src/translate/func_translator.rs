@@ -4,6 +4,7 @@
 //! function to Cranelift IR guided by a `FuncEnvironment` which provides information about the
 //! WebAssembly module and the runtime environment.
 
+use crate::alias_region::AliasRegions;
 use crate::func_environ::FuncEnvironment;
 use crate::translate::TargetEnvironment;
 use crate::translate::code_translator::{bitcast_wasm_returns, translate_operator};
@@ -11,7 +12,8 @@ use crate::translate::translation_utils::get_vmctx_value_label;
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::{self, Block, InstBuilder, ValueLabel};
 use cranelift_codegen::timing;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use smallvec::SmallVec;
 use wasmparser::{BinaryReader, FuncValidator, FunctionBody, OperatorsReader, WasmModuleResources};
 use wasmtime_environ::{TypeConvert, WasmResult};
 
@@ -67,6 +69,7 @@ impl FuncTranslator {
         debug_assert_eq!(func.dfg.num_insts(), 0, "Function must be empty");
 
         let mut builder = FunctionBuilder::new(func, &mut self.func_ctx);
+        builder.make_stack_map_alias_region(Box::new(AliasRegions::<u8>::stack_map_region));
         builder.set_srcloc(cur_srcloc(&reader));
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
@@ -79,21 +82,71 @@ impl FuncTranslator {
         // `environ`. The callback functions may need to insert things in the entry block.
         builder.ensure_inserted_block();
 
-        let num_params = declare_wasm_parameters(&mut builder, entry_block, environ);
+        let num_params = declare_wasm_parameters(&mut builder, entry_block, environ)?;
 
         // Set up the translation state with a single pushed control block representing the whole
         // function and its return values.
         let exit_block = builder.create_block();
-        builder.append_block_params_for_function_returns(exit_block);
         environ
             .stacks
             .initialize(&builder.func.signature, exit_block);
 
         parse_local_decls(&mut reader, &mut builder, num_params, environ, validator)?;
+
+        // Represent the function's return values as `Variable`s, exactly like
+        // Wasm block parameters, rather than as real CLIF block parameters.
+        //
+        // Note this must happen *after* `parse_local_decls`: the Wasm locals'
+        // `Variable`s must be indexed contiguously after the parameters, so we
+        // can only declare these additional variables once all locals exist.
+        let return_types: SmallVec<[ir::Type; 6]> = builder
+            .func
+            .signature
+            .returns
+            .iter()
+            .map(|ret| ret.value_type)
+            .collect();
+        let return_vars: SmallVec<[Variable; 6]> = return_types
+            .iter()
+            .map(|ty| builder.declare_var(*ty))
+            .collect();
+        environ
+            .stacks
+            .block_param_vars
+            .insert(exit_block, return_vars);
+
         parse_function_body(validator, reader, &mut builder, environ)?;
 
-        builder.finalize();
+        builder.finalize(environ.target_config());
+        crate::alias_region::debug_assert_all_mem_insts_have_alias_regions(func);
         log::trace!("translated Wasm to CLIF:\n{}", func.display());
+        Ok(())
+    }
+
+    /// Translate the `FuncKey::ModuleStartup` function.
+    pub fn translate_module_startup(
+        &mut self,
+        func: &mut ir::Function,
+        environ: &mut FuncEnvironment<'_>,
+    ) -> WasmResult<()> {
+        let mut builder = FunctionBuilder::new(func, &mut self.func_ctx);
+        builder.make_stack_map_alias_region(Box::new(AliasRegions::<u8>::stack_map_region));
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+        builder.ensure_inserted_block();
+        environ.before_translate_function(&mut builder)?;
+        environ.translate_module_startup(&mut builder)?;
+        // This function is synthesized rather than translated, so it has no
+        // trailing `end` operator to fold buffered fuel charges into
+        // `self.fuel_var`. Flush them here so they are not dropped when
+        // `fuel_function_exit` saves the fuel var below.
+        environ.fuel_flush_consumed(&mut builder);
+        environ.after_translate_function(&mut builder)?;
+        builder.ins().return_(&[]);
+        builder.finalize(environ.target_config());
+        crate::alias_region::debug_assert_all_mem_insts_have_alias_regions(func);
         Ok(())
     }
 }
@@ -105,7 +158,7 @@ fn declare_wasm_parameters(
     builder: &mut FunctionBuilder,
     entry_block: Block,
     environ: &mut FuncEnvironment<'_>,
-) -> usize {
+) -> WasmResult<usize> {
     let sig_len = builder.func.signature.params.len();
     let mut next_local = 0;
     for i in 0..sig_len {
@@ -125,7 +178,7 @@ fn declare_wasm_parameters(
             let param_value = builder.block_params(entry_block)[i];
             builder.def_var(local, param_value);
 
-            environ.add_state_slot_local(builder, wasm_type, Some(param_value));
+            environ.add_state_slot_local(builder, wasm_type, |_, _| Ok(param_value))?;
         }
         if param_type.purpose == ir::ArgumentPurpose::VMContext {
             let param_value = builder.block_params(entry_block)[i];
@@ -133,7 +186,7 @@ fn declare_wasm_parameters(
         }
     }
 
-    next_local
+    Ok(next_local)
 }
 
 /// Parse the local variable declarations that precede the function body.
@@ -224,7 +277,25 @@ fn declare_locals(
             builder.def_var(local, init);
             builder.set_val_label(init, ValueLabel::new(*next_local));
         }
-        environ.add_state_slot_local(builder, environ.convert_valtype(wasm_type)?, init);
+        environ.add_state_slot_local(
+            builder,
+            environ.convert_valtype(wasm_type)?,
+            |environ, builder| match init {
+                Some(init) => Ok(init),
+                // A non-nullable reference local has no initial value
+                // (validation ensures it's set before it's read), but its
+                // state-slot entry still needs one: the debug API can read
+                // any local's entry, and the GC traces every
+                // GC-reference-typed entry. Use null.
+                None => {
+                    let Ref(rt) = wasm_type else {
+                        unreachable!("only non-nullable references have no initial value")
+                    };
+                    let hty = environ.convert_heap_type(rt.heap_type())?;
+                    environ.translate_ref_null(builder.cursor(), hty)
+                }
+            },
+        )?;
         *next_local += 1;
     }
     Ok(())
@@ -296,7 +367,7 @@ fn validate_op_and_get_operand_types<'a>(
     environ: &mut FuncEnvironment<'_>,
     operand_types: &'a mut Vec<wasmtime_environ::WasmValType>,
     op: &wasmparser::Operator<'_>,
-    pos: usize,
+    pos: u64,
 ) -> WasmResult<Option<&'a [wasmtime_environ::WasmValType]>> {
     // Get the operand types for this operator.
     //

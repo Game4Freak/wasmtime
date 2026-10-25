@@ -29,7 +29,7 @@ use crate::runtime::vm::{
     traphandlers::{CallThreadState, tls},
 };
 #[cfg(all(feature = "gc", feature = "stack-switching"))]
-use crate::vm::stack_switching::{VMContRef, VMStackState};
+use crate::vm::{VMContRef, stack_switching::VMStackState};
 use core::ops::ControlFlow;
 use wasmtime_unwinder::Frame;
 #[cfg(feature = "debug")]
@@ -37,7 +37,7 @@ use wasmtime_unwinder::FrameCursor;
 
 /// A WebAssembly stack trace.
 #[derive(Debug)]
-pub struct Backtrace(Vec<Frame>);
+pub struct Backtrace(TryVec<Frame>);
 
 /// One activation: information sufficient to trace an activation on a
 /// frame as long as that frame remains alive.
@@ -66,7 +66,7 @@ impl Activation {
 impl Backtrace {
     /// Returns an empty backtrace
     pub fn empty() -> Backtrace {
-        Backtrace(Vec::new())
+        Backtrace(TryVec::new())
     }
 
     /// Capture the current Wasm stack in a backtrace.
@@ -77,7 +77,7 @@ impl Backtrace {
             Some(state) => unsafe {
                 Self::new_with_trap_state(vm_store_context, unwind, state, None)
             },
-            None => Backtrace(vec![]),
+            None => Backtrace(TryVec::new()),
         })
     }
 
@@ -92,16 +92,16 @@ impl Backtrace {
         state: &CallThreadState,
         trap_pc_and_fp: Option<(usize, usize)>,
     ) -> Backtrace {
-        let mut frames = vec![];
+        let mut frames = TryVec::new();
         let f = |activation: Activation| unsafe {
             wasmtime_unwinder::visit_frames(
                 unwind,
                 activation.exit_pc,
                 activation.exit_fp,
                 activation.entry_trampoline_fp,
-                |frame| {
-                    frames.push(frame);
-                    ControlFlow::Continue(())
+                |frame| match frames.push(frame) {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(_) => ControlFlow::Break(()),
                 },
             )
         };
@@ -158,11 +158,7 @@ impl Backtrace {
             .last_wasm_entry_fp;
 
         unsafe {
-            // FIXME(frank-emrich) Casting from *const to *mut pointer is
-            // terrible, but we won't actually modify any of the continuations
-            // here.
-            let stack_chain =
-                VMStackChain::Continuation(continuation as *const VMContRef as *mut VMContRef);
+            let stack_chain = VMStackChain::Continuation(continuation.into());
 
             if let ControlFlow::Break(()) = Self::trace_through_continuations(
                 stack_chain,
@@ -189,7 +185,7 @@ impl Backtrace {
 
     /// Walk the current Wasm stack, calling `f` for each frame we walk.
     ///
-    /// If Wasm hit a trap, and we calling this from the trap handler, then the
+    /// If Wasm hit a trap and we are calling this from the trap handler, then the
     /// Wasm exit trampoline didn't run, and we use the provided PC and FP
     /// instead of looking them up in `VMStoreContext`.
     ///
@@ -242,6 +238,10 @@ impl Backtrace {
         // chain. This is justified because only the most recent execution of
         // wasm may execute off the initial stack (see comments in
         // `wasmtime::invoke_wasm_and_catch_traps` for details).
+        //
+        // An activation with a zero PC entered no Wasm (e.g. `Func::call` of a
+        // host function) and is skipped, but older activations may still hold
+        // Wasm frames.
         let activations =
             core::iter::once((stack_chain, last_wasm_exit_pc, last_wasm_exit_fp, unsafe {
                 *(*vm_store_context).last_wasm_entry_fp.get()
@@ -249,7 +249,6 @@ impl Backtrace {
             .chain(
                 state
                     .iter()
-                    .flat_map(|state| state.iter())
                     .filter(|state| {
                         core::ptr::eq(vm_store_context, state.vm_store_context.get().as_ptr())
                     })
@@ -262,7 +261,7 @@ impl Backtrace {
                         )
                     }),
             )
-            .take_while(|(chain, pc, fp, sp)| {
+            .filter(|(chain, pc, fp, sp)| {
                 if *pc == 0 {
                     debug_assert_eq!(*fp, 0);
                     debug_assert_eq!(*sp, 0);
@@ -306,7 +305,7 @@ impl Backtrace {
         entry_trampoline_fp: usize,
         mut f: impl FnMut(Activation) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
-        use crate::runtime::vm::stack_switching::VMStackLimits;
+        use crate::runtime::vm::VMStackLimits;
 
         // Handle the stack that is currently running (which may be a
         // continuation or the initial stack).
@@ -330,19 +329,24 @@ impl Backtrace {
         // pair continuations[i] with stack_limits[i + 1].
         let mut stack_limits_iter = unsafe { chain.clone().into_stack_limits_iter() };
         // Skip the first stack limits (current running stack, handled above).
-        let _current: Option<*mut VMStackLimits> = stack_limits_iter.next();
+        let _current: Option<core::ptr::NonNull<VMStackLimits>> = stack_limits_iter.next();
 
         let mut continuations_iter = unsafe { chain.into_continuation_iter() }.peekable();
 
         while let Some(continuation_ptr) = continuations_iter.next() {
-            let parent_limits_ptr = stack_limits_iter
-                .next()
-                .expect("expected one more VMStackLimits than continuations");
-            let continuation = unsafe { &*continuation_ptr };
-            let parent_limits = unsafe { &*parent_limits_ptr };
+            let continuation = unsafe { continuation_ptr.as_ref() };
+            let Some(parent_limits_ptr) = stack_limits_iter.next() else {
+                // A detached suspended continuation chain ends in `Absent`,
+                // unlike a running chain which ends in an initial stack. The
+                // currently suspended stack was already traced above, and the
+                // last continuation has no parent stack left to trace.
+                debug_assert_eq!(continuation.parent_chain, VMStackChain::Absent);
+                break;
+            };
+            let parent_limits = unsafe { parent_limits_ptr.as_ref() };
 
             // The parent of `continuation` if present and not the last in the chain.
-            let parent_continuation = continuations_iter.peek().map(|&c| unsafe { &*c });
+            let parent_continuation = continuations_iter.peek().map(|c| unsafe { c.as_ref() });
 
             let fiber_stack = continuation.fiber_stack();
             let resume_pc = fiber_stack.control_context_instruction_pointer();

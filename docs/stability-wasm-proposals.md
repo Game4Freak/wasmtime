@@ -24,14 +24,18 @@ The emoji legend is:
 | [`nontrapping-fptoint`]  | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
 | [`multi-value`]          | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
 | [`bulk-memory`]          | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
-| [`reference-types`]      | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
+| [`reference-types`]      | ✅      | ✅    | ✅[^4]   | ✅     | ✅  | ✅    |
 | [`simd`]                 | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
 | [`component-model`]      | ❌[^1]  | ✅    | ✅       | 🚧[^2] | ✅  | 🚧[^3]|
-| [`relaxed-simd`]         | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
+| [`relaxed-simd`]         | ✅      | ✅    | ✅[^4]   | ✅     | ✅  | ✅    |
 | [`multi-memory`]         | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
-| [`tail-call`]            | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
+| [`tail-call`]            | ✅      | ✅    | ✅[^4]   | ✅     | ✅  | ✅    |
 | [`extended-const`]       | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
 | [`memory64`]             | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
+| [`function-references`]  | ✅      | ✅    | ✅[^4]   | ✅     | ✅  | ✅    |
+| [`gc`]                   | ✅      | ✅    | ✅[^4]   | ✅     | ✅  | ✅    |
+| [`exception-handling`]   | ✅      | ✅    | ✅[^4]   | ✅     | ✅  | ✅    |
+| [`wide-arithmetic`]      | ✅      | ✅    | ✅[^4]   | ✅     | ✅  | ✅    |
 
 [^1]: The `component-model` proposal is not at phase 4 in the standardization
     process but it is still enabled-by-default in Wasmtime.
@@ -39,6 +43,7 @@ The emoji legend is:
     lines of `wasm-smith` are not implemented for components.
 [^3]: The component model is mostly supported in the C API but [gaps
     remain][cm-capi-gaps].
+[^4]: Winch does not yet support this proposal at Tier 1.
 
 [cm-capi-gaps]: https://github.com/bytecodealliance/wasmtime/issues?q=is%3Aissue%20state%3Aopen%20label%3Awasm-proposal%3Acomponent-model%20label%3Awasmtime%3Ac-api
 
@@ -47,48 +52,38 @@ The emoji legend is:
 |  Proposal                | Phase 4 | Tests | Finished | Fuzzed | API | C API  |
 |--------------------------|---------|-------|----------|--------|-----|--------|
 | [`custom-page-sizes`]    | ❌      | ✅    | ✅       | ✅     | ✅  | ✅     |
-| [`exception-handling`]   | ✅      | ✅    | ✅       | ✅     | ✅  | ✅     |
-| [`function-references`]  | ✅      | ✅    | ✅       | 🚧     | ✅  | ❌     |
-| [`gc`] [^5]              | ✅      | ✅    | 🚧[^6]   | 🚧[^7] | ✅  | ✅     |
 | [`threads`]              | ✅      | ✅    | 🚧[^8]   | ❌[^4] | ✅  | ✅     |
-| [`wide-arithmetic`]      | ❌      | ✅    | ✅       | ✅     | ✅  | ✅     |
 
-[^4]: Fuzzing with threads is an open implementation question that is expected
-    to get fleshed out as the [`shared-everything-threads`] proposal advances.
-[^5]: There is also a [tracking
-    issue](https://github.com/bytecodealliance/wasmtime/issues/5032) for the
-    GC proposal.
-[^6]: The implementation of Wasm GC is feature complete from a specification
-    perspective, however a number of quality-of-implementation tasks
-    [remain](https://github.com/bytecodealliance/wasmtime/issues/5032), notably
-    a tracing collector that can reclaim garbage cycles.
-[^7]: The GC proposal is lightly fuzzed via `wasm-smith` and our usual
-    whole-module fuzz targets like `differential`, but we would like to
-    additionally [extend the `table_ops` fuzz target to exercise more of the GC
-    proposal](https://github.com/bytecodealliance/wasmtime/issues/10327).
 [^8]: There are [known
     issues](https://github.com/bytecodealliance/wasmtime/issues/4245) with
     shared memories and the implementation/API in Wasmtime, for example they
     aren't well integrated with resource-limiting features in `Store`.
     Additionally `shared` memories aren't supported in the pooling allocator.
+[^4]: Fuzzing with threads is an open implementation question that is expected
+    to get fleshed out as the [`shared-everything-threads`] proposal advances.
 
 [cm-capi-gaps]: https://github.com/bytecodealliance/wasmtime/issues?q=is%3Aissue%20state%3Aopen%20label%3Awasm-proposal%3Acomponent-model%20label%3Awasmtime%3Ac-api
 
 ## Tier 3 WebAssembly Proposals
 
-|  Proposal                   | Phase 4 | Tests | Finished | Fuzzed | API | C API |
-|-----------------------------|---------|-------|----------|--------|-----|-------|
-| [`stack-switching`] [^11]   | ❌      | 🚧    | 🚧       | ❌     | ❌  | ❌    |
+|  Proposal                        | Phase 4 | Tests | Finished | Fuzzed | API | C API |
+|----------------------------------|---------|-------|----------|--------|-----|-------|
+| [`branch-hinting`] [^12]         | ✅      | ✅    | ✅       | ❌     | ✅  | ✅    |
+| [`stack-switching`] [^11]        | ❌      | 🚧    | 🚧       | ❌     | ❌  | ❌    |
+| [`compact-import-section`] [^13] | ✅      | ✅    | ✅       | ❌     | ✅  | ✅    |
 
+[^12]: Disabled by default (`Config::wasm_branch_hinting`) pending fuzzing;
+    tracked at [#9463](https://github.com/bytecodealliance/wasmtime/issues/9463).
 [^11]: The stack-switching proposal is a work-in-progress being tracked
     at [#9465](https://github.com/bytecodealliance/wasmtime/issues/9465).
     Currently the implementation is only for x86\_64 Linux.
+[^13]: Disabled by default (`Config::wasm_compact_imports`) pending fuzzing;
+    tracked at [#14108](https://github.com/bytecodealliance/wasmtime/issues/14108).
 
 ## Unimplemented proposals
 
 | Proposal                      | Tracking Issue |
 |-------------------------------|----------------|
-| [`branch-hinting`]            | [#9463](https://github.com/bytecodealliance/wasmtime/issues/9463) |
 | [`flexible-vectors`]          | [#9464](https://github.com/bytecodealliance/wasmtime/issues/9464) |
 | [`memory-control`]            | [#9467](https://github.com/bytecodealliance/wasmtime/issues/9467) |
 | [`shared-everything-threads`] | [#9466](https://github.com/bytecodealliance/wasmtime/issues/9466) |
@@ -117,13 +112,54 @@ The emoji legend is:
 [`wide-arithmetic`]: https://github.com/WebAssembly/wide-arithmetic/blob/main/proposals/wide-arithmetic/Overview.md
 [`gc`]: https://github.com/WebAssembly/gc
 [`custom-page-sizes`]: https://github.com/WebAssembly/custom-page-sizes
+[`compact-import-section`]: https://github.com/WebAssembly/compact-import-section
+
+## Component-Model Proposals
+
+Changes to the component model aren't currently of the same shape as changes to
+core WebAssembly itself. There are not proposal repositories at this time but
+instead the main specification has "emoji gates" where parts of the
+specification are considered gated when the descriptive text or binary form is
+annotated with a specific emoji. This is the status of the emojis and
+implementations within Wasmtime.
+
+**On-by-default proposals**
+
+|  Proposal                 | Emoji | Phase 4 | Tests | Finished | Fuzzed | API | C API  |
+|---------------------------|-------|---------|-------|----------|--------|-----|--------|
+| async                     | 🔀    | ✅      | ✅    | ✅       | ✅     | ✅  | 🚧[^c1]|
+
+**Off-by-default proposals**
+
+|  Proposal                 | Emoji | Phase 4 | Tests | Finished | Fuzzed | API | C API  |
+|---------------------------|-------|---------|-------|----------|--------|-----|--------|
+| map                       | 🗺️     | ✅      | ✅    | ✅       | ✅     | ✅  | ✅     |
+| implements                | 🏷️     | ✅      | ✅    | ✅       | ❌     | ✅  | ✅     |
+| more async options [^c2]  | 🚝    | ❌      | ✅    | ❌       | ❌     | ✅  | ✅     |
+| stackful async [^c2]      | 🚟    | ❌      | ✅    | ❌       | ❌     | ✅  | ✅     |
+| threading                 | 🧵    | ❌      | ✅    | ❌       | ❌     | ✅  | ❌     |
+| fixed-length-lists        | 🔧    | ❌      | ✅    | 🚧       | ❌     | ✅  | ❌     |
+| memory64                  | 🐘    | ❌      | 🚧    | 🚧       | ❌     | 🚧  | ❌     |
+| error-context [^c2]       | 📝    | ❌      | ❌    | ❌       | ❌     | 🚧  | ❌     |
+| values                    | 🪙    | ❌      | ❌    | ❌       | ❌     | ❌  | ❌     |
+| nested names              | 🪺    | ❌      | ❌    | ❌       | ❌     | ❌  | ❌     |
+| canonical names           | 🔗    | ❌      | ❌    | ❌       | ❌     | ❌  | ❌     |
+| shared-everything-threads | 🧵②   | ❌      | ❌    | ❌       | ❌     | ❌  | ❌     |
+
+[^c1]: Tracked in [#13705](https://github.com/bytecodealliance/wasmtime/issues/13705)
+[^c2]: These features were sliced out of the original async proposal for the
+    component model but the implementation remains in Wasmtime.
+
+
 
 ## Feature requirements
 
 For each column in the above tables, this is a further explanation of its meaning:
 
 * **Phase 4** - The proposal must be in phase 4, or greater, of [the
-  WebAssembly standardization process][phases].
+  WebAssembly standardization process][phases]. For component model proposals
+  this means that the WASI subgroup has voted to include this feature in a
+  release of WASI
 
 * **Tests** - All spec tests must be passing in Wasmtime and where appropriate
   Wasmtime-specific tests, for example for the API, should be passing. Tests

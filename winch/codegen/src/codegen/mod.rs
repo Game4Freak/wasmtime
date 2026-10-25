@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    abi::{ABIOperand, ABISig, RetArea, vmctx},
+    abi::{ABI, ABIOperand, ABISig, LocalSlot, RetArea, vmctx},
     bail,
     codegen::BlockSig,
     ensure, format_err,
@@ -20,12 +20,13 @@ use smallvec::SmallVec;
 use std::marker::PhantomData;
 use wasmparser::{
     BinaryReader, FuncValidator, MemArg, Operator, OperatorsReader, ValidatorResources,
-    VisitOperator, VisitSimdOperator,
+    VisitOperator, VisitSimdOperator, WasmFeatures,
 };
 use wasmtime_cranelift::{TRAP_BAD_SIGNATURE, TRAP_HEAP_MISALIGNED, TRAP_TABLE_OUT_OF_BOUNDS};
 use wasmtime_environ::{
-    FUNCREF_MASK, GlobalIndex, MemoryIndex, MemoryKind, MemoryTunables, PtrSize, TableIndex,
-    Tunables, TypeIndex, WasmHeapType, WasmValType,
+    DataIndex, ElemIndex, FUNCREF_INIT_BIT, FUNCREF_MASK, GlobalIndex, IndexType, MemoryIndex,
+    MemoryKind, MemoryTunables, PtrSize, TableIndex, Tunables, TypeIndex, WasmHeapType,
+    WasmValType, wasm_unsupported,
 };
 
 mod context;
@@ -39,6 +40,11 @@ pub(crate) use control::*;
 mod builtin;
 pub use builtin::*;
 pub(crate) mod bounds;
+mod drc;
+mod exceptions;
+pub(crate) use exceptions::{CatchInfo, TryTableInfo};
+mod gc;
+use gc::GcCodegenConfig;
 
 use bounds::{Bounds, ImmOffset, Index};
 
@@ -117,6 +123,12 @@ where
 
     /// Local counter to track fuel consumption.
     pub fuel_consumed: i64,
+
+    /// Whether this function accesses the store's GC heap.
+    pub needs_gc_heap: bool,
+
+    /// Collector-specific configuration for generating GC operations.
+    gc_codegen_config: Option<GcCodegenConfig>,
     phase: PhantomData<P>,
 }
 
@@ -130,8 +142,19 @@ where
         context: CodeGenContext<'a, Prologue>,
         env: FuncEnv<'a, 'translation, 'data, M::Ptr>,
         sig: ABISig,
-    ) -> CodeGen<'a, 'translation, 'data, M, Prologue> {
-        Self {
+        wasm_features: &WasmFeatures,
+    ) -> Result<CodeGen<'a, 'translation, 'data, M, Prologue>> {
+        let gc_codegen_config = match tunables.collector {
+            Some(collector) => Some(GcCodegenConfig::new(collector)),
+            None if wasm_features.contains(WasmFeatures::EXCEPTIONS) => {
+                return Err(format_err!(wasm_unsupported!(
+                    "support for GC types disabled at configuration time"
+                )));
+            }
+            None => None,
+        };
+
+        Ok(Self {
             sig,
             context,
             masm,
@@ -141,8 +164,10 @@ where
             control_frames: Default::default(),
             // Empty functions should consume at least 1 fuel unit.
             fuel_consumed: 1,
+            needs_gc_heap: false,
+            gc_codegen_config,
             phase: PhantomData,
-        }
+        })
     }
 
     /// Code generation prologue.
@@ -167,6 +192,7 @@ where
 
         self.masm.reserve_stack(self.context.frame.locals_size)?;
         self.spill_register_arguments()?;
+        self.copy_stack_gc_refs_to_frame()?;
 
         let defined_locals_range = &self.context.frame.defined_locals_range;
         self.masm.zero_mem_range(defined_locals_range.as_range())?;
@@ -201,6 +227,8 @@ where
             source_location: self.source_location,
             control_frames: self.control_frames,
             fuel_consumed: self.fuel_consumed,
+            needs_gc_heap: self.needs_gc_heap,
+            gc_codegen_config: self.gc_codegen_config,
             phase: PhantomData,
         })
     }
@@ -221,14 +249,54 @@ where
                             self.masm.store((*reg).into(), addr, (*ty).try_into()?)?;
                         }
                         Ref(rt) => match rt.heap_type {
-                            WasmHeapType::Func | WasmHeapType::Extern => {
+                            WasmHeapType::Func => {
                                 self.masm.store_ptr(*reg, addr)?;
+                            }
+                            WasmHeapType::Extern
+                            | WasmHeapType::Exn
+                            | WasmHeapType::ConcreteExn(_)
+                            | WasmHeapType::NoExn => {
+                                self.masm.store((*reg).into(), addr, (*ty).try_into()?)?;
                             }
                             _ => bail!(CodeGenError::unsupported_wasm_type()),
                         },
                     }
                 }
                 // Skip non-register arguments
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy GC references passed on the stack into frame slots so that
+    /// stack maps cover them: the caller's argument area is not visited by
+    /// the collector, so a reference left there goes stale across a
+    /// collection. Everything else stays in the caller's argument area.
+    fn copy_stack_gc_refs_to_frame(&mut self) -> Result<()> {
+        for (operand, slot) in self
+            .sig
+            .params_without_retptr()
+            .iter()
+            .zip(self.context.frame.locals())
+        {
+            match (operand, slot) {
+                (ABIOperand::Stack { ty, offset, .. }, slot)
+                    if ty.is_vmgcref_type_and_not_i31() =>
+                {
+                    ensure!(
+                        slot.addressed_from_sp(),
+                        CodeGenError::sp_addressing_expected(),
+                    );
+                    let arg_base = u32::from(<M::ABI as ABI>::arg_base_offset());
+                    let src = LocalSlot::stack_arg(*ty, offset + arg_base);
+                    let src_addr = self.masm.local_address(&src)?;
+                    let dst_addr = self.masm.local_address(slot)?;
+                    self.masm.with_scratch::<IntScratch, _>(|masm, scratch| {
+                        masm.load(src_addr, scratch.writable(), (*ty).try_into()?)?;
+                        masm.store(scratch.inner().into(), dst_addr, (*ty).try_into()?)
+                    })?;
+                }
                 _ => {}
             }
         }
@@ -254,9 +322,17 @@ where
 
     /// Pops a control frame from the control frame stack.
     pub fn pop_control_frame(&mut self) -> Result<ControlStackFrame> {
-        self.control_frames
+        let frame = self
+            .control_frames
             .pop()
-            .ok_or_else(|| format_err!(CodeGenError::control_frame_expected()))
+            .ok_or_else(|| format_err!(CodeGenError::control_frame_expected()))?;
+        if let Some(info) = frame.try_table_info() {
+            self.context
+                .exception_handlers
+                .restore_checkpoint(info.checkpoint);
+        }
+
+        Ok(frame)
     }
 
     /// Derives a [RelSourceLoc] from a [SourceLoc].
@@ -294,6 +370,9 @@ where
 
     pub fn handle_unreachable_end(&mut self) -> Result<()> {
         let mut frame = self.pop_control_frame()?;
+        if let Some(info) = frame.take_try_table_info() {
+            return self.emit_try_table_end(frame, info);
+        }
         // We just popped the outermost block.
         let is_outermost = self.control_frames.len() == 0;
 
@@ -351,7 +430,7 @@ where
         ops.finish()?;
         return Ok(());
 
-        struct ValidateThenVisit<'a, T, U>(T, &'a mut U, usize);
+        struct ValidateThenVisit<'a, T, U>(T, &'a mut U, u64);
 
         macro_rules! validate_then_visit {
             ($( @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident $ann:tt)*) => {
@@ -359,6 +438,7 @@ where
                     fn $visit(&mut self $($(,$arg: $argty)*)?) -> Self::Output {
                         self.0.$visit($($($arg.clone()),*)?)?;
                         let op = Operator::$op $({ $($arg: $arg.clone()),* })?;
+                        check_impl_limits(&op)?;
                         if self.1.visit(&op) {
                             self.1.before_visit_op(&op, self.2)?;
                             let res = self.1.$visit($($($arg),*)?)?;
@@ -372,10 +452,21 @@ where
             };
         }
 
+        /// Check implementation limits that are not (yet) enforced by
+        /// validation. This is done regardless of reachability.
+        fn check_impl_limits(op: &Operator) -> Result<()> {
+            if let Operator::BrTable { targets } = op {
+                if targets.len() > wasmtime_cranelift::MAX_BR_TABLE_TARGETS {
+                    bail!(CodeGenError::br_table_too_large(targets.len()));
+                }
+            }
+            Ok(())
+        }
+
         fn visit_op_when_unreachable(op: &Operator) -> bool {
             use Operator::*;
             match op {
-                If { .. } | Block { .. } | Loop { .. } | Else | End => true,
+                If { .. } | Block { .. } | TryTable { .. } | Loop { .. } | Else | End => true,
                 _ => false,
             }
         }
@@ -384,7 +475,7 @@ where
         /// operator.
         trait VisitorHooks {
             /// Hook prior to visiting an operator.
-            fn before_visit_op(&mut self, operator: &Operator, offset: usize) -> Result<()>;
+            fn before_visit_op(&mut self, operator: &Operator, offset: u64) -> Result<()>;
             /// Hook after visiting an operator.
             fn after_visit_op(&mut self) -> Result<()>;
 
@@ -406,7 +497,7 @@ where
                 self.context.reachable || visit_op_when_unreachable(op)
             }
 
-            fn before_visit_op(&mut self, operator: &Operator, offset: usize) -> Result<()> {
+            fn before_visit_op(&mut self, operator: &Operator, offset: u64) -> Result<()> {
                 // Handle source location mapping.
                 self.source_location_before_visit_op(offset)?;
 
@@ -451,6 +542,14 @@ where
         }
     }
 
+    /// Whether a GC barrier must be emitted when writing or reading a
+    /// reference of the given type through a collector-visible location.
+    pub fn gc_barrier_needed(&self, ty: &WasmValType) -> bool {
+        ty.is_vmgcref_type_and_not_i31()
+            && self.tunables.collector
+                == Some(wasmtime_environ::Collector::DeferredReferenceCounting)
+    }
+
     /// Emits a a series of instructions that will type check a function reference call.
     pub fn emit_typecheck_funcref(
         &mut self,
@@ -461,12 +560,9 @@ where
         let sig_index_bytes = self.env.vmoffsets.size_of_vmshared_type_index();
         let sig_size = OperandSize::from_bytes(sig_index_bytes);
         let sig_index = self.env.translation.module.types[type_index].unwrap_module_type_index();
-        let sig_offset = sig_index
-            .as_u32()
-            .checked_mul(sig_index_bytes.into())
-            .unwrap();
-        let signatures_base_offset = self.env.vmoffsets.ptr.vmctx_type_ids_array();
-        let funcref_sig_offset = self.env.vmoffsets.ptr.vm_func_ref_type_index();
+        let sig_offset = self.env.shared_type_index_offset(sig_index);
+        let signatures_base_offset = self.env.vmoffsets.ptr.vmctx().type_ids();
+        let funcref_sig_offset = self.env.vmoffsets.ptr.vm_func_ref().type_index();
         // Get the caller id.
         let caller_id = self.context.any_gpr(self.masm)?;
 
@@ -527,9 +623,40 @@ where
             self.context.stack.len() == 0,
             CodeGenError::unexpected_value_in_value_stack()
         );
-        self.masm.free_stack(self.context.frame.locals_size)?;
-        self.masm.epilogue()?;
+        let stack_args_size = if self.sig.call_conv.is_default() {
+            crate::abi::align_to(
+                self.sig.params_stack_size(),
+                u32::from(M::ABI::call_stack_align()),
+            )
+        } else {
+            0
+        };
+        self.masm
+            .epilogue(self.context.frame.locals_size, stack_args_size)?;
         self.masm.end_source_loc()?;
+        Ok(())
+    }
+
+    /// Emits a select, using the declared result type for typed selects.
+    pub fn emit_select(&mut self, ty: Option<WasmValType>) -> Result<()> {
+        let cond = self.context.pop_to_reg(self.masm, None)?;
+        let val2 = self.context.pop_to_reg(self.masm, None)?;
+        let val1 = self.context.pop_to_reg(self.masm, None)?;
+        let ty = ty.unwrap_or(val1.ty);
+        self.masm.cmp(cond.reg, RegImm::i32(0), OperandSize::S32)?;
+        // Conditionally move val1 to val2 if the comparison is not zero.
+        self.masm.cmov(
+            writable!(val2.into()),
+            val1.into(),
+            IntCmpKind::Ne,
+            ty.try_into()?,
+        )?;
+        // A null reference can have an integer shadow type. The selected value
+        // must retain the declared reference type so stack maps cover it.
+        self.context.stack.push(TypedReg::new(ty, val2.reg).into());
+        self.context.free_reg(val1.reg);
+        self.context.free_reg(cond);
+
         Ok(())
     }
 
@@ -567,13 +694,22 @@ where
         }
     }
 
-    pub fn emit_lazy_init_funcref(&mut self, table_index: TableIndex) -> Result<()> {
-        assert!(self.tunables.table_lazy_init, "unsupported eager init");
+    pub fn emit_table_get(&mut self, table_index: TableIndex) -> Result<()> {
+        let table = self.env.table(table_index);
+        let heap_type = table.ref_type.heap_type;
+        ensure!(
+            heap_type == WasmHeapType::Func,
+            CodeGenError::unsupported_wasm_type()
+        );
+        ensure!(
+            self.tunables.table_lazy_init,
+            CodeGenError::unsupported_table_eager_init()
+        );
         let table_data = self.env.resolve_table_data(table_index);
         let ptr_type = self.env.ptr_type();
         let builtin = self.env.builtins.table_get_lazy_init_func_ref::<M::ABI>()?;
 
-        // Request the builtin's  result register and use it to hold the table
+        // Request the builtin's result register and use it to hold the table
         // element value. We preemptively spill and request this register to
         // avoid conflict at the control flow merge below. Requesting the result
         // register is safe since we know ahead-of-time the builtin's signature.
@@ -647,6 +783,406 @@ where
         self.masm.bind(cont)
     }
 
+    /// Emit the `table.set` operation for a function-reference table.
+    ///
+    /// Expects the value stack to contain `[index, value]` (with `value` on
+    /// top) and consumes both.
+    pub fn emit_table_set(&mut self, table_index: TableIndex) -> Result<()> {
+        let table = self.env.table(table_index);
+        ensure!(
+            table.ref_type.heap_type == WasmHeapType::Func,
+            CodeGenError::unsupported_wasm_type()
+        );
+        ensure!(
+            self.tunables.table_lazy_init,
+            CodeGenError::unsupported_table_eager_init()
+        );
+        let ptr_type = self.env.ptr_type();
+        let table_data = self.env.resolve_table_data(table_index);
+        let value = self.context.pop_to_reg(self.masm, None)?;
+        let index = self.context.pop_to_reg(self.masm, None)?;
+        let base = self.context.any_gpr(self.masm)?;
+        let elem_addr = self.emit_compute_table_elem_addr(index.into(), base, &table_data)?;
+        // Set the initialized bit.
+        self.masm.or(
+            writable!(value.into()),
+            value.into(),
+            RegImm::i64(FUNCREF_INIT_BIT as i64),
+            ptr_type.try_into()?,
+        )?;
+
+        self.masm.store_ptr(value.into(), elem_addr)?;
+
+        self.context.free_reg(value);
+        self.context.free_reg(index);
+        self.context.free_reg(base);
+        Ok(())
+    }
+
+    /// Emit the `table.grow` operation.
+    pub fn emit_table_grow(&mut self, table_index: TableIndex) -> Result<()> {
+        let ptr_type = self.env.ptr_type();
+        let idx_type = self.env.table(table_index).idx_type;
+
+        // Duplicate the `delta` argument on the stack since we'll need it at
+        // the end if growth succeeds.
+        let delta = self.context.pop_to_reg(self.masm, None)?;
+        let tmp = self.context.any_gpr(self.masm)?;
+        self.masm
+            .mov(writable!(tmp), delta.reg.into(), delta.ty.try_into()?)?;
+        self.context.stack.push(TypedReg::new(delta.ty, tmp).into());
+        self.context.stack.push(delta.into());
+
+        // Invoke the `table.grow` builtin on the host which will return whether
+        // the growth succeeded, and if so where it's located.
+        let at = self.context.stack.ensure_index_at(1)?;
+        let builtin = self.env.builtins.table_grow::<M::ABI>()?;
+        let builtin = self.prepare_builtin_defined_table_arg(table_index, at, builtin)?;
+        FnCall::emit::<M>(&mut self.env, self.masm, &mut self.context, builtin)?;
+
+        // Pop everything that's on the stack now. The builtin took `delta` and
+        // pushed a result, and then peel off our duplicate of `delta` plus the
+        // initialization element of `table.grow` itself.
+        let result = self.context.pop_to_reg(self.masm, None)?;
+        let len = self.context.pop_to_reg(self.masm, None)?;
+        let init = self.context.pop_to_reg(self.masm, None)?;
+
+        // Save a copy of `result` on the stack since we'll need it after
+        // `table.fill` is done.
+        let tmp_result = self.context.any_gpr(self.masm)?;
+        self.masm.mov(
+            writable!(tmp_result),
+            result.reg.into(),
+            result.ty.try_into()?,
+        )?;
+        self.context
+            .stack
+            .push(TypedReg::new(result.ty, tmp_result).into());
+
+        // Test if the result of growth is -1. If it is, then we're done.
+        // Otherwise fall through to `table.fill`.
+        let done = self.masm.get_label()?;
+        self.masm.branch(
+            IntCmpKind::Eq,
+            result.reg,
+            RegImm::i64(-1),
+            done,
+            OperandSize::S64,
+        )?;
+
+        // Prepare the arguments for `table.fill` in the order the wasm
+        // instruction expects.
+        self.context.stack.push(result.into());
+        self.context.stack.push(init.into());
+        self.context.stack.push(len.into());
+        self.emit_table_fill(table_index)?;
+
+        self.masm.bind(done)?;
+
+        // Similar to the memory.grow builtin, `table.grow` returns a
+        // pointer, however, we need to ensure that the returned index
+        // is representative of the address space for tables.
+        match (ptr_type, idx_type) {
+            (WasmValType::I64, IndexType::I64) => Ok(()),
+            (WasmValType::I64, IndexType::I32) => {
+                let top: Reg = self.context.pop_to_reg(self.masm, None)?.into();
+                self.masm.wrap(writable!(top), top)?;
+                self.context.stack.push(TypedReg::i32(top).into());
+                Ok(())
+            }
+
+            _ => Err(format_err!(CodeGenError::unsupported_32_bit_platform())),
+        }
+    }
+
+    /// Emit the `table.fill` operation.
+    pub fn emit_table_fill(&mut self, table_index: TableIndex) -> Result<()> {
+        // Put all of this opcode's arguments into registers.
+        let len = self.context.pop_to_reg(self.masm, None)?;
+        let init = self.context.pop_to_reg(self.masm, None)?;
+        let offset = self.context.pop_to_reg(self.masm, None)?;
+
+        // Perform a bounds check to see if `offset+len` is inbounds.
+        let table_data = self.env.resolve_table_data(table_index);
+        self.emit_compute_table_size(&table_data)?;
+        let table_size = self.context.pop_to_reg(self.masm, None)?;
+        let tmp = self.context.any_gpr(self.masm)?;
+        let idx_size = table_data.index_type().try_into()?;
+        self.masm.mov(writable!(tmp), offset.reg.into(), idx_size)?;
+        self.masm.checked_uadd(
+            writable!(tmp),
+            tmp,
+            len.reg.into(),
+            idx_size,
+            TRAP_TABLE_OUT_OF_BOUNDS,
+        )?;
+        self.masm.cmp(tmp, table_size.reg.into(), idx_size)?;
+        self.masm
+            .trapif(IntCmpKind::GtU, TRAP_TABLE_OUT_OF_BOUNDS)?;
+        self.context.free_reg(tmp);
+        self.context.free_reg(table_size);
+
+        let header = self.masm.get_label()?;
+        let exit = self.masm.get_label()?;
+
+        self.masm.bind(header)?;
+
+        // Exit the loop once there are no more elements to copy.
+        self.masm.branch(
+            IntCmpKind::Eq,
+            len.reg,
+            RegImm::i64(0),
+            exit,
+            OperandSize::S64,
+        )?;
+
+        // Duplicate `offset`, where we're writing, and `init` what we're
+        // writing, into temporary registers. These are used by `emit_table_set`
+        // below.
+        let tmp_index = self.context.any_gpr(self.masm)?;
+        let tmp_init = self.context.any_gpr(self.masm)?;
+        self.masm
+            .mov(writable!(tmp_index), offset.reg.into(), OperandSize::S64)?;
+        self.masm
+            .mov(writable!(tmp_init), init.reg.into(), OperandSize::S64)?;
+
+        // Spill all this loop's variables onto the stack.
+        self.context.stack.push(TypedReg::i64(len.reg).into());
+        self.context.stack.push(TypedReg::i64(init.reg).into());
+        self.context.stack.push(TypedReg::i64(offset.reg).into());
+
+        // Emit `table.set`, consuming our temporary registers.
+        self.context.stack.push(TypedReg::i64(tmp_index).into());
+        self.context.stack.push(TypedReg::i64(tmp_init).into());
+        self.emit_table_set(table_index)?;
+
+        // Reload this loop's variables into the same registers as the start of
+        // the loop.
+        self.context.pop_to_reg(self.masm, Some(offset.reg))?;
+        self.context.pop_to_reg(self.masm, Some(init.reg))?;
+        self.context.pop_to_reg(self.masm, Some(len.reg))?;
+
+        // Advance the destination we're writing to, and decrement the number of
+        // elements left to write.
+        self.masm.add(
+            writable!(offset.reg),
+            offset.reg,
+            RegImm::i64(1),
+            OperandSize::S64,
+        )?;
+        self.masm.sub(
+            writable!(len.reg),
+            len.reg,
+            RegImm::i64(1),
+            OperandSize::S64,
+        )?;
+        self.masm.jmp(header)?;
+
+        self.masm.bind(exit)?;
+
+        self.context.free_reg(offset);
+        self.context.free_reg(init);
+        self.context.free_reg(len);
+        Ok(())
+    }
+
+    /// Emits a bounds check for the range `[idx, idx + len)` against the
+    /// current size of `table_data`, trapping with `TRAP_TABLE_OUT_OF_BOUNDS`
+    /// if the range is out-of-bounds.
+    ///
+    /// Both `idx` and `len` are expected to be 64-bit values.
+    fn emit_table_range_bounds_check(
+        &mut self,
+        table_data: &TableData,
+        idx: Reg,
+        len: Reg,
+    ) -> Result<()> {
+        self.emit_compute_table_size(table_data)?;
+        let size = self.context.pop_to_reg(self.masm, None)?;
+
+        // Compute `end = idx + len`, trapping on overflow, and then trap if
+        // `end > size`.
+        let end = self.context.any_gpr(self.masm)?;
+        self.masm
+            .mov(writable!(end), idx.into(), OperandSize::S64)?;
+        self.masm.checked_uadd(
+            writable!(end),
+            end,
+            len.into(),
+            OperandSize::S64,
+            TRAP_TABLE_OUT_OF_BOUNDS,
+        )?;
+        self.masm.cmp(end, size.reg.into(), OperandSize::S64)?;
+        self.masm
+            .trapif(IntCmpKind::GtU, TRAP_TABLE_OUT_OF_BOUNDS)?;
+
+        self.context.free_reg(size);
+        self.context.free_reg(end);
+        Ok(())
+    }
+
+    /// Emit the `table.copy` operation.
+    pub fn emit_table_copy(&mut self, dst_table: TableIndex, src_table: TableIndex) -> Result<()> {
+        let dst_data = self.env.resolve_table_data(dst_table);
+        let src_data = self.env.resolve_table_data(src_table);
+
+        // The value stack contains `[dst, src, len]` (top is `len`).
+        let len = self.context.pop_to_reg(self.masm, None)?;
+        let src = self.context.pop_to_reg(self.masm, None)?;
+        let dst = self.context.pop_to_reg(self.masm, None)?;
+
+        // Zero-extend each operand to a full 64-bit value so that the
+        // arithmetic and bounds checks below can uniformly operate on 64-bit
+        // quantities regardless of the table's index type.
+        for op in [&len, &src, &dst] {
+            if op.ty == WasmValType::I32 {
+                self.masm.extend(
+                    writable!(op.reg),
+                    op.reg,
+                    Extend::<Zero>::I64Extend32.into(),
+                )?;
+            }
+        }
+
+        // Bounds check both ranges up-front; `table.copy` traps without
+        // copying anything if either range is out-of-bounds.
+        self.emit_table_range_bounds_check(&src_data, src.reg, len.reg)?;
+        self.emit_table_range_bounds_check(&dst_data, dst.reg, len.reg)?;
+
+        // Decide the copy direction. If `dst <= src` then do a forwards copy
+        // and otherwise it's backwards.
+        let step = self.context.any_gpr(self.masm)?;
+        let forward = self.masm.get_label()?;
+        let setup_done = self.masm.get_label()?;
+        self.masm.branch(
+            IntCmpKind::LeU,
+            dst.reg,
+            src.reg.into(),
+            forward,
+            OperandSize::S64,
+        )?;
+        // Backwards: start at the last element and walk down.
+        {
+            self.masm
+                .mov(writable!(step), RegImm::i64(-1), OperandSize::S64)?;
+            self.masm.add(
+                writable!(src.reg),
+                src.reg,
+                len.reg.into(),
+                OperandSize::S64,
+            )?;
+            self.masm.sub(
+                writable!(src.reg),
+                src.reg,
+                RegImm::i64(1),
+                OperandSize::S64,
+            )?;
+            self.masm.add(
+                writable!(dst.reg),
+                dst.reg,
+                len.reg.into(),
+                OperandSize::S64,
+            )?;
+            self.masm.sub(
+                writable!(dst.reg),
+                dst.reg,
+                RegImm::i64(1),
+                OperandSize::S64,
+            )?;
+        }
+        self.masm.jmp(setup_done)?;
+        // Forwards: start at the first element and walk up.
+        self.masm.bind(forward)?;
+        {
+            self.masm
+                .mov(writable!(step), RegImm::i64(1), OperandSize::S64)?;
+        }
+
+        self.masm.bind(setup_done)?;
+
+        let header = self.masm.get_label()?;
+        let exit = self.masm.get_label()?;
+
+        self.masm.bind(header)?;
+
+        // Exit the loop once there are no more elements to copy.
+        self.masm.branch(
+            IntCmpKind::Eq,
+            len.reg,
+            RegImm::i64(0),
+            exit,
+            OperandSize::S64,
+        )?;
+
+        // Spill all loop variables to the stack for the body of the loop.
+        // These will get reloaded back into the same registers at the end of
+        // the loop.
+        self.context.stack.push(TypedReg::i64(step).into());
+        self.context.stack.push(TypedReg::i64(len.reg).into());
+        self.context.stack.push(TypedReg::i64(dst.reg).into());
+        self.context.stack.push(TypedReg::i64(src.reg).into());
+
+        // Do a `table.get` followed by a `table.set`. Note that this'll redo
+        // bounds checks which technically aren't necessary, but it's less code
+        // duplication/complexity in Winch.
+        //
+        // Note that `dst` and `src` are on the stack and are needed for these
+        // operations. They're also needed at the end of the loop, so some
+        // stack-shuffling is necessary to "dup" the right values and get
+        // everything in the expected shapes for `emit_table_{get,set}`.
+        {
+            let tmp_src = self.context.pop_to_reg(self.masm, None)?;
+            let s = self.context.any_gpr(self.masm)?;
+            self.masm
+                .mov(writable!(s), tmp_src.reg.into(), OperandSize::S64)?;
+            self.context.stack.push(tmp_src.into());
+            self.context.stack.push(TypedReg::i64(s).into());
+            self.emit_table_get(src_table)?;
+            let funcref = self.context.pop_to_reg(self.masm, None)?;
+
+            let tmp_src = self.context.pop_to_reg(self.masm, None)?;
+            let tmp_dst = self.context.pop_to_reg(self.masm, None)?;
+
+            let d = self.context.any_gpr(self.masm)?;
+            self.masm
+                .mov(writable!(d), tmp_dst.reg.into(), OperandSize::S64)?;
+            self.context.stack.push(tmp_dst.into());
+            self.context.stack.push(tmp_src.into());
+            self.context.stack.push(TypedReg::i64(d).into());
+            self.context.stack.push(funcref.into());
+            self.emit_table_set(dst_table)?;
+        }
+
+        // Reload loop variables specifically back into the same registers to
+        // ensure that modifications below are picked up on the next iteration.
+        self.context.pop_to_reg(self.masm, Some(src.reg))?;
+        self.context.pop_to_reg(self.masm, Some(dst.reg))?;
+        self.context.pop_to_reg(self.masm, Some(len.reg))?;
+        self.context.pop_to_reg(self.masm, Some(step))?;
+
+        // Advance the running indices and decrement the remaining count.
+        self.masm
+            .add(writable!(dst.reg), dst.reg, step.into(), OperandSize::S64)?;
+        self.masm
+            .add(writable!(src.reg), src.reg, step.into(), OperandSize::S64)?;
+        self.masm.sub(
+            writable!(len.reg),
+            len.reg,
+            RegImm::i64(1),
+            OperandSize::S64,
+        )?;
+
+        self.masm.jmp(header)?;
+
+        self.masm.bind(exit)?;
+
+        self.context.free_reg(src);
+        self.context.free_reg(dst);
+        self.context.free_reg(len);
+        self.context.free_reg(step);
+        Ok(())
+    }
+
     /// Emits a series of instructions to bounds check and calculate the address
     /// of the given WebAssembly memory.
     /// This function returns a register containing the requested address.
@@ -669,6 +1205,7 @@ where
     /// detecting an out of bounds access at compile time.
     pub fn emit_compute_heap_address(
         &mut self,
+        heap: &HeapData,
         memarg: &MemArg,
         access_size: OperandSize,
     ) -> Result<Option<Reg>> {
@@ -678,8 +1215,6 @@ where
             (access_size.bytes() as u64) + (offset.as_u32() as u64)
         };
 
-        let memory_index = MemoryIndex::from_u32(memarg.memory);
-        let heap = self.env.resolve_heap(memory_index);
         let index = Index::from_typed_reg(self.context.pop_to_reg(self.masm, None)?);
 
         let offset = bounds::ensure_index_and_offset(
@@ -696,8 +1231,6 @@ where
             .can_elide_bounds_check(&memory_tunables, self.env.page_size_log2);
 
         let addr = if offset_with_access_size > heap.memory.maximum_byte_size().unwrap_or(u64::MAX)
-            || (!self.tunables.memory_may_move
-                && offset_with_access_size > self.tunables.memory_reservation)
         {
             // Detect at compile time if the access is out of bounds.
             // Doing so will put the compiler in an unreachable code state,
@@ -830,7 +1363,7 @@ where
             self.masm.checked_uadd(
                 writable!(index_offset_and_access_size),
                 index_offset_and_access_size,
-                Imm::i64(offset_with_access_size as i64),
+                RegImm::i64(offset_with_access_size as i64),
                 ptr_size,
                 TrapCode::HEAP_OUT_OF_BOUNDS,
             )?;
@@ -866,10 +1399,16 @@ where
         Ok(addr)
     }
 
-    /// Emit checks to ensure that the address at `memarg` is correctly aligned for `size`.
-    fn emit_check_align(&mut self, memarg: &MemArg, size: OperandSize) -> Result<()> {
-        if size.bytes() > 1 {
-            // Peek addr from top of the stack by popping and pushing.
+    /// Emit checks to ensure that the address at `memarg` is
+    /// correctly aligned for the access size.
+    fn emit_check_align(
+        &mut self,
+        heap: &HeapData,
+        memarg: &MemArg,
+        access_size: OperandSize,
+    ) -> Result<()> {
+        if access_size.bytes() > 1 {
+            let heap_ty_size: OperandSize = heap.index_type().try_into()?;
             let addr = *self
                 .context
                 .stack
@@ -883,18 +1422,18 @@ where
                     writable!(tmp),
                     tmp,
                     RegImm::Imm(Imm::I64(memarg.offset)),
-                    size,
+                    heap_ty_size,
                 )?;
             }
 
             self.masm.and(
                 writable!(tmp),
                 tmp,
-                RegImm::Imm(Imm::I32(size.bytes() - 1)),
-                size,
+                RegImm::Imm(Imm::I32(access_size.bytes() - 1)),
+                heap_ty_size,
             )?;
 
-            self.masm.cmp(tmp, RegImm::Imm(Imm::i64(0)), size)?;
+            self.masm.cmp(tmp, RegImm::Imm(Imm::i64(0)), heap_ty_size)?;
             self.masm.trapif(IntCmpKind::Ne, TRAP_HEAP_MISALIGNED)?;
             self.context.free_reg(tmp);
         }
@@ -904,11 +1443,12 @@ where
 
     pub fn emit_compute_heap_address_align_checked(
         &mut self,
+        heap: &HeapData,
         memarg: &MemArg,
         access_size: OperandSize,
     ) -> Result<Option<Reg>> {
-        self.emit_check_align(memarg, access_size)?;
-        self.emit_compute_heap_address(memarg, access_size)
+        self.emit_check_align(heap, memarg, access_size)?;
+        self.emit_compute_heap_address(heap, memarg, access_size)
     }
 
     /// Emit a WebAssembly load.
@@ -928,6 +1468,9 @@ where
             Ok(())
         };
 
+        let memory_index = MemoryIndex::from_u32(arg.memory);
+        let heap = self.env.resolve_heap(memory_index);
+
         // Ensure that the destination register is not allocated if
         // `emit_compute_heap_address` does not return an address.
         match kind {
@@ -936,7 +1479,8 @@ where
                 // `emit_compute_heap_address` expects an integer register
                 // containing the address to load to be at the top of the stack.
                 let dst = self.context.pop_to_reg(self.masm, None)?;
-                let addr = self.emit_compute_heap_address(&arg, kind.derive_operand_size())?;
+                let addr =
+                    self.emit_compute_heap_address(&heap, &arg, kind.derive_operand_size())?;
                 if let Some(addr) = addr {
                     emit_load(self, dst.reg, addr, kind)?;
                 } else {
@@ -946,10 +1490,11 @@ where
             _ => {
                 let maybe_addr = match kind {
                     LoadKind::Atomic(_, _) => self.emit_compute_heap_address_align_checked(
+                        &heap,
                         &arg,
                         kind.derive_operand_size(),
                     )?,
-                    _ => self.emit_compute_heap_address(&arg, kind.derive_operand_size())?,
+                    _ => self.emit_compute_heap_address(&heap, &arg, kind.derive_operand_size())?,
                 };
 
                 if let Some(addr) = maybe_addr {
@@ -970,12 +1515,16 @@ where
 
     /// Emit a WebAssembly store.
     pub fn emit_wasm_store(&mut self, arg: &MemArg, kind: StoreKind) -> Result<()> {
+        let memory_index = MemoryIndex::from_u32(arg.memory);
+        let heap = self.env.resolve_heap(memory_index);
         let src = self.context.pop_to_reg(self.masm, None)?;
 
         let maybe_addr = match kind {
-            StoreKind::Atomic(size) => self.emit_compute_heap_address_align_checked(&arg, size)?,
+            StoreKind::Atomic(size) => {
+                self.emit_compute_heap_address_align_checked(&heap, &arg, size)?
+            }
             StoreKind::Operand(size) | StoreKind::VectorLane(LaneSelector { size, .. }) => {
-                self.emit_compute_heap_address(&arg, size)?
+                self.emit_compute_heap_address(&heap, &arg, size)?
             }
         };
 
@@ -1081,9 +1630,7 @@ where
     }
 
     /// Retrieves the size of the memory, pushing the result to the value stack.
-    pub fn emit_compute_memory_size(&mut self, heap_data: &HeapData) -> Result<()> {
-        let size_reg = self.context.any_gpr(self.masm)?;
-
+    fn load_memory_length(&mut self, heap_data: &HeapData, size_reg: Reg) -> Result<()> {
         self.masm.with_scratch::<IntScratch, _>(|masm, scratch| {
             let base = if let Some(offset) = heap_data.import_from {
                 masm.load_ptr(masm.address_at_vmctx(offset)?, scratch.writable())?;
@@ -1095,6 +1642,14 @@ where
             let size_addr = masm.address_at_reg(base, heap_data.current_length_offset)?;
             masm.load_ptr(size_addr, writable!(size_reg))
         })?;
+        Ok(())
+    }
+
+    /// Retrieves the size of the memory, pushing the result to the value stack.
+    pub fn emit_compute_memory_size(&mut self, heap_data: &HeapData) -> Result<()> {
+        let size_reg = self.context.any_gpr(self.masm)?;
+        self.load_memory_length(heap_data, size_reg)?;
+
         // Emit a shift to get the size in pages rather than in bytes.
         let dst = TypedReg::new(heap_data.index_type(), size_reg);
         let pow = heap_data.memory.page_size_log2;
@@ -1107,6 +1662,515 @@ where
         )?;
         self.context.stack.push(dst.into());
         Ok(())
+    }
+
+    /// Emit a bounds check for `ptr+len` and put the native address for this
+    /// wasm address into `dst`.
+    fn emit_bounds_check_and_compute_addr(
+        &mut self,
+        heap: &HeapData,
+        dst: Reg,
+        ptr: Reg,
+        len: Reg,
+    ) -> Result<()> {
+        let ptr_size: OperandSize = self.env.ptr_type().try_into()?;
+        let idx_size: OperandSize = heap.index_type().try_into()?;
+        // Compute `dst = ptr + len` trapping on overflow. For an `i32` index
+        // type the operands are zero-extended to 64-bit so overflow is
+        // impossible.
+        match idx_size {
+            OperandSize::S32 => {
+                self.masm
+                    .extend(writable!(dst), ptr, Extend::<Zero>::I64Extend32.into())?;
+                self.masm.add_uextend(
+                    writable!(dst),
+                    dst,
+                    len,
+                    OperandSize::S32,
+                    OperandSize::S64,
+                )?;
+            }
+            OperandSize::S64 => {
+                self.masm
+                    .mov(writable!(dst), ptr.into(), OperandSize::S64)?;
+                self.masm.checked_uadd(
+                    writable!(dst),
+                    dst,
+                    len.into(),
+                    OperandSize::S64,
+                    TrapCode::HEAP_OUT_OF_BOUNDS,
+                )?;
+            }
+            _ => unreachable!(),
+        }
+
+        // Load the current size in bytes of the memory, and trap if
+        // `dst > size_in_bytes`.
+        let size_in_bytes = self.context.any_gpr(self.masm)?;
+        self.load_memory_length(&heap, size_in_bytes)?;
+        assert!(ptr_size == OperandSize::S64);
+        self.masm.cmp(dst, size_in_bytes.into(), ptr_size)?;
+        self.masm
+            .trapif(IntCmpKind::GtU, TrapCode::HEAP_OUT_OF_BOUNDS)?;
+        self.context.free_reg(size_in_bytes);
+
+        // Compute `dst = memory_base + ptr`.
+        bounds::load_heap_addr_unchecked(
+            self.masm,
+            &heap,
+            Index::from_typed_reg(TypedReg::new(heap.index_type(), ptr)),
+            ImmOffset::from_u32(0),
+            dst,
+            ptr_size,
+        )?;
+        Ok(())
+    }
+
+    /// Emit the `memory.copy` operation.
+    pub fn emit_memory_copy(&mut self, dst_mem: MemoryIndex, src_mem: MemoryIndex) -> Result<()> {
+        let dst_heap = self.env.resolve_heap(dst_mem);
+        let src_heap = self.env.resolve_heap(src_mem);
+        let dst_idx_size: OperandSize = dst_heap.index_type().try_into()?;
+        let src_idx_size: OperandSize = src_heap.index_type().try_into()?;
+
+        let len = self.context.pop_to_reg(self.masm, None)?;
+        let src = self.context.pop_to_reg(self.masm, None)?;
+        let dst = self.context.pop_to_reg(self.masm, None)?;
+
+        // For 32-bit linear memories go ahead and make sure `len` is zero
+        // extended within its register ensuring that the full 64-bits of the
+        // register are defined. This assists in situations like cross-memory
+        // copies where one memory is 32-bit and one is 64-bit and the same
+        // register can be used for the length in both bounds checks below.
+        if dst_idx_size == OperandSize::S32 || src_idx_size == OperandSize::S32 {
+            self.masm.extend(
+                writable!(len.reg),
+                len.reg,
+                Extend::<Zero>::I64Extend32.into(),
+            )?;
+        }
+
+        let dst_raw_addr = self.context.any_gpr(self.masm)?;
+        self.emit_bounds_check_and_compute_addr(&dst_heap, dst_raw_addr, dst.reg, len.reg)?;
+        self.context.free_reg(dst);
+
+        let src_raw_addr = self.context.any_gpr(self.masm)?;
+        self.emit_bounds_check_and_compute_addr(&src_heap, src_raw_addr, src.reg, len.reg)?;
+        self.context.free_reg(src);
+
+        self.context
+            .stack
+            .push(TypedReg::new(self.env.ptr_type(), dst_raw_addr).into());
+        self.context
+            .stack
+            .push(TypedReg::new(self.env.ptr_type(), src_raw_addr).into());
+        self.context
+            .stack
+            .push(TypedReg::new(self.env.ptr_type(), len.reg).into());
+
+        let builtin = self.env.builtins.memory_copy::<M::ABI>()?;
+        FnCall::emit::<M>(
+            &mut self.env,
+            self.masm,
+            &mut self.context,
+            Callee::Builtin(builtin),
+        )?;
+        Ok(())
+    }
+
+    /// Emit the `memory.fill` operation.
+    pub fn emit_memory_fill(&mut self, mem: MemoryIndex) -> Result<()> {
+        let heap = self.env.resolve_heap(mem);
+        let ptr_size: OperandSize = self.env.ptr_type().try_into()?;
+        let idx_size: OperandSize = heap.index_type().try_into()?;
+
+        // The wasm stack at this point is `[dst, val, len]`.
+        let len = self.context.pop_to_reg(self.masm, None)?;
+        let val = self.context.pop_to_reg(self.masm, None)?;
+        let dst = self.context.pop_to_reg(self.masm, None)?;
+
+        let raw_addr = self.context.any_gpr(self.masm)?;
+        self.emit_bounds_check_and_compute_addr(&heap, raw_addr, dst.reg, len.reg)?;
+        self.context.free_reg(dst);
+
+        // The libcall takes the length as a host-pointer-sized integer, so
+        // zero-extend if the wasm index type is smaller.
+        let len_reg = len.reg;
+        if idx_size == OperandSize::S32 && ptr_size == OperandSize::S64 {
+            self.masm.extend(
+                writable!(len_reg),
+                len_reg,
+                Extend::<Zero>::I64Extend32.into(),
+            )?;
+        }
+
+        // Set up the call arguments: `[dst_ptr, val, len]`.
+        self.context
+            .stack
+            .push(TypedReg::new(self.env.ptr_type(), raw_addr).into());
+        self.context.stack.push(val.into());
+        self.context
+            .stack
+            .push(TypedReg::new(self.env.ptr_type(), len_reg).into());
+
+        let builtin = self.env.builtins.memory_fill::<M::ABI>()?;
+        FnCall::emit::<M>(
+            &mut self.env,
+            self.masm,
+            &mut self.context,
+            Callee::Builtin(builtin),
+        )?;
+        Ok(())
+    }
+
+    /// Emit the `memory.init` operation.
+    pub fn emit_memory_init(&mut self, segment: DataIndex, mem: MemoryIndex) -> Result<()> {
+        let dst_heap = self.env.resolve_heap(mem);
+
+        let len = self.context.pop_to_reg(self.masm, None)?;
+        let src = self.context.pop_to_reg(self.masm, None)?;
+        let dst = self.context.pop_to_reg(self.masm, None)?;
+
+        // Make sure `len` is zero extended within its register ensuring that
+        // the full 64-bits of the register are defined. This assists in
+        // situations like cross-memory copies where one memory is 32-bit and
+        // one is 64-bit and the same register can be used for the length in
+        // both bounds checks below.
+        self.masm.extend(
+            writable!(len.reg),
+            len.reg,
+            Extend::<Zero>::I64Extend32.into(),
+        )?;
+
+        let dst_raw_addr = self.context.any_gpr(self.masm)?;
+        self.emit_bounds_check_and_compute_addr(&dst_heap, dst_raw_addr, dst.reg, len.reg)?;
+        self.context.free_reg(dst);
+
+        let runtime_data_index = match self.env.translation.runtime_data_map[segment] {
+            Some(i) => i,
+
+            // Active data segments always have length zero, so this is only
+            // valid of src and len are both zero.
+            None => {
+                self.masm.cmp(src.reg, RegImm::i32(0), OperandSize::S32)?;
+                self.masm
+                    .trapif(IntCmpKind::Ne, TrapCode::HEAP_OUT_OF_BOUNDS)?;
+                self.masm.cmp(len.reg, RegImm::i32(0), OperandSize::S32)?;
+                self.masm
+                    .trapif(IntCmpKind::Ne, TrapCode::HEAP_OUT_OF_BOUNDS)?;
+                self.context.free_reg(dst_raw_addr);
+                self.context.free_reg(src);
+                self.context.free_reg(len);
+                return Ok(());
+            }
+        };
+
+        // Bounds check this passive data segment. Load its
+        // dynamically-specified length and see if that's in the range
+        // of `src+len`.
+        let data_segment_length_offset = self
+            .env
+            .vmoffsets
+            .runtime_data_lengths()
+            .at(runtime_data_index);
+        let tmp1 = self.context.any_gpr(self.masm)?;
+        let tmp2 = self.context.any_gpr(self.masm)?;
+        self.masm.load(
+            self.masm.address_at_vmctx(data_segment_length_offset)?,
+            writable!(tmp1),
+            OperandSize::S32,
+        )?;
+        self.masm
+            .mov(writable!(tmp2), src.reg.into(), OperandSize::S32)?;
+        self.masm.checked_uadd(
+            writable!(tmp2),
+            tmp2,
+            len.reg.into(),
+            OperandSize::S32,
+            TrapCode::HEAP_OUT_OF_BOUNDS,
+        )?;
+        self.masm.cmp(tmp2, tmp1.into(), OperandSize::S32)?;
+        self.masm
+            .trapif(IntCmpKind::GtU, TrapCode::HEAP_OUT_OF_BOUNDS)?;
+        self.context.free_reg(tmp2);
+
+        // Calculate the src pointer by loading the base of the passive segment
+        // and adding in the `src` offset.
+        let data_segment_base_offset = self
+            .env
+            .vmoffsets
+            .runtime_data_bases()
+            .at(runtime_data_index);
+        self.masm.load(
+            self.masm.address_at_vmctx(data_segment_base_offset)?,
+            writable!(tmp1),
+            OperandSize::S64,
+        )?;
+        self.masm.add_uextend(
+            writable!(tmp1),
+            tmp1,
+            src.reg,
+            OperandSize::S32,
+            OperandSize::S64,
+        )?;
+        self.context.free_reg(src);
+
+        // And finally, the final step is calling the `memory_copy` libcall.
+        self.context.stack.push(TypedReg::i64(dst_raw_addr).into());
+        self.context.stack.push(TypedReg::i64(tmp1).into());
+        self.context.stack.push(len.into());
+        let builtin = self.env.builtins.memory_copy::<M::ABI>()?;
+        FnCall::emit::<M>(
+            &mut self.env,
+            self.masm,
+            &mut self.context,
+            Callee::Builtin(builtin),
+        )?;
+        Ok(())
+    }
+
+    pub fn emit_data_drop(&mut self, data_index: DataIndex) -> Result<()> {
+        let runtime_data_index = match self.env.translation.runtime_data_map[data_index] {
+            Some(idx) => idx,
+            // Active data segments do nothing when dropped, so this is a noop.
+            None => return Ok(()),
+        };
+        let data_segment_offset = self
+            .env
+            .vmoffsets
+            .runtime_data_lengths()
+            .at(runtime_data_index);
+        let len_addr = self.masm.address_at_vmctx(data_segment_offset)?;
+        self.masm.store(RegImm::i32(0), len_addr, OperandSize::S32)
+    }
+
+    /// Implementation of `table.init`
+    pub fn emit_table_init(
+        &mut self,
+        elem_index: ElemIndex,
+        table_index: TableIndex,
+    ) -> Result<()> {
+        let builtin_base = self.env.builtins.passive_elem_segment_base::<M::ABI>()?;
+        let builtin_len = self.env.builtins.passive_elem_segment_len::<M::ABI>()?;
+
+        // Push the passive segment's length and base onto the stack.
+        match self.env.translation.passive_elem_map[elem_index] {
+            Some(idx) => {
+                self.context.stack.extend([idx.as_u32().try_into()?]);
+                FnCall::emit::<M>(
+                    &mut self.env,
+                    self.masm,
+                    &mut self.context,
+                    Callee::Builtin(builtin_len),
+                )?;
+                self.context.stack.extend([idx.as_u32().try_into()?]);
+                FnCall::emit::<M>(
+                    &mut self.env,
+                    self.masm,
+                    &mut self.context,
+                    Callee::Builtin(builtin_base),
+                )?;
+            }
+            // Active data segments have 0 length and a null base pointer.
+            None => {
+                let tmp = self.context.any_gpr(self.masm)?;
+                self.masm
+                    .mov(writable!(tmp), RegImm::i64(0), OperandSize::S64)?;
+                self.context
+                    .stack
+                    .push(TypedReg::new(WasmValType::I64, tmp).into());
+
+                let tmp = self.context.any_gpr(self.masm)?;
+                self.masm
+                    .mov(writable!(tmp), RegImm::i64(0), OperandSize::S64)?;
+                self.context
+                    .stack
+                    .push(TypedReg::new(WasmValType::I64, tmp).into());
+            }
+        };
+
+        // Push the table's current length onto the stack.
+        let table_data = self.env.resolve_table_data(table_index);
+        let idx_size = table_data.index_type().try_into()?;
+        self.emit_compute_table_size(&table_data)?;
+
+        // And now pop off everything we have for this instruction to work with
+        // it all below.
+        let table_size = self.context.pop_to_reg(self.masm, None)?;
+        let segment_base = self.context.pop_to_reg(self.masm, None)?;
+        let segment_len = self.context.pop_to_reg(self.masm, None)?;
+        let len = self.context.pop_to_reg(self.masm, None)?;
+        let segment_off = self.context.pop_to_reg(self.masm, None)?;
+        let table_off = self.context.pop_to_reg(self.masm, None)?;
+
+        // Zero-extend the length to make it easier to work with below for
+        // 64-bit tables.
+        if len.ty == WasmValType::I32 {
+            self.masm.extend(
+                writable!(len.reg),
+                len.reg,
+                Extend::<Zero>::I64Extend32.into(),
+            )?;
+        }
+
+        // Perform a bounds check to see if `segment_off+len` is inbounds.
+        let tmp = self.context.any_gpr(self.masm)?;
+        {
+            self.masm
+                .mov(writable!(tmp), segment_off.reg.into(), OperandSize::S32)?;
+            self.masm.checked_uadd(
+                writable!(tmp),
+                tmp,
+                len.reg.into(),
+                OperandSize::S32,
+                TRAP_TABLE_OUT_OF_BOUNDS,
+            )?;
+            self.masm
+                .cmp(tmp, segment_len.reg.into(), OperandSize::S32)?;
+            self.masm
+                .trapif(IntCmpKind::GtU, TRAP_TABLE_OUT_OF_BOUNDS)?;
+            self.context.free_reg(segment_len);
+        }
+
+        // Perform a bounds check to see if `table_off+len` is inbounds.
+        {
+            self.masm
+                .mov(writable!(tmp), table_off.reg.into(), idx_size)?;
+            self.masm.checked_uadd(
+                writable!(tmp),
+                tmp,
+                len.reg.into(),
+                idx_size,
+                TRAP_TABLE_OUT_OF_BOUNDS,
+            )?;
+            self.masm.cmp(tmp, table_size.reg.into(), idx_size)?;
+            self.masm
+                .trapif(IntCmpKind::GtU, TRAP_TABLE_OUT_OF_BOUNDS)?;
+            self.context.free_reg(table_size);
+        }
+        self.context.free_reg(tmp);
+
+        // Calculate the base address of the segment that we're reading from.
+        {
+            self.masm.extend(
+                writable!(segment_off.reg),
+                segment_off.reg,
+                Extend::<Zero>::I64Extend32.into(),
+            )?;
+            self.masm.mul(
+                writable!(segment_off.reg),
+                segment_off.reg,
+                RegImm::i64(16),
+                OperandSize::S64,
+            )?;
+            self.masm.add(
+                writable!(segment_base.reg),
+                segment_base.reg,
+                segment_off.reg.into(),
+                OperandSize::S64,
+            )?;
+            self.context.free_reg(segment_off);
+        }
+
+        // Now run `table.set` in a loop with the values read from the element
+        // segment.
+        let header = self.masm.get_label()?;
+        let exit = self.masm.get_label()?;
+
+        self.masm.bind(header)?;
+        {
+            self.masm.branch(
+                IntCmpKind::Eq,
+                len.reg,
+                RegImm::i64(0),
+                exit,
+                OperandSize::S64,
+            )?;
+
+            // Read `*mut VMFuncRef` from `ValRaw`, and then increment the
+            // `segment_base` pointer.
+            let funcref = self.context.any_gpr(self.masm)?;
+            self.masm.load_ptr(
+                self.masm.address_at_reg(segment_base.reg, 0)?,
+                writable!(funcref),
+            )?;
+            self.masm.add(
+                writable!(segment_base.reg),
+                segment_base.reg,
+                RegImm::i64(16),
+                OperandSize::S64,
+            )?;
+
+            // Spill context/variables for the table.set, and note that
+            // `table_off` is duplicated here as one version is consumed by the
+            // `table.set` and the other persists across the loop.
+            self.context.stack.push(segment_base.into());
+            self.context.stack.push(len.into());
+            let table_off_copy = self.context.any_gpr(self.masm)?;
+            self.masm.mov(
+                writable!(table_off_copy),
+                table_off.reg.into(),
+                table_off.ty.try_into()?,
+            )?;
+            self.context.stack.push(table_off.into());
+            self.context
+                .stack
+                .push(TypedReg::new(table_off.ty, table_off_copy).into());
+            self.context
+                .stack
+                .push(TypedReg::new(WasmValType::FUNCREF, funcref).into());
+            self.emit_table_set(table_index)?;
+
+            // Pop loop variables into their original registers for the loop.
+            self.context.pop_to_reg(self.masm, Some(table_off.reg))?;
+            self.context.pop_to_reg(self.masm, Some(len.reg))?;
+            self.context.pop_to_reg(self.masm, Some(segment_base.reg))?;
+
+            // Increment the table index to copy next
+            self.masm.add(
+                writable!(table_off.reg),
+                table_off.reg,
+                RegImm::i64(1),
+                table_off.ty.try_into()?,
+            )?;
+
+            // Decrement the number of remaining elements to copy, used as the
+            // loop's exit condition above.
+            self.masm.sub(
+                writable!(len.reg),
+                len.reg,
+                RegImm::i64(1),
+                OperandSize::S64,
+            )?;
+        }
+        self.masm.jmp(header)?;
+
+        self.masm.bind(exit)?;
+
+        self.context.free_reg(segment_base);
+        self.context.free_reg(len);
+        self.context.free_reg(table_off);
+        Ok(())
+    }
+
+    /// Implementation of `elem.drop`
+    pub fn emit_elem_drop(&mut self, elem_index: ElemIndex) -> Result<()> {
+        let passive_elem_index = match self.env.translation.passive_elem_map[elem_index] {
+            Some(idx) => idx,
+            // Active elem segments do nothing when dropped, so this is a noop.
+            None => return Ok(()),
+        };
+        let builtin = self.env.builtins.passive_elem_segment_drop::<M::ABI>()?;
+        self.context
+            .stack
+            .extend([passive_elem_index.as_u32().try_into()?]);
+        FnCall::emit::<M>(
+            &mut self.env,
+            self.masm,
+            &mut self.context,
+            Callee::Builtin(builtin),
+        )?;
+        self.context.pop_and_free(self.masm)
     }
 
     /// Checks if fuel consumption is enabled and emits a series of instructions
@@ -1161,8 +2225,8 @@ where
     /// Emits a series of instructions that load the `fuel_consumed` field from
     /// `VMStoreContext`.
     fn emit_load_fuel_consumed(&mut self, fuel_reg: Reg) -> Result<()> {
-        let store_context_offset = self.env.vmoffsets.ptr.vmctx_store_context();
-        let fuel_offset = self.env.vmoffsets.ptr.vmstore_context_fuel_consumed();
+        let store_context_offset = self.env.vmoffsets.ptr.vmctx().store_context();
+        let fuel_offset = self.env.vmoffsets.ptr.vm_store_context().fuel_consumed();
         self.masm.load_ptr(
             self.masm
                 .address_at_vmctx(u32::from(store_context_offset))?,
@@ -1239,9 +2303,9 @@ where
         epoch_deadline_reg: Reg,
         epoch_counter_reg: Reg,
     ) -> Result<()> {
-        let epoch_ptr_offset = self.env.vmoffsets.ptr.vmctx_epoch_ptr();
-        let store_context_offset = self.env.vmoffsets.ptr.vmctx_store_context();
-        let epoch_deadline_offset = self.env.vmoffsets.ptr.vmstore_context_epoch_deadline();
+        let epoch_ptr_offset = self.env.vmoffsets.ptr.vmctx().epoch_ptr();
+        let store_context_offset = self.env.vmoffsets.ptr.vmctx().store_context();
+        let epoch_deadline_offset = self.env.vmoffsets.ptr.vm_store_context().epoch_deadline();
 
         // Load the current epoch value into `epoch_counter_var`.
         self.masm.load_ptr(
@@ -1281,8 +2345,8 @@ where
             return Ok(());
         }
 
-        let store_context_offset = self.env.vmoffsets.ptr.vmctx_store_context();
-        let fuel_offset = self.env.vmoffsets.ptr.vmstore_context_fuel_consumed();
+        let store_context_offset = self.env.vmoffsets.ptr.vmctx().store_context();
+        let fuel_offset = self.env.vmoffsets.ptr.vm_store_context().fuel_consumed();
         let limits_reg = self.context.any_gpr(self.masm)?;
 
         // Load `VMStoreContext` into the `limits_reg` reg.
@@ -1327,7 +2391,10 @@ where
         if !self.context.reachable {
             // `self.fuel_consumed` must be correctly flushed to memory when
             // entering an unreachable state.
-            ensure!(self.fuel_consumed == 0, CodeGenError::illegal_fuel_state())
+            ensure!(self.fuel_consumed == 0, CodeGenError::illegal_fuel_state());
+            // Control operators are still visited to track nesting and restore
+            // reachability at `else` or `end`, but those visits must not charge fuel.
+            return Ok(());
         }
 
         // Generally, most instructions require 1 fuel unit.
@@ -1361,13 +2428,15 @@ where
             | Operator::CallIndirect { .. }
             | Operator::Call { .. }
             | Operator::ReturnCall { .. }
-            | Operator::ReturnCallIndirect { .. } => self.emit_fuel_increment(),
+            | Operator::ReturnCallIndirect { .. }
+            | Operator::Throw { .. }
+            | Operator::ThrowRef => self.emit_fuel_increment(),
             _ => Ok(()),
         }
     }
 
     // Hook to handle source location mapping before visiting an operator.
-    fn source_location_before_visit_op(&mut self, offset: usize) -> Result<()> {
+    fn source_location_before_visit_op(&mut self, offset: u64) -> Result<()> {
         let loc = SourceLoc::new(offset as u32);
         let rel = self.source_loc_from(loc);
         self.source_location.current = self.masm.start_source_loc(rel)?;
@@ -1396,16 +2465,28 @@ where
         size: OperandSize,
         extend: Option<Extend<Zero>>,
     ) -> Result<()> {
+        let memory_index = MemoryIndex::from_u32(arg.memory);
+        let heap = self.env.resolve_heap(memory_index);
         // We need to pop-push the operand to compute the address before passing control over to
         // masm, because some architectures may have specific requirements for the registers used
-        // in some atomic operations.
+        // in some atomic operations. The computed address is pushed back to the context's stack
+        // too, rather than handed over as a register, since registers that are not tracked by the
+        // value stack can't be spilled, so an untracked address register would make any request
+        // for a fixed register fail if the address happened to be allocated to it. For this
+        // reason, the address is pushed as a register to be dereferenced prior to emission, after
+        // all the ISA-specifc constraints have been solved.
         let operand = self.context.pop_to_reg(self.masm, None)?;
-        if let Some(addr) = self.emit_compute_heap_address_align_checked(arg, size)? {
-            let src = self.masm.address_at_reg(addr, 0)?;
+        if let Some(addr) = self.emit_compute_heap_address_align_checked(&heap, arg, size)? {
+            self.context
+                .stack
+                .push(TypedReg::new(self.env.ptr_type(), addr).into());
             self.context.stack.push(operand.into());
             self.masm
-                .atomic_rmw(&mut self.context, src, size, op, UNTRUSTED_FLAGS, extend)?;
-            self.context.free_reg(addr);
+                .atomic_rmw(&mut self.context, size, op, UNTRUSTED_FLAGS, extend)?;
+        } else {
+            // Ensure that the operand register is not left allocated if the access was proven to
+            // be out of bounds at compile time.
+            self.context.free_reg(operand);
         }
 
         Ok(())
@@ -1429,34 +2510,40 @@ where
         // with regard to the registers used for some arguments, so we
         // need to pass the context to the masm. To solve this issue,
         // we pop the two first arguments from the stack, compute the
-        // address, push back the arguments, and hand over the control
-        // to masm. The implementer of `atomic_cas` can expect to find
-        // `expected` and `replacement` at the top the context's
-        // stack.
+        // address, push back the address and the arguments, and hand
+        // over the control to masm. The implementer of `atomic_cas`
+        // can expect to find `address`, `expected` and `replacement`
+        // at the top the context's stack.
+        //
+        // The computed address is pushed back to the stack as a
+        // register, rather than handed over directly, so that the
+        // register allocator is able to spill it if the target
+        // requires a fixed register.
 
         let replacement = self.context.pop_to_reg(self.masm, None)?;
         let expected = self.context.pop_to_reg(self.masm, None)?;
 
-        if let Some(addr) = self.emit_compute_heap_address_align_checked(arg, size)? {
+        let memory_index = MemoryIndex::from_u32(arg.memory);
+        let heap = self.env.resolve_heap(memory_index);
+        if let Some(addr) = self.emit_compute_heap_address_align_checked(&heap, arg, size)? {
+            self.context
+                .stack
+                .push(TypedReg::new(self.env.ptr_type(), addr).into());
             self.context.stack.push(expected.into());
             self.context.stack.push(replacement.into());
 
-            let src = self.masm.address_at_reg(addr, 0)?;
             self.masm
-                .atomic_cas(&mut self.context, src, size, UNTRUSTED_FLAGS, extend)?;
-
-            self.context.free_reg(addr);
+                .atomic_cas(&mut self.context, size, UNTRUSTED_FLAGS, extend)?;
+        } else {
+            // Ensure that the argument registers are not left allocated if the access was proven
+            // to be out of bounds at compile time.
+            self.context.free_reg(expected);
+            self.context.free_reg(replacement);
         }
         Ok(())
     }
 
-    #[cfg(not(feature = "threads"))]
-    pub fn emit_atomic_wait(&mut self, _arg: &MemArg, _kind: AtomicWaitKind) -> Result<()> {
-        Err(CodeGenError::unimplemented_wasm_instruction().into())
-    }
-
     /// Emit the sequence of instruction for a `memory.atomic.wait*`.
-    #[cfg(feature = "threads")]
     pub fn emit_atomic_wait(&mut self, arg: &MemArg, kind: AtomicWaitKind) -> Result<()> {
         // The `memory_atomic_wait*` builtins expect the following arguments:
         // - `memory`, as u32
@@ -1490,7 +2577,7 @@ where
             self.masm.checked_uadd(
                 writable!(addr.reg),
                 addr.reg,
-                Imm::i64(arg.offset as i64),
+                RegImm::i64(arg.offset as i64),
                 OperandSize::S64,
                 TrapCode::HEAP_OUT_OF_BOUNDS,
             )?;
@@ -1507,12 +2594,6 @@ where
         Ok(())
     }
 
-    #[cfg(not(feature = "threads"))]
-    pub fn emit_atomic_notify(&mut self, _arg: &MemArg) -> Result<()> {
-        Err(CodeGenError::unimplemented_wasm_instruction().into())
-    }
-
-    #[cfg(feature = "threads")]
     pub fn emit_atomic_notify(&mut self, arg: &MemArg) -> Result<()> {
         // The memory `memory_atomic_notify` builtin expects the following arguments:
         // - `memory`, as u32
@@ -1541,7 +2622,7 @@ where
             self.masm.checked_uadd(
                 writable!(addr.reg),
                 addr.reg,
-                Imm::i64(arg.offset as i64),
+                RegImm::i64(arg.offset as i64),
                 OperandSize::S64,
                 TrapCode::HEAP_OUT_OF_BOUNDS,
             )?;
@@ -1578,9 +2659,11 @@ where
             // is loaded from the `VMMemoryImport` and the vmctx is loaded from
             // the vmctx itself.
             None => {
-                let vmimport = self.env.vmoffsets.vmctx_vmmemory_import(mem);
-                let vmctx_offset = vmimport + u32::from(self.env.vmoffsets.vmmemory_import_vmctx());
-                let index_offset = vmimport + u32::from(self.env.vmoffsets.vmmemory_import_index());
+                let vmimport = self.env.vmoffsets.imported_memories().at(mem);
+                let vmctx_offset =
+                    vmimport + u32::from(self.env.vmoffsets.ptr.vm_memory_import().vmctx());
+                let index_offset =
+                    vmimport + u32::from(self.env.vmoffsets.ptr.vm_memory_import().index());
                 let index_addr = self.masm.address_at_vmctx(index_offset)?;
                 let index_dst = self.context.reg_for_class(RegClass::Int, self.masm)?;
                 self.masm
@@ -1608,9 +2691,11 @@ where
                 Ok(Callee::Builtin(builtin))
             }
             None => {
-                let vmimport = self.env.vmoffsets.vmctx_vmtable_import(table);
-                let vmctx_offset = vmimport + u32::from(self.env.vmoffsets.vmtable_import_vmctx());
-                let index_offset = vmimport + u32::from(self.env.vmoffsets.vmtable_import_index());
+                let vmimport = self.env.vmoffsets.imported_tables().at(table);
+                let vmctx_offset =
+                    vmimport + u32::from(self.env.vmoffsets.ptr.vm_table_import().vmctx());
+                let index_offset =
+                    vmimport + u32::from(self.env.vmoffsets.ptr.vm_table_import().index());
                 let index_addr = self.masm.address_at_vmctx(index_offset)?;
                 let index_dst = self.context.reg_for_class(RegClass::Int, self.masm)?;
                 self.masm

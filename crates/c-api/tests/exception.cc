@@ -40,6 +40,12 @@ TEST(Exception, ConstructAndExamine) {
   auto f1 = exn.field(cx, 1).unwrap();
   EXPECT_EQ(f1.kind(), ValKind::I64);
   EXPECT_EQ(f1.i64(), 100);
+
+  auto fty = exn.ty(cx).tag_type()->functype();
+  EXPECT_EQ(fty->params().size(), 2);
+  EXPECT_EQ(*fty->params().begin(), ValType::i32());
+  EXPECT_EQ(*(fty->params().begin() + 1), ValType::i64());
+  EXPECT_EQ(fty->results().size(), 0);
 }
 
 TEST(Exception, TagFromModule) {
@@ -149,6 +155,13 @@ TEST(Exception, ExnRefRoundTripThroughVal) {
   auto &exnref_val = result.ok()[0];
   EXPECT_EQ(exnref_val.kind(), ValKind::ExnRef);
 
+  auto exnref = exnref_val.exnref();
+  ASSERT_TRUE(exnref);
+  auto fty = exnref->ty(cx).tag_type()->functype();
+  EXPECT_EQ(fty->params().size(), 1);
+  EXPECT_EQ(*fty->params().begin(), ValType::i32());
+  EXPECT_EQ(fty->results().size(), 0);
+
   // Pass the exnref back into a wasm function that extracts the i32 payload.
   Module module2 =
       Module::compile(engine,
@@ -214,4 +227,20 @@ TEST(Exception, WasmThrowHostCatch) {
   EXPECT_EQ(exn->field_count(cx), 1u);
   auto f0 = exn->field(cx, 0).unwrap();
   EXPECT_EQ(f0.i32(), 77);
+}
+
+TEST(ExnRef, NullAndMethods) {
+  Config config;
+  config.wasm_gc(true);
+  Engine engine(std::move(config));
+  Store store(engine);
+
+  wasmtime_exnref_t null_raw;
+  wasmtime_exnref_set_null(&null_raw);
+  ExnRef null(null_raw);
+  EXPECT_FALSE(null.tag(store));
+  EXPECT_EQ(null.field_count(store), 0);
+  EXPECT_FALSE(null.field(store, 0));
+
+  store.context().throw_exception(null);
 }

@@ -15,7 +15,7 @@ workspace = true
 all-features = true
 
 [features]
-default = ["default-send-request", "p2"]
+default = ["default-send-request", "p2", "p3"]
 default-send-request = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
 p2 = ["wasmtime-wasi/p2"]
 p3 = ["wasmtime-wasi/p3", "dep:tokio-util"]
@@ -42,6 +42,8 @@ wasmtime = { workspace = true, features = ['component-model'] }
 tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
+pin-project-lite = { workspace = true }
+rustix = { workspace = true }
 
 [dev-dependencies]
 wasmtime-wasi-http = { path = ".", features = ['default-send-request'] }
@@ -57,3 +59,9 @@ flate2 = { workspace = true }
 wasm-compose = { workspace = true }
 tempfile = { workspace = true }
 env_logger = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "p3_http_proxy"
+harness = false
+required-features = ["test-programs-artifacts/release-artifacts"]

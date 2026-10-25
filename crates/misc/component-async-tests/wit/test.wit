@@ -63,6 +63,7 @@ interface backpressure {
   set-backpressure: func(enabled: bool);
   inc-backpressure: func();
   dec-backpressure: func();
+  inc-then-later-dec-backpressure: async func();
 }
 
 interface transmit {
@@ -173,6 +174,10 @@ interface readiness {
 
 interface synchronous-transmit {
   start: async func(s: stream<u8>, s-expected: list<u8>, f: future<u8>, f-expected: u8) -> tuple<stream<u8>, list<u8>, future<u8>, u8>;
+}
+
+interface cross-instance {
+  make: async func() -> tuple<stream<u8>, future<u8>>;
 }
 
 interface yield-post-return {
@@ -348,6 +353,10 @@ world readiness-guest {
 
 world synchronous-transmit-guest {
   export synchronous-transmit;
+}
+
+world cross-instance-source {
+  export cross-instance;
 }
 
 world yield-post-return-callee {

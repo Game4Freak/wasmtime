@@ -1,7 +1,7 @@
 ;;! target = "x86_64"
 ;;! test = "optimize"
 ;;! filter = "wasm[2]--function"
-;;! flags = "-C inlining=y"
+;;! flags = "-C inlining=inter-module"
 
 (component
   (core module $A
@@ -35,17 +35,18 @@
 )
 
 ;; function u2:0(i64 vmctx, i64) -> i32 tail {
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 42 ""
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     gv3 = vmctx
-;;     gv4 = vmctx
-;;     gv5 = load.i64 notrap aligned readonly gv4+8
-;;     gv6 = load.i64 notrap aligned gv5+24
-;;     gv7 = vmctx
-;;     gv8 = vmctx
-;;     gv9 = load.i64 notrap aligned readonly gv8+8
-;;     gv10 = load.i64 notrap aligned gv9+24
+;;     gv4 = load.i64 notrap aligned readonly can_move region0 gv3+8
+;;     gv5 = load.i64 notrap aligned region1 gv4+24
+;;     gv6 = vmctx
+;;     gv7 = load.i64 notrap aligned readonly can_move region0 gv6+8
+;;     gv8 = load.i64 notrap aligned region1 gv7+24
 ;;     sig0 = (i64 vmctx, i64) -> i32 tail
 ;;     sig1 = (i64 vmctx, i64) -> i32 tail
 ;;     sig2 = (i64 vmctx, i64) tail
@@ -61,9 +62,9 @@
 ;;                                     jump block4
 ;;
 ;;                                 block4:
-;; @00d4                               v4 = load.i64 notrap aligned readonly can_move v0+72
-;;                                     v10 = load.i64 notrap aligned readonly can_move v4+104
-;;                                     call fn2(v10, v10)
+;; @00d4                               v2 = load.i64 notrap aligned readonly can_move region2 v0+72
+;;                                     v6 = load.i64 notrap aligned readonly can_move region2 v2+72
+;;                                     call fn2(v6, v6)
 ;;                                     jump block5
 ;;
 ;;                                 block5:
@@ -79,6 +80,6 @@
 ;; @00d6                               jump block1
 ;;
 ;;                                 block1:
-;;                                     v11 = iconst.i32 1
-;; @00d6                               return v11  ; v11 = 1
+;;                                     v7 = iconst.i32 1
+;; @00d6                               return v7  ; v7 = 1
 ;; }

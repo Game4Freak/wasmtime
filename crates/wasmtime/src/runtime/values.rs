@@ -1,10 +1,9 @@
 use crate::store::{AutoAssertNoGc, StoreOpaque};
 use crate::{
-    AnyRef, ArrayRef, AsContext, AsContextMut, ExnRef, ExternRef, Func, HeapType, RefType, Rooted,
-    StructRef, V128, ValType, prelude::*,
+    AnyRef, ArrayRef, AsContext, AsContextMut, ExnRef, ExternRef, Func, HeapTopType, HeapType,
+    RefType, Rooted, StructRef, V128, ValType, prelude::*,
 };
 use core::ptr;
-use wasmtime_environ::WasmHeapTopType;
 
 pub use crate::runtime::vm::ValRaw;
 
@@ -107,32 +106,22 @@ impl Val {
         Val::FuncRef(None)
     }
 
-    /// Returns the null function reference value.
+    /// Returns the null external reference value.
     ///
-    /// The return value has type `(ref null extern)` aka `nullexternref` and is
-    /// a subtype of all external references.
+    /// The return value has type `(ref null noextern)` aka `nullexternref` and
+    /// is a subtype of all external references.
     #[inline]
     pub const fn null_extern_ref() -> Val {
         Val::ExternRef(None)
     }
 
-    /// Returns the null function reference value.
+    /// Returns the null internal reference value.
     ///
-    /// The return value has type `(ref null any)` aka `nullref` and is a
+    /// The return value has type `(ref null none)` aka `nullref` and is a
     /// subtype of all internal references.
     #[inline]
     pub const fn null_any_ref() -> Val {
         Val::AnyRef(None)
-    }
-
-    pub(crate) const fn null_top(top: WasmHeapTopType) -> Val {
-        match top {
-            WasmHeapTopType::Func => Val::FuncRef(None),
-            WasmHeapTopType::Extern => Val::ExternRef(None),
-            WasmHeapTopType::Any => Val::AnyRef(None),
-            WasmHeapTopType::Exn => Val::ExnRef(None),
-            WasmHeapTopType::Cont => Val::ContRef(None),
-        }
     }
 
     /// Returns the default value for the given type, if any exists.
@@ -180,7 +169,7 @@ impl Val {
             Val::F64(_) => ValType::F64,
             Val::V128(_) => ValType::V128,
             Val::ExternRef(Some(_)) => ValType::EXTERNREF,
-            Val::ExternRef(None) => ValType::NULLFUNCREF,
+            Val::ExternRef(None) => ValType::NULLEXTERNREF,
             Val::FuncRef(None) => ValType::NULLFUNCREF,
             Val::FuncRef(Some(f)) => ValType::Ref(RefType::new(
                 false,
@@ -869,11 +858,11 @@ impl Ref {
     #[inline]
     pub fn null(heap_type: &HeapType) -> Self {
         match heap_type.top() {
-            HeapType::Any => Ref::Any(None),
-            HeapType::Extern => Ref::Extern(None),
-            HeapType::Func => Ref::Func(None),
-            HeapType::Exn => Ref::Exn(None),
-            ty => unreachable!("not a heap type: {ty:?}"),
+            HeapTopType::Any => Ref::Any(None),
+            HeapTopType::Extern => Ref::Extern(None),
+            HeapTopType::Func => Ref::Func(None),
+            HeapTopType::Exn => Ref::Exn(None),
+            HeapTopType::Cont => unimplemented!("embedding API for `(ref cont)`"),
         }
     }
 
@@ -1058,7 +1047,7 @@ impl Ref {
                 Ref::Any(None) => HeapType::None,
                 Ref::Any(Some(a)) => a._ty(store)?,
 
-                Ref::Exn(None) => HeapType::None,
+                Ref::Exn(None) => HeapType::NoExn,
                 Ref::Exn(Some(e)) => e._ty(store)?.into(),
             },
         ))

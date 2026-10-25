@@ -1,12 +1,11 @@
 use crate::prelude::*;
-use crate::runtime::component::concurrent::ConcurrentState;
 use crate::runtime::component::{HostResourceData, Instance};
 use crate::runtime::vm;
 use crate::runtime::vm::component::{
-    CallContext, ComponentInstance, HandleTable, OwnedComponentInstance,
+    CallContext, ComponentInstance, HandleCounter, HandleTable, OwnedComponentInstance, Scope,
 };
 use crate::store::{StoreData, StoreId, StoreOpaque};
-use crate::{AsContext, AsContextMut, Engine, Store, StoreContextMut};
+use crate::{AsContext, AsContextMut, Engine, Store, StoreContextMut, bail_bug};
 use core::pin::Pin;
 use wasmtime_environ::component::RuntimeComponentInstanceIndex;
 use wasmtime_environ::prelude::TryPrimaryMap;
@@ -14,6 +13,7 @@ use wasmtime_environ::prelude::TryPrimaryMap;
 #[cfg(feature = "component-model-async")]
 use crate::{
     component::ResourceTable,
+    component::concurrent::ConcurrentState,
     runtime::vm::{VMStore, component::InstanceState},
 };
 
@@ -25,6 +25,12 @@ use crate::{
 /// often in theory but also small enough such that if left unconfigured on a
 /// host doesn't mean that it's automatically susceptible to DoS for example.
 const DEFAULT_HOSTCALL_FUEL: usize = 128 << 20;
+
+/// Default per-store cap on simultaneously-live component-model handles.
+///
+/// A guest creates these directly (e.g. `resource.new`), so leaving them
+/// unbounded is a DoS vector.
+const DEFAULT_MAX_COMPONENT_HANDLES: usize = 100_000;
 
 /// Extensions to `Store` which are only relevant for component-related
 /// information.
@@ -39,6 +45,11 @@ pub struct ComponentStoreData {
     /// Total number of component instances in this store, used to track
     /// resources in the instance allocator.
     num_component_instances: usize,
+
+    /// Live-handle counter for every `HandleTable` in this store (the
+    /// `component_host_table` below and each instance's tables). See
+    /// `HandleCounter`.
+    handle_counter: HandleCounter,
 
     /// Runtime state for components used in the handling of resources, borrow,
     /// and calls. These also interact with the `ResourceAny` type and its
@@ -66,6 +77,7 @@ pub enum ComponentTaskState {
 
     /// Used when `Config::concurrency_support` is enabled and has
     /// full state for all async tasks.
+    #[cfg(feature = "component-model-async")]
     Concurrent(ConcurrentState),
 }
 
@@ -86,6 +98,7 @@ impl ComponentStoreData {
             trapped: false,
             num_component_instances: 0,
             component_host_table: Default::default(),
+            handle_counter: HandleCounter::new(DEFAULT_MAX_COMPONENT_HANDLES),
             host_resource_data: Default::default(),
             task_state: if engine.tunables().concurrency_support {
                 #[cfg(feature = "component-model-async")]
@@ -122,6 +135,7 @@ impl ComponentStoreData {
         #[cfg(feature = "component-model-async")]
         if store.0.component_data().task_state.is_concurrent() {
             ComponentStoreData::drop_fibers_and_futures(store.0);
+            store.0.clean_up_task_groups();
         }
         #[cfg(not(feature = "component-model-async"))]
         let _ = store;
@@ -136,7 +150,7 @@ impl ComponentStoreData {
         let mut fibers = Vec::new();
         let mut futures = Vec::new();
         store
-            .concurrent_state_mut()
+            .concurrent_state_mut_without_forcing_current_thread()
             .take_fibers_and_futures(&mut fibers, &mut futures);
 
         for mut fiber in fibers {
@@ -164,6 +178,11 @@ impl ComponentStoreData {
         for _ in 0..self.num_component_instances {
             allocator.decrement_component_instance_count();
         }
+    }
+
+    #[cfg(all(feature = "component-model-async", feature = "gc"))]
+    pub fn task_state_mut(&mut self) -> &mut ComponentTaskState {
+        &mut self.task_state
     }
 }
 
@@ -226,6 +245,21 @@ impl StoreComponentInstanceId {
         self.from_data_get_mut(store.store_data_mut())
     }
 
+    /// Same as `get_mut`, but also returns the store's `HandleCounter`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` does not belong to `store`.
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn get_mut_and_handle_counter<'a>(
+        &self,
+        store: &'a mut StoreOpaque,
+    ) -> (Pin<&'a mut ComponentInstance>, &'a mut HandleCounter) {
+        let store = store.store_data_mut();
+        self.assert_belongs_to(store.id());
+        store.component_instance_and_handle_counter_mut(self.instance)
+    }
+
     /// Return a mutable `ComponentInstance` and a `ModuleRegistry`
     /// from the store.
     ///
@@ -273,6 +307,18 @@ impl StoreData {
     ) -> Pin<&mut ComponentInstance> {
         self.components.instances[id].as_mut().unwrap().get_mut()
     }
+
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn component_instance_and_handle_counter_mut(
+        &mut self,
+        id: ComponentInstanceId,
+    ) -> (Pin<&mut ComponentInstance>, &mut HandleCounter) {
+        let data = &mut self.components;
+        (
+            data.instances[id].as_mut().unwrap().get_mut(),
+            &mut data.handle_counter,
+        )
+    }
 }
 
 impl StoreOpaque {
@@ -284,16 +330,19 @@ impl StoreOpaque {
         self.store_data_mut().components.trapped = true;
     }
 
+    /// Determine whether an instance may be entered from the host.
+    ///
+    /// We return `false` here only `self` has been poisoned due to a trap.
+    pub(crate) fn may_enter(&mut self) -> bool {
+        !self.trapped()
+    }
+
     pub(crate) fn component_data(&self) -> &ComponentStoreData {
         &self.store_data().components
     }
 
     pub(crate) fn component_data_mut(&mut self) -> &mut ComponentStoreData {
         &mut self.store_data_mut().components
-    }
-
-    pub(crate) fn component_task_state_mut(&mut self) -> &mut ComponentTaskState {
-        &mut self.component_data_mut().task_state
     }
 
     pub(crate) fn push_component_instance(&mut self, instance: Instance) {
@@ -318,9 +367,32 @@ impl StoreOpaque {
     }
 
     #[cfg(feature = "component-model-async")]
-    pub(crate) fn concurrent_state_mut(&mut self) -> &mut ConcurrentState {
+    pub(crate) fn concurrent_state_mut_without_forcing_current_thread(
+        &mut self,
+    ) -> &mut ConcurrentState {
         debug_assert!(self.concurrency_support());
         self.component_data_mut().task_state.concurrent_state_mut()
+    }
+
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn concurrent_state_mut_already_forced_current_thread(
+        &mut self,
+    ) -> &mut ConcurrentState {
+        debug_assert!(self.concurrency_support());
+        debug_assert!(
+            !self
+                .vm_store_context_mut()
+                .current_thread_mut()
+                .is_deferred()
+        );
+        self.concurrent_state_mut_without_forcing_current_thread()
+    }
+
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn concurrent_state_mut(&mut self) -> Result<&mut ConcurrentState> {
+        debug_assert!(self.concurrency_support());
+        self.current_thread()?;
+        Ok(self.component_data_mut().task_state.concurrent_state_mut())
     }
 
     #[inline]
@@ -337,6 +409,7 @@ impl StoreOpaque {
     ) -> (
         &mut ComponentTaskState,
         &mut HandleTable,
+        &mut HandleCounter,
         &mut HostResourceData,
         Pin<&mut ComponentInstance>,
     ) {
@@ -346,6 +419,7 @@ impl StoreOpaque {
         (
             &mut data.task_state,
             &mut data.component_host_table,
+            &mut data.handle_counter,
             &mut data.host_resource_data,
             data.instances[instance.instance]
                 .as_mut()
@@ -357,18 +431,21 @@ impl StoreOpaque {
     pub(crate) fn component_resource_tables(
         &mut self,
         instance: Option<Instance>,
-    ) -> vm::component::ResourceTables<'_> {
-        self.component_resource_tables_and_host_resource_data(instance)
-            .0
+    ) -> Result<vm::component::ResourceTables<'_>> {
+        Ok(self
+            .component_resource_tables_and_host_resource_data(instance)?
+            .0)
     }
 
     pub(crate) fn component_resource_tables_and_host_resource_data(
         &mut self,
         instance: Option<Instance>,
-    ) -> (
+    ) -> Result<(
         vm::component::ResourceTables<'_>,
         &mut crate::component::HostResourceData,
-    ) {
+    )> {
+        let current_scope = self.current_scope()?;
+
         let store_id = self.id();
         let data = self.component_data_mut();
         let guest = instance.map(|i| {
@@ -381,19 +458,22 @@ impl StoreOpaque {
                 .instance_states()
         });
 
-        (
+        Ok((
             vm::component::ResourceTables {
                 host_table: &mut data.component_host_table,
+                handle_counter: &mut data.handle_counter,
                 task_state: &mut data.task_state,
                 guest,
+                current_scope,
             },
             &mut data.host_resource_data,
-        )
+        ))
     }
 
     pub(crate) fn enter_call_not_concurrent(&mut self) -> Result<()> {
         let state = match &mut self.component_data_mut().task_state {
             ComponentTaskState::NotConcurrent(state) => state,
+            #[cfg(feature = "component-model-async")]
             ComponentTaskState::Concurrent(_) => unreachable!(),
         };
         state.scopes.push(CallContext::default())?;
@@ -403,6 +483,7 @@ impl StoreOpaque {
     pub(crate) fn exit_call_not_concurrent(&mut self) {
         let state = match &mut self.component_data_mut().task_state {
             ComponentTaskState::NotConcurrent(state) => state,
+            #[cfg(feature = "component-model-async")]
             ComponentTaskState::Concurrent(_) => unreachable!(),
         };
         state.scopes.pop();
@@ -416,12 +497,34 @@ impl StoreOpaque {
         self.component_data_mut().hostcall_fuel = fuel;
     }
 
+    pub(crate) fn max_component_handles(&self) -> usize {
+        self.component_data().handle_counter.limit()
+    }
+
+    pub(crate) fn set_max_component_handles(&mut self, limit: usize) {
+        self.component_data_mut().handle_counter.set_limit(limit);
+    }
+
     #[cfg(feature = "component-model-async")]
     fn concurrent_resource_table(&mut self) -> Option<&mut ResourceTable> {
         if self.concurrency_support() {
-            Some(self.concurrent_state_mut().table())
+            Some(
+                self.concurrent_state_mut_without_forcing_current_thread()
+                    .table(),
+            )
         } else {
             None
+        }
+    }
+
+    pub(crate) fn current_scope_id_not_concurrent(&mut self) -> Result<Option<u32>> {
+        match &mut self.component_data_mut().task_state {
+            ComponentTaskState::NotConcurrent(state) => match state.scopes.len().checked_sub(1) {
+                Some(i) => Ok(Some(u32::try_from(i)?)),
+                None => Ok(None),
+            },
+            #[cfg(feature = "component-model-async")]
+            ComponentTaskState::Concurrent(_) => crate::bail_bug!("should not be reachable"),
         }
     }
 }
@@ -465,10 +568,50 @@ impl<T> Store<T> {
         self.as_context_mut().set_hostcall_fuel(fuel)
     }
 
+    /// Returns the maximum number of simultaneously-live component-model handles
+    /// permitted in this store.
+    ///
+    /// This is either the default amount if it hasn't been configured or
+    /// returns the last value passed to [`Store::set_max_component_handles`].
+    ///
+    /// See [`Store::set_max_component_handles`] for more details.
+    pub fn max_component_handles(&self) -> usize {
+        self.as_context().0.max_component_handles()
+    }
+
+    /// Sets the maximum number of simultaneously-live component-model handles
+    /// permitted in this store.
+    ///
+    /// Operations such as `resource.new` let a guest allocate handles in
+    /// host-side tables without host code in the loop, across as many instances
+    /// as it likes. This store-wide limit caps that as a DoS mitigation;
+    /// allocating past it traps.
+    ///
+    /// The limit counts *live* handles, so dropping a handle (e.g. via
+    /// `resource.drop`) returns budget and steady-state churn is unaffected.
+    /// Lowering it below the current live count does not trap existing handles,
+    /// only blocks new allocations until the count falls back under it.
+    ///
+    /// The default value for this is 100,000 handles.
+    pub fn set_max_component_handles(&mut self, limit: usize) {
+        self.as_context_mut().set_max_component_handles(limit)
+    }
+
     /// Returns the underlying [`ResourceTable`] that the implementation of
     /// concurrency in the component model is using.
     ///
     /// Returns `None` if [`Config::concurrency_support`] is disabled.
+    ///
+    /// Use [`ResourceTable::set_max_capacity`] on this table to bound component
+    /// async allocations, including guest-created streams, futures, and waitable
+    /// sets. Configure the capacity before instantiating components or starting
+    /// tasks: lowering it later does not evict entries or prevent reuse of
+    /// existing slots. This table is separate from any resource table maintained
+    /// by the embedder for host resources.
+    ///
+    /// [`ResourceTable::len`] returns the number of live entries in constant
+    /// time. Internal tasks, threads, and scratch waitable sets also occupy
+    /// entries; some are allocated lazily as execution requires them.
     ///
     /// [`Config::concurrency_support`]: crate::Config::concurrency_support
     #[cfg(feature = "component-model-async")]
@@ -488,6 +631,16 @@ impl<T> StoreContextMut<'_, T> {
         self.0.set_hostcall_fuel(fuel)
     }
 
+    /// See [`Store::max_component_handles`].
+    pub fn max_component_handles(&self) -> usize {
+        self.0.max_component_handles()
+    }
+
+    /// See [`Store::set_max_component_handles`].
+    pub fn set_max_component_handles(&mut self, limit: usize) {
+        self.0.set_max_component_handles(limit)
+    }
+
     /// See [`Store::concurrent_resource_table`].
     #[cfg(feature = "component-model-async")]
     pub fn concurrent_resource_table(&mut self) -> Option<&mut ResourceTable> {
@@ -501,20 +654,36 @@ pub struct ComponentTasksNotConcurrent {
 }
 
 impl ComponentTaskState {
-    pub fn call_context(&mut self, id: u32) -> Result<&mut CallContext> {
+    pub fn call_context(&mut self, id: Scope) -> Result<&mut CallContext> {
         match self {
-            ComponentTaskState::NotConcurrent(state) => Ok(&mut state.scopes[id as usize]),
+            ComponentTaskState::NotConcurrent(state) => match id {
+                Scope::Id(id) => Ok(&mut state.scopes[id as usize]),
+                Scope::HostId(_) => bail_bug!("non-concurrent scope cannot be a host ID"),
+            },
+            #[cfg(feature = "component-model-async")]
             ComponentTaskState::Concurrent(state) => state.call_context(id),
         }
     }
 
-    pub fn current_call_context_scope_id(&self) -> Result<u32> {
+    pub(crate) fn materialize_current_scope(&mut self) -> Result<Scope> {
         match self {
-            ComponentTaskState::NotConcurrent(state) => Ok(u32::try_from(state.scopes.len() - 1)?),
-            ComponentTaskState::Concurrent(state) => state.current_call_context_scope_id(),
+            ComponentTaskState::NotConcurrent(_) => {
+                bail_bug!("a non-concurrent scope cannot be deferred")
+            }
+            #[cfg(feature = "component-model-async")]
+            ComponentTaskState::Concurrent(state) => state.materialize_current_scope(),
         }
     }
 
+    pub(crate) fn deferred_host_call_context(&mut self) -> Option<&mut CallContext> {
+        match self {
+            ComponentTaskState::NotConcurrent(_) => None,
+            #[cfg(feature = "component-model-async")]
+            ComponentTaskState::Concurrent(state) => state.deferred_host_call_context(),
+        }
+    }
+
+    #[cfg(feature = "component-model-async")]
     pub fn concurrent_state_mut(&mut self) -> &mut ConcurrentState {
         match self {
             ComponentTaskState::Concurrent(state) => state,

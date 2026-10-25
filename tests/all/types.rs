@@ -19,6 +19,37 @@ fn valty(heap_ty: HeapType) -> ValType {
 }
 
 #[test]
+fn heap_type_top_and_bottom() {
+    for (heap_type, top, bottom) in [
+        (
+            HeapType::Extern,
+            HeapTopType::Extern,
+            HeapBottomType::NoExtern,
+        ),
+        (
+            HeapType::NoExtern,
+            HeapTopType::Extern,
+            HeapBottomType::NoExtern,
+        ),
+        (HeapType::Func, HeapTopType::Func, HeapBottomType::NoFunc),
+        (HeapType::NoFunc, HeapTopType::Func, HeapBottomType::NoFunc),
+        (HeapType::Any, HeapTopType::Any, HeapBottomType::None),
+        (HeapType::Eq, HeapTopType::Any, HeapBottomType::None),
+        (HeapType::I31, HeapTopType::Any, HeapBottomType::None),
+        (HeapType::Array, HeapTopType::Any, HeapBottomType::None),
+        (HeapType::Struct, HeapTopType::Any, HeapBottomType::None),
+        (HeapType::None, HeapTopType::Any, HeapBottomType::None),
+        (HeapType::Cont, HeapTopType::Cont, HeapBottomType::NoCont),
+        (HeapType::NoCont, HeapTopType::Cont, HeapBottomType::NoCont),
+        (HeapType::Exn, HeapTopType::Exn, HeapBottomType::NoExn),
+        (HeapType::NoExn, HeapTopType::Exn, HeapBottomType::NoExn),
+    ] {
+        assert_eq!(heap_type.top(), top);
+        assert_eq!(heap_type.bottom(), bottom);
+    }
+}
+
+#[test]
 fn basic_array_types() -> Result<()> {
     let engine = Engine::default();
     for mutability in [Mutability::Const, Mutability::Var] {
@@ -673,6 +704,7 @@ fn func_subtyping() -> Result<()> {
         (false, "i", &i, "a", &a),
     ] {
         eprintln!("expect that `{sub_name} <: {sup_name}` is `{expected}`");
+        assert_eq!(expected, sub.matches(sup));
         let sub = HeapType::ConcreteFunc(sub.clone());
         let sup = HeapType::ConcreteFunc(sup.clone());
         let actual = sub.matches(&sup);
@@ -705,5 +737,61 @@ fn heap_type_matches_noexn() -> Result<()> {
     assert!(!HeapType::NoExn.matches(&HeapType::Cont));
     assert!(!HeapType::NoExn.matches(&HeapType::NoCont));
 
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+/// Check that dropping a long guest-defined type from the registry doesn't
+/// stack overflow.
+fn drop_long_chain_of_guest_func_types() -> Result<()> {
+    // A chain of 20,000 function types where each type's parameter is a
+    // reference to the previous type.
+    const N: usize = 20_000;
+
+    let mut wat = String::from("(module\n  (type $t0 (func))\n");
+    for i in 1..N {
+        wat.push_str(&format!(
+            "  (type $t{i} (func (param (ref null $t{}))))\n",
+            i - 1
+        ));
+    }
+    wat.push_str(&format!(
+        "  (func (export \"f\") (type $t{}) unreachable)\n)\n",
+        N - 1
+    ));
+
+    let mut config = Config::new();
+    config.wasm_function_references(true);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, &wat)?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    let trap = instance
+        .get_func(&mut store, "f")
+        .unwrap()
+        .call(&mut store, &[Val::FuncRef(None)], &mut [])
+        .unwrap_err()
+        .downcast::<Trap>()?;
+    assert_eq!(trap, Trap::UnreachableCodeReached);
+
+    Ok(())
+}
+
+#[test]
+/// Check that dropping a long host-defined type from the registry doesn't stack
+/// overflow.
+fn drop_long_chain_of_host_func_types() -> Result<()> {
+    // Dropping the last type in a long chain of rec groups, each of which
+    // references the previous, should not overflow the stack.
+    let engine = Engine::default();
+    let mut ty = FuncType::new(&engine, [], []);
+    let amt = if cfg!(miri) { 10 } else { 100_000 };
+    for _ in 0..amt {
+        let param = ValType::Ref(RefType::new(true, HeapType::ConcreteFunc(ty)));
+        ty = FuncType::new(&engine, [param], []);
+    }
+    drop(ty);
     Ok(())
 }

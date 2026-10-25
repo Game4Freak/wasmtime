@@ -13,9 +13,7 @@ use cranelift_codegen::entity::{PrimaryMap, entity_impl};
 use cranelift_codegen::ir::ExternalName;
 use cranelift_codegen::ir::function::{Function, VersionMarker};
 use cranelift_codegen::settings::SetError;
-use cranelift_codegen::{
-    CodegenError, CompileError, Context, FinalizedMachReloc, FinalizedRelocTarget, ir, isa,
-};
+use cranelift_codegen::{CodegenError, CompileError, Context, MachReloc, RelocTarget, ir, isa};
 use cranelift_control::ControlPlane;
 use std::borrow::{Cow, ToOwned};
 use std::boxed::Box;
@@ -36,25 +34,22 @@ pub struct ModuleReloc {
 }
 
 impl ModuleReloc {
-    /// Converts a `FinalizedMachReloc` produced from a `Function` into a `ModuleReloc`.
-    pub fn from_mach_reloc(
-        mach_reloc: &FinalizedMachReloc,
-        func: &Function,
-        func_id: FuncId,
-    ) -> Self {
+    /// Converts a `MachReloc` produced from a `Function` into a `ModuleReloc`.
+    pub fn from_mach_reloc(mach_reloc: &MachReloc, func: &Function, func_id: FuncId) -> Self {
         let name = match mach_reloc.target {
-            FinalizedRelocTarget::ExternalName(ExternalName::User(reff)) => {
+            RelocTarget::ExternalName(ExternalName::User(reff)) => {
                 let name = &func.params.user_named_funcs()[reff];
                 ModuleRelocTarget::user(name.namespace, name.index)
             }
-            FinalizedRelocTarget::ExternalName(ExternalName::TestCase(_)) => unimplemented!(),
-            FinalizedRelocTarget::ExternalName(ExternalName::LibCall(libcall)) => {
+            RelocTarget::ExternalName(ExternalName::TestCase(_)) => unimplemented!(),
+            RelocTarget::ExternalName(ExternalName::LibCall(libcall)) => {
                 ModuleRelocTarget::LibCall(libcall)
             }
-            FinalizedRelocTarget::ExternalName(ExternalName::KnownSymbol(ks)) => {
+            RelocTarget::ExternalName(ExternalName::KnownSymbol(ks)) => {
                 ModuleRelocTarget::KnownSymbol(ks)
             }
-            FinalizedRelocTarget::Func(offset) => {
+            RelocTarget::Label(label) => {
+                let offset = label.as_offset();
                 ModuleRelocTarget::FunctionOffset(func_id, offset)
             }
         };
@@ -280,6 +275,10 @@ pub enum ModuleError {
     /// different signature than declared previously
     IncompatibleSignature(String, ir::Signature, ir::Signature),
 
+    /// Indicates a data object was declared as TLS but previously
+    /// declared as not TLS or vice versa.
+    IncompatibleDataTls(String, bool, bool),
+
     /// Indicates an identifier was defined more than once
     DuplicateDefinition(String),
 
@@ -290,6 +289,11 @@ pub enum ModuleError {
     Compilation(CodegenError),
 
     /// Memory allocation failure from a backend
+    ///
+    /// Only the `std` builds carry this variant: the payload is a
+    /// `std::io::Error` and the only producer is `cranelift-jit`, which needs
+    /// `std` anyway.
+    #[cfg(feature = "std")]
     Allocation {
         /// Io error the allocation failed with
         err: std::io::Error,
@@ -310,15 +314,17 @@ impl<'a> From<CompileError<'a>> for ModuleError {
 
 // This is manually implementing Error and Display instead of using thiserror to reduce the amount
 // of dependencies used by Cranelift.
-impl std::error::Error for ModuleError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for ModuleError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Undeclared { .. }
             | Self::IncompatibleDeclaration { .. }
             | Self::IncompatibleSignature { .. }
+            | Self::IncompatibleDataTls { .. }
             | Self::DuplicateDefinition { .. }
             | Self::InvalidImportDefinition { .. } => None,
             Self::Compilation(source) => Some(source),
+            #[cfg(feature = "std")]
             Self::Allocation { err: source } => Some(source),
             Self::Backend(source) => Some(&**source),
             Self::Flag(source) => Some(source),
@@ -341,6 +347,12 @@ impl std::fmt::Display for ModuleError {
                     "Function {name} signature {new_sig:?} is incompatible with previous declaration {prev_sig:?}",
                 )
             }
+            Self::IncompatibleDataTls(name, prev_tls, new_tls) => {
+                write!(
+                    f,
+                    "Data object {name} TLS {new_tls:?} is incompatible with previous declaration TLS {prev_tls:?}",
+                )
+            }
             Self::DuplicateDefinition(name) => {
                 write!(f, "Duplicate definition of identifier: {name}")
             }
@@ -353,6 +365,7 @@ impl std::fmt::Display for ModuleError {
             Self::Compilation(err) => {
                 write!(f, "Compilation error: {err}")
             }
+            #[cfg(feature = "std")]
             Self::Allocation { err } => {
                 write!(f, "Allocation error: {err}")
             }
@@ -362,13 +375,13 @@ impl std::fmt::Display for ModuleError {
     }
 }
 
-impl std::convert::From<CodegenError> for ModuleError {
+impl From<CodegenError> for ModuleError {
     fn from(source: CodegenError) -> Self {
         Self::Compilation { 0: source }
     }
 }
 
-impl std::convert::From<SetError> for ModuleError {
+impl From<SetError> for ModuleError {
     fn from(source: SetError) -> Self {
         Self::Flag { 0: source }
     }
@@ -405,13 +418,17 @@ impl DataDeclaration {
         }
     }
 
-    fn merge(&mut self, linkage: Linkage, writable: bool, tls: bool) {
+    fn merge(&mut self, linkage: Linkage, writable: bool, tls: bool) -> Result<(), ModuleError> {
         self.linkage = Linkage::merge(self.linkage, linkage);
         self.writable = self.writable || writable;
-        assert_eq!(
-            self.tls, tls,
-            "Can't change TLS data object to normal or in the opposite way",
-        );
+        if self.tls != tls {
+            return Err(ModuleError::IncompatibleDataTls(
+                self.name.clone().unwrap(),
+                self.tls,
+                tls,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -787,7 +804,7 @@ impl ModuleDeclarations {
             Occupied(entry) => match *entry.get() {
                 FuncOrDataId::Data(id) => {
                     let existing = &mut self.data_objects[id];
-                    existing.merge(linkage, writable, tls);
+                    existing.merge(linkage, writable, tls)?;
                     Ok((id, existing.linkage))
                 }
 

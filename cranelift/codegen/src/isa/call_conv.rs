@@ -14,16 +14,21 @@ use serde_derive::{Deserialize, Serialize};
 pub enum CallConv {
     /// Best performance, not ABI-stable.
     Fast,
-    /// Supports tail calls, not ABI-stable except for exception
-    /// payload registers.
+    /// Supports tail calls, not ABI-stable except as stated here.
     ///
-    /// On exception resume, a caller to a `tail`-convention function
-    /// assumes that the exception payload values are in the following
-    /// registers (per platform):
+    /// On exception resume, a caller to a `tail`-convention function assumes
+    /// that the exception payload values are in the following registers (per
+    /// platform):
     /// - x86-64: rax, rdx
     /// - aarch64: x0, x1
     /// - riscv64: a0, a1
     /// - pulley{32,64}: x0, x1
+    ///
+    /// The `interrupt_poll` instruction uses registers as follows:
+    /// - x86-64: `context` in rdi, `load_ptr` and `next_load_ptr` in r11,
+    ///   scratch in r10
+    /// - aarch64: `context` in x0, `load_ptr` and `next_load_ptr` in x10,
+    ///   scratch in x9
     //
     // Currently, this is basically sys-v except that callees pop stack
     // arguments, rather than callers. Expected to change even more in the
@@ -37,11 +42,15 @@ pub enum CallConv {
     AppleAarch64,
     /// Specialized convention for the probestack function.
     Probestack,
-    /// The winch calling convention, not ABI-stable.
+    /// Internal calling convention for Winch-generated functions.
+    /// Cranelift-generated trampolines use the same convention to
+    /// interoperate with them. This convention is not ABI-stable.
     ///
-    /// The main difference to SystemV is that the winch calling convention
-    /// defines no callee-save registers, and restricts the number of return
-    /// registers to one integer, and one floating point.
+    /// Callees reclaim their aligned incoming stack-argument area
+    /// before returning.
+    ///
+    /// Only the last result is returned in a register; any preceding
+    /// results are written to the return area in memory.
     Winch,
     /// Calling convention optimized for callsite efficiency, at the
     /// cost of the callee. It does so by not clobbering any
@@ -95,7 +104,11 @@ impl CallConv {
     /// Does this calling convention support exceptions?
     pub fn supports_exceptions(&self) -> bool {
         match self {
-            CallConv::Tail | CallConv::SystemV | CallConv::Winch | CallConv::PreserveAll => true,
+            CallConv::Tail
+            | CallConv::SystemV
+            | CallConv::Winch
+            | CallConv::PreserveAll
+            | CallConv::AppleAarch64 => true,
             _ => false,
         }
     }
@@ -113,11 +126,13 @@ impl CallConv {
     /// destinations as this return value.
     pub fn exception_payload_types(&self, pointer_ty: Type) -> &[Type] {
         match self {
-            CallConv::Tail | CallConv::SystemV | CallConv::PreserveAll => match pointer_ty {
-                types::I32 => &[types::I32, types::I32],
-                types::I64 => &[types::I64, types::I64],
-                _ => unreachable!(),
-            },
+            CallConv::Tail | CallConv::SystemV | CallConv::PreserveAll | CallConv::AppleAarch64 => {
+                match pointer_ty {
+                    types::I32 => &[types::I32, types::I32],
+                    types::I64 => &[types::I64, types::I64],
+                    _ => unreachable!(),
+                }
+            }
             _ => &[],
         }
     }

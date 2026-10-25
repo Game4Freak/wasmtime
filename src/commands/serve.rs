@@ -1,38 +1,41 @@
 use crate::common::{HttpHooks, Profile, RunCommon, RunTarget};
-use bytes::Bytes;
 use clap::Parser;
-use futures::future::FutureExt;
-use http::{Response, StatusCode};
-use http_body_util::BodyExt as _;
-use http_body_util::combinators::UnsyncBoxBody;
-use hyper::body::{Body, Frame, SizeHint};
+use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
+use http_body_util::{BodyExt as _, Full};
+use hyper::server::conn::http1;
+use pin_project_lite::pin_project;
 use std::convert::Infallible;
 use std::ffi::OsString;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{
     path::PathBuf,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::io::{self, AsyncWrite};
-use tokio::sync::Notify;
-use wasmtime::component::{Component, Linker};
+use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use wasmtime::component::{Component, Linker, TaskGroupId};
+use wasmtime::error::Context as _;
 use wasmtime::{
-    Engine, Result, Store, StoreContextMut, StoreLimits, UpdateDeadline, bail, error::Context as _,
+    AsContextMut as _, Engine, Result, Store, StoreContextMut, StoreLimits, UpdateDeadline, bail,
 };
 use wasmtime_cli_flags::opt::WasmtimeOptionValue;
 use wasmtime_wasi::p2::{StreamError, StreamResult};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-#[cfg(feature = "component-model-async")]
-use wasmtime_wasi_http::handler::p2::bindings as p2;
-use wasmtime_wasi_http::handler::{HandlerState, Proxy, ProxyHandler, ProxyPre, StoreBundle};
+use wasmtime_wasi_http::handler::{
+    HandlerState, Instance, Prepared, Proxy, ProxyHandler, ProxyPre, ShouldAccept,
+    WorkerExpiration, WorkerState, WorkerStatus,
+};
 use wasmtime_wasi_http::io::TokioIo;
-use wasmtime_wasi_http::{WasiHttpCtx, p2::WasiHttpView};
+use wasmtime_wasi_http::{ErrorResponse, WasiHttpCtx};
 
 #[cfg(feature = "debug")]
 use crate::commands::run::RunCommand;
@@ -67,6 +70,8 @@ struct Host {
 
     #[cfg(feature = "profiling")]
     guest_profiler: Option<Arc<wasmtime::GuestProfiler>>,
+
+    write_profile: Option<WriteProfile>,
 }
 
 impl WasiView for Host {
@@ -78,9 +83,9 @@ impl WasiView for Host {
     }
 }
 
-impl wasmtime_wasi_http::p2::WasiHttpView for Host {
-    fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
-        wasmtime_wasi_http::p2::WasiHttpCtxView {
+impl wasmtime_wasi_http::WasiHttpView for Host {
+    fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::WasiHttpCtxView {
             ctx: &mut self.http,
             table: &mut self.table,
             hooks: &mut self.hooks,
@@ -88,21 +93,10 @@ impl wasmtime_wasi_http::p2::WasiHttpView for Host {
     }
 }
 
-#[cfg(feature = "component-model-async")]
-impl wasmtime_wasi_http::p3::WasiHttpView for Host {
-    fn http(&mut self) -> wasmtime_wasi_http::p3::WasiHttpCtxView<'_> {
-        wasmtime_wasi_http::p3::WasiHttpCtxView {
-            table: &mut self.table,
-            ctx: &mut self.http,
-            hooks: &mut self.hooks,
-        }
-    }
-}
-
-const DEFAULT_ADDR: std::net::SocketAddr = std::net::SocketAddr::new(
+const DEFAULT_ADDRS: &[std::net::SocketAddr] = &[std::net::SocketAddr::new(
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
     8080,
-);
+)];
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
     Duration::parse(Some(s)).map_err(|e| e.to_string())
@@ -114,14 +108,17 @@ pub struct ServeCommand {
     #[command(flatten)]
     run: RunCommon,
 
-    /// Socket address for the web server to bind to.
-    #[arg(long , value_name = "SOCKADDR", default_value_t = DEFAULT_ADDR)]
-    addr: SocketAddr,
+    /// Socket addresses for the web server to bind to.
+    ///
+    /// Defaults to `0.0.0.0:8080`.
+    #[arg(long, value_name = "SOCKADDR", conflicts_with = "systemd_listenfd")]
+    addr: Vec<SocketAddr>,
 
     /// Socket address where, when connected to, will initiate a graceful
     /// shutdown.
     ///
-    /// Note that graceful shutdown is also supported on ctrl-c.
+    /// Note that graceful shutdown is also supported on ctrl-c and, on Unix,
+    /// SIGTERM.
     #[arg(long, value_name = "SOCKADDR")]
     shutdown_addr: Option<SocketAddr>,
 
@@ -129,6 +126,11 @@ pub struct ServeCommand {
     /// if unspecified, logs will be prefixed with 'stdout|stderr [{req_id}] :: '
     #[arg(long)]
     no_logging_prefix: bool,
+
+    /// Use sockets passed via the 'LISTEN_FDS' environment variable (set e.g. by systemd when
+    /// launching a service from socket units). Not available on Windows.
+    #[arg(long)]
+    systemd_listenfd: bool,
 
     /// The WebAssembly component to run.
     #[arg(value_name = "WASM", required = true)]
@@ -158,11 +160,59 @@ pub struct ServeCommand {
     /// (microseconds), and `ns` (nanoseconds).
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     idle_instance_timeout: Duration,
+
+    /// Optional maximum idle time before exiting the process.
+    ///
+    /// If no connection is open for this interval after the first connection has been received, the
+    /// process gracefully shuts down. This is mainly useful when starting `wasmtime serve` via
+    /// socket activation, as a system manager can restart the process when the next request comes
+    /// in.
+    ///
+    /// This accepts the same syntax as `--idle-instance-timeout`.
+    #[arg(long, value_parser = parse_duration)]
+    idle_process_timeout: Option<Duration>,
+
+    /// Replace or add a request header before forwarding it to the component.
+    ///
+    /// The argument must have the form `name: value`. May be specified more
+    /// than once. An argument beginning with `@` is treated as a file containing
+    /// one header per line.
+    #[arg(short = 'H', long = "header", value_name = "HEADER")]
+    headers: Vec<String>,
+
+    /// Maximum number of concurrent requests that can be processed at any one
+    /// point in time.
+    #[arg(long, value_parser = parse_concurrency_limit)]
+    max_concurrent_requests: Option<NonZeroUsize>,
+    /// Maximum number of concurrent connections that can be held at any one
+    /// point in time.
+    #[arg(long, value_parser = parse_concurrency_limit)]
+    max_concurrent_connections: Option<NonZeroUsize>,
+
+    #[arg(skip)]
+    inherited_sockets: InheritedSockets,
+}
+
+/// Both limits are handed to a semaphore, which panics above its permit limit.
+fn parse_concurrency_limit(s: &str) -> Result<NonZeroUsize, String> {
+    let n: NonZeroUsize = s
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if n.get() > Semaphore::MAX_PERMITS {
+        return Err(format!("maximum is {}", Semaphore::MAX_PERMITS));
+    }
+    Ok(n)
 }
 
 impl ServeCommand {
     /// Start a server to run the given wasi-http proxy component
     pub fn execute(mut self) -> Result<()> {
+        if self.systemd_listenfd {
+            // SAFETY: Called early before any other file descriptors are opened.
+            unsafe { self.inherited_sockets.inherit_sockets() }
+                .with_context(|| "Failed to resolve inherited sockets")?;
+        }
+
         self.run.common.init_logging()?;
 
         // We force cli errors before starting to listen for connections so then
@@ -234,7 +284,7 @@ impl ServeCommand {
             };
             self.run.common.debug.debugger = Some("<built-in gdbstub>".into());
             self.run.common.debug.arg.push(addr);
-            Some(gdbstub_component_artifact::GDBSTUB_COMPONENT)
+            Some(gdbstub_component_artifact::gdbstub()?)
         } else {
             None
         };
@@ -300,20 +350,16 @@ impl ServeCommand {
     /// sequentially, so the debugger can pause and inspect state.
     #[cfg(feature = "debug")]
     async fn serve_under_debugger(
-        &self,
+        self,
         mut debug_run: RunCommand,
-        engine: &Engine,
-        linker: &Linker<Host>,
-        component: &Component,
+        linker: Linker<Host>,
+        component: Component,
     ) -> Result<()> {
-        let instance_pre = linker.instantiate_pre(component)?;
-        let proxy_pre = wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre)?;
-
-        let mut debuggee_store = self.new_store(engine, None)?;
+        let mut debuggee_store = self.new_store(linker.engine(), None)?;
 
         // Pre-register component modules so the debugger can see
         // them and set breakpoints at the initial stop.
-        debuggee_store.debug_register_component(component)?;
+        debuggee_store.debug_register_component(&component)?;
 
         let debug_engine = debug_run.new_engine()?;
         let debug_main = debug_run.run.load_module(
@@ -335,32 +381,31 @@ impl ServeCommand {
         };
         debug_run.add_debugger_api(&mut debug_linker)?;
 
-        let addr = self.addr;
         debug_run
             .invoke_debugger(
                 &mut debug_store,
                 &debug_component,
                 &mut debug_linker,
                 debuggee_store,
-                move |store| Box::pin(debug_serve_body(store, proxy_pre, addr)),
+                move |store| Box::pin(self.serve_maybe_debug(linker, component, Some(store))),
             )
             .await
     }
 
-    fn new_store(&self, engine: &Engine, req_id: Option<u64>) -> Result<Store<Host>> {
+    fn new_store(&self, engine: &Engine, instance_id: Option<u64>) -> Result<Store<Host>> {
         let mut builder = WasiCtxBuilder::new();
         self.run.configure_wasip2(&mut builder)?;
 
-        if let Some(req_id) = req_id {
-            builder.env("REQUEST_ID", req_id.to_string());
+        if let Some(instance_id) = instance_id {
+            builder.env("INSTANCE_ID", instance_id.to_string());
         }
 
         let stdout_prefix: String;
         let stderr_prefix: String;
-        match req_id {
-            Some(req_id) if !self.no_logging_prefix => {
-                stdout_prefix = format!("stdout [{req_id}] :: ");
-                stderr_prefix = format!("stderr [{req_id}] :: ");
+        match instance_id {
+            Some(instance_id) if !self.no_logging_prefix => {
+                stdout_prefix = format!("stdout [{instance_id}] :: ");
+                stderr_prefix = format!("stderr [{instance_id}] :: ");
             }
             _ => {
                 stdout_prefix = "".to_string();
@@ -390,6 +435,7 @@ impl ServeCommand {
             wasi_keyvalue: None,
             #[cfg(feature = "profiling")]
             guest_profiler: None,
+            write_profile: None,
         };
 
         if self.run.common.wasi.nn == Some(true) {
@@ -441,20 +487,7 @@ impl ServeCommand {
         }
 
         let mut store = Store::new(engine, host);
-
-        if let Some(fuel) = self.run.common.wasi.hostcall_fuel {
-            store.set_hostcall_fuel(fuel);
-        }
-
-        store.data_mut().limits = self.run.store_limits();
-        store.limiter(|t| &mut t.limits);
-
-        // If fuel has been configured, we want to add the configured
-        // fuel amount to this store.
-        if let Some(fuel) = self.run.common.wasm.fuel {
-            store.set_fuel(fuel)?;
-        }
-
+        self.run.configure_store(&mut store, |t| &mut t.limits)?;
         Ok(store)
     }
 
@@ -540,8 +573,6 @@ impl ServeCommand {
     }
 
     async fn serve(mut self) -> Result<()> {
-        use hyper::server::conn::http1;
-
         #[cfg(feature = "debug")]
         let debug_run = self.debugger_setup()?;
 
@@ -578,30 +609,54 @@ impl ServeCommand {
         #[cfg(feature = "debug")]
         if let Some(debug_run) = debug_run {
             return self
-                .serve_under_debugger(debug_run, &engine, &linker, &component)
+                .serve_under_debugger(debug_run, linker, component)
                 .await;
         }
 
+        self.serve_maybe_debug(linker, component, None).await
+    }
+
+    async fn serve_maybe_debug(
+        mut self,
+        linker: Linker<Host>,
+        component: Component,
+        debuggee_store: Option<&mut Store<Host>>,
+    ) -> Result<()> {
+        let engine = linker.engine();
+        let request_headers = RequestHeaders::parse(&self.headers)?;
         let instance = linker.instantiate_pre(&component)?;
         #[cfg(feature = "component-model-async")]
         let instance = match wasmtime_wasi_http::p3::bindings::ServicePre::new(instance.clone()) {
             Ok(pre) => ProxyPre::P3(pre),
-            Err(_) => ProxyPre::P2(p2::ProxyPre::new(instance)?),
+            Err(_) => ProxyPre::P2(wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance)?),
         };
         #[cfg(not(feature = "component-model-async"))]
-        let instance = ProxyPre::P2(p2::ProxyPre::new(instance)?);
+        let instance = ProxyPre::P2(wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance)?);
 
         // Spawn background task(s) waiting for graceful shutdown signals. This
-        // always listens for ctrl-c but additionally can listen for a TCP
-        // connection to the specified address.
+        // always listens for ctrl-c (and SIGTERM on Unix) but additionally can
+        // listen for a TCP connection to the specified address.
         let shutdown = Arc::new(GracefulShutdown::default());
         tokio::task::spawn({
             let shutdown = shutdown.clone();
             async move {
-                tokio::signal::ctrl_c().await.unwrap();
-                shutdown.requested.notify_one();
+                wait_for_shutdown_signal().await;
+                shutdown.request_shutdown();
             }
         });
+        if let Some(timeout) = self.idle_process_timeout {
+            let shutdown = shutdown.clone();
+            let idle = shutdown.wait_idle_connections(timeout);
+            tokio::task::spawn(async move {
+                tokio::select! {
+                    _ = shutdown.requested() => {}
+                    _ = idle => {
+                        eprintln!("No connections for {timeout:?}, shutting down");
+                        shutdown.request_shutdown();
+                    }
+                }
+            });
+        }
         if let Some(addr) = self.shutdown_addr {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             eprintln!(
@@ -611,34 +666,55 @@ impl ServeCommand {
             let shutdown = shutdown.clone();
             tokio::task::spawn(async move {
                 let _ = listener.accept().await;
-                shutdown.requested.notify_one();
+                shutdown.request_shutdown();
             });
         }
 
-        let socket = match &self.addr {
-            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+        let servers = match self.inherited_sockets.take()? {
+            Some(listeners) => {
+                assert!(!listeners.is_empty());
+                eprintln!("Serving HTTP on inherited socket");
+                log::info!("Listening on inherited socket");
+                listeners
+            }
+            None => {
+                let addrs = if self.addr.is_empty() {
+                    DEFAULT_ADDRS.to_vec()
+                } else {
+                    self.addr.clone()
+                };
+                let mut servers = vec![];
+                for addr in &addrs {
+                    let socket = match addr {
+                        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+                        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+                    };
+                    // Conditionally enable `SO_REUSEADDR` depending on the current
+                    // platform. On Unix we want this to be able to rebind an address in
+                    // the `TIME_WAIT` state which can happen then a server is killed with
+                    // active TCP connections and then restarted. On Windows though if
+                    // `SO_REUSEADDR` is specified then it enables multiple applications to
+                    // bind the port at the same time which is not something we want. Hence
+                    // this is conditionally set based on the platform (and deviates from
+                    // Tokio's default from always-on).
+                    socket.set_reuseaddr(!cfg!(windows))?;
+                    socket.bind(*addr)?;
+                    let listener = socket.listen(100)?;
+
+                    eprintln!("Serving HTTP on http://{}/", listener.local_addr()?);
+                    log::info!("Listening on {addr}");
+                    servers.push(SocketServer::Tcp(listener));
+                }
+                servers
+            }
         };
-        // Conditionally enable `SO_REUSEADDR` depending on the current
-        // platform. On Unix we want this to be able to rebind an address in
-        // the `TIME_WAIT` state which can happen then a server is killed with
-        // active TCP connections and then restarted. On Windows though if
-        // `SO_REUSEADDR` is specified then it enables multiple applications to
-        // bind the port at the same time which is not something we want. Hence
-        // this is conditionally set based on the platform (and deviates from
-        // Tokio's default from always-on).
-        socket.set_reuseaddr(!cfg!(windows))?;
-        socket.bind(self.addr)?;
-        let listener = socket.listen(100)?;
-
-        eprintln!("Serving HTTP on http://{}/", listener.local_addr()?);
-
-        log::info!("Listening on {}", self.addr);
 
         let epoch_interval = if let Some(Profile::Guest { interval, .. }) = self.run.profile {
             Some(interval)
         } else if let Some(t) = self.run.common.wasm.timeout {
             Some(EPOCH_INTERRUPT_PERIOD.min(t))
+        } else if debuggee_store.is_some() {
+            Some(Duration::from_millis(1))
         } else {
             None
         };
@@ -659,91 +735,98 @@ impl ServeCommand {
             1
         };
 
-        let handler = ProxyHandler::new(
-            HostHandlerState {
-                cmd: self,
-                engine,
-                component,
-                max_instance_reuse_count,
-                max_instance_concurrent_reuse_count,
-                // Give one shutdown guard to this handler which will track the
-                // full lifetime of any instances spawned.
-                _shutdown_guard: Box::new(shutdown.clone().increment()),
-            },
-            instance,
-        );
-
-        loop {
-            // Wait for a socket, but also "race" against shutdown to break out
-            // of this loop. Once the graceful shutdown signal is received then
-            // this loop exits immediately.
-            let (stream, _) = tokio::select! {
-                _ = shutdown.requested.notified() => break,
-                v = listener.accept() => v?,
-            };
-
-            // The Nagle algorithm can impose a significant latency penalty
-            // (e.g. 40ms on Linux) on guests which write small, intermittent
-            // response body chunks (e.g. SSE streams).  Here we disable that
-            // algorithm and rely on the guest to buffer if appropriate to avoid
-            // TCP fragmentation.
-            stream.set_nodelay(true)?;
-
-            let stream = TokioIo::new(stream);
-            let h = handler.clone();
-
-            // In addition to the shutdown guard given to the handler above,
-            // also give one to the tokio tasks doing HTTP I/O as well to ensure
-            // it keeps them alive too.
-            let shutdown_guard = shutdown.clone().increment();
-            tokio::task::spawn(async move {
-                if let Err(e) = http1::Builder::new()
-                    .keep_alive(true)
-                    .serve_connection(
-                        stream,
-                        hyper::service::service_fn(move |req| {
-                            let h = h.clone();
-                            async move {
-                                use http_body_util::{BodyExt, Full};
-                                match handle_request(h, req).await {
-                                    Ok(r) => Ok::<_, Infallible>(r),
-                                    Err(e) => {
-                                        eprintln!("error: {e:?}");
-                                        let error_html = "\
-<!doctype html>
-<html>
-<head>
-    <title>500 Internal Server Error</title>
-</head>
-<body>
-    <center>
-        <h1>500 Internal Server Error</h1>
-        <hr>
-        wasmtime
-    </center>
-</body>
-</html>";
-                                        Ok(Response::builder()
-                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                            .header("Content-Type", "text/html; charset=UTF-8")
-                                            .body(
-                                                Full::new(bytes::Bytes::from(error_html))
-                                                    .map_err(|_| unreachable!())
-                                                    .boxed_unsync(),
-                                            )
-                                            .unwrap())
-                                    }
-                                }
-                            }
-                        }),
-                    )
-                    .await
-                {
-                    eprintln!("error: {e:?}");
-                }
-                drop(shutdown_guard);
-            });
+        let max_concurrent_connections = self
+            .max_concurrent_connections
+            .map(|n| n.get())
+            .unwrap_or(if debuggee_store.is_some() { 1 } else { 1000 });
+        let max_concurrent_requests = self
+            .max_concurrent_requests
+            .map(|n| n.get())
+            .unwrap_or(if debuggee_store.is_some() { 1 } else { 1000 });
+        if debuggee_store.is_some() && max_concurrent_connections != 1 {
+            bail!("cannot have more than 1 max concurrent connections with a debugger");
         }
+        if debuggee_store.is_some() && max_concurrent_requests != 1 {
+            bail!("cannot have more than 1 max concurrent requests with a debugger");
+        }
+        if debuggee_store.is_some() && servers.len() != 1 {
+            bail!("Cannot listen on more than one socket with a debugger");
+        }
+
+        let sem_connections = Arc::new(Semaphore::new(max_concurrent_connections));
+
+        // `--profile=guest` starts a new profiler for every instance, so the
+        // component's modules are prepared for profiling once, up front.
+        #[cfg(feature = "profiling")]
+        let guest_profiler_modules = match &self.run.profile {
+            Some(Profile::Guest { .. }) => Some(wasmtime::GuestProfilerModules::new_component(
+                engine,
+                &component,
+                std::iter::empty(),
+            )?),
+            _ => None,
+        };
+
+        let handler = ProxyHandler::new(HostHandlerState {
+            sem_requests: Semaphore::new(max_concurrent_requests),
+            cmd: self,
+            component,
+            #[cfg(feature = "profiling")]
+            guest_profiler_modules,
+            request_headers,
+            max_instance_reuse_count,
+            max_instance_concurrent_reuse_count,
+            instance,
+            next_instance_id: AtomicU64::default(),
+            next_request_id: AtomicU64::default(),
+            // Give one shutdown guard to this handler which will track the
+            // full lifetime of any instances spawned.
+            _shutdown_guard: Box::new(shutdown.clone().increment(false)),
+        });
+
+        // If any listener fails then a shutdown is requested to bring down all
+        // the other listeners as well, but the drain below still happens to
+        // gracefully finish in-flight requests. The first error seen is then
+        // returned at the end.
+        let result = if debuggee_store.is_some() {
+            debug_assert_eq!(servers.len(), 1);
+            let server = servers.into_iter().next().unwrap();
+            Self::serve_on_listener(
+                server,
+                shutdown.clone(),
+                sem_connections,
+                handler.clone(),
+                debuggee_store,
+            )
+            .await
+        } else {
+            let mut listener_tasks = tokio::task::JoinSet::new();
+
+            for server in servers {
+                listener_tasks.spawn(Self::serve_on_listener(
+                    server,
+                    shutdown.clone(),
+                    sem_connections.clone(),
+                    handler.clone(),
+                    None,
+                ));
+            }
+
+            let mut result = Ok(());
+            while let Some(task_result) = listener_tasks.join_next().await {
+                let task_result = task_result
+                    .map_err(wasmtime::Error::from)
+                    .and_then(|result| result);
+                if let Err(e) = task_result {
+                    eprintln!("listener error: {e:?}");
+                    shutdown.request_shutdown();
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
+            }
+            result
+        };
 
         drop(handler);
 
@@ -751,110 +834,376 @@ impl ServeCommand {
         // connections but there may still be outstanding connections
         // processing in child tasks. If there are wait for those to complete
         // before shutting down completely. Also enable short-circuiting this
-        // wait with a second ctrl-c signal.
-        if shutdown.close() {
-            return Ok(());
-        }
-        eprintln!("Waiting for child tasks to exit, ctrl-c again to quit sooner...");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = shutdown.complete.notified() => {}
+        // wait with a second ctrl-c (or SIGTERM) signal.
+        if let Some(wait_for_remaining) = shutdown.close() {
+            eprintln!("Waiting for child tasks to exit, ctrl-c again to quit sooner...");
+            tokio::select! {
+                _ = wait_for_shutdown_signal() => {}
+                _ = wait_for_remaining => {}
+            }
         }
 
-        Ok(())
+        result
+    }
+
+    async fn serve_on_listener(
+        server: SocketServer,
+        shutdown: Arc<GracefulShutdown>,
+        sem_connections: Arc<Semaphore>,
+        handler: ProxyHandler<HostHandlerState>,
+        mut debuggee_store: Option<&mut Store<Host>>,
+    ) -> Result<()> {
+        loop {
+            // Wait for a socket, but also "race" against shutdown to break out
+            // of this loop. Once the graceful shutdown signal is received then
+            // this loop exits immediately.
+            let (connection_permit, stream) = tokio::select! {
+                _ = shutdown.requested() => break Ok(()),
+                v = async {
+                    let permit = sem_connections.clone().acquire_owned().await?;
+                    let stream = server.accept().await?;
+                    wasmtime::error::Ok((permit, stream))
+                } => v?,
+            };
+
+            // In addition to the shutdown guard given to the handler above,
+            // also give one to the tokio tasks doing HTTP I/O as well to ensure
+            // it keeps them alive too.
+            let shutdown_guard = shutdown.clone().increment(true);
+
+            // When debugging, handle the client synchronously since
+            // concurrent requests can't be served. Otherwise though spawn a
+            // task to handle this client.
+            match &mut debuggee_store {
+                Some(store) => handle_client(stream, &handler, &shutdown, Some(store)).await,
+                None => {
+                    let handler = handler.clone();
+                    let shutdown = shutdown.clone();
+                    tokio::task::spawn(async move {
+                        handle_client(stream, &handler, &shutdown, None).await;
+                        drop(shutdown_guard);
+                        drop(connection_permit);
+                    });
+                }
+            }
+        }
+    }
+}
+
+pin_project! {
+    struct HostWorkerExpiration {
+        idle_timeout: Duration,
+        request_timeout: Duration,
+        #[pin]
+        sleep: tokio::time::Sleep,
+    }
+}
+
+impl WorkerExpiration for HostWorkerExpiration {
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        status: WorkerStatus,
+        start: Instant,
+    ) -> Poll<()> {
+        let mut me = self.project();
+
+        let timeout = match status {
+            WorkerStatus::Idle => *me.idle_timeout,
+            // TODO: add a dedicated `post_return_timeout` config setting
+            // instead of reusing `request_timeout` for
+            // `WorkerStatus::PostReturn` here
+            WorkerStatus::Requests | WorkerStatus::PostReturn => *me.request_timeout,
+        };
+
+        if let Some(deadline) = start.checked_add(timeout) {
+            let deadline = deadline.into();
+            if deadline != me.sleep.deadline() {
+                me.sleep.as_mut().reset(deadline);
+            }
+            me.sleep.poll(cx)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+struct HostWorkerState {
+    instance_id: u64,
+    max_instance_reuse_count: usize,
+    max_instance_concurrent_reuse_count: usize,
+    request_timeout: Duration,
+    #[cfg(feature = "coredump")]
+    coredump: Option<String>,
+    #[cfg(feature = "coredump")]
+    coredump_name: String,
+}
+
+impl WorkerState for HostWorkerState {
+    type StoreData = Host;
+    type RequestData = u64;
+
+    fn should_accept_request(&self, concurrent_count: usize, total_count: usize) -> ShouldAccept {
+        if total_count >= self.max_instance_reuse_count {
+            ShouldAccept::Never
+        } else if concurrent_count >= self.max_instance_concurrent_reuse_count {
+            ShouldAccept::No
+        } else {
+            ShouldAccept::Yes
+        }
+    }
+
+    fn on_request_start(
+        &self,
+        _store: StoreContextMut<Host>,
+        request_id: u64,
+        _task_group: TaskGroupId,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'static + Send + Sync>> {
+        log::info!(
+            "Instance {} handling request {request_id}",
+            self.instance_id,
+        );
+
+        Box::pin(tokio::time::sleep(self.request_timeout))
+    }
+
+    fn drop(&self, mut store: Store<Self::StoreData>, result: Result<(), wasmtime::Error>) {
+        if let Err(error) = result {
+            eprintln!("worker failed: {error:?}");
+            #[cfg(feature = "coredump")]
+            write_serve_coredump(self, &mut store, &error);
+        }
+
+        if let Some(write_profile) = store.data_mut().write_profile.take() {
+            write_profile(store.as_context_mut());
+        }
+
+        drop(store);
+    }
+}
+
+#[cfg(feature = "coredump")]
+fn write_serve_coredump(state: &HostWorkerState, store: &mut Store<Host>, error: &wasmtime::Error) {
+    let Some(path) = &state.coredump else {
+        return;
+    };
+    if error.downcast_ref::<wasmtime::WasmCoreDump>().is_none() {
+        return;
+    }
+    match super::write_core_dump(store, error, &state.coredump_name, path) {
+        Ok(()) => eprintln!("core dumped at {path}"),
+        Err(coredump_err) => eprintln!("warning: coredump failed to generate: {coredump_err}"),
     }
 }
 
 struct HostHandlerState {
     cmd: ServeCommand,
-    engine: Engine,
     component: Component,
+    /// The component's modules prepared for `--profile=guest`, shared by every
+    /// instance's profiler; `None` when guest profiling is disabled.
+    #[cfg(feature = "profiling")]
+    guest_profiler_modules: Option<wasmtime::GuestProfilerModules>,
+    request_headers: RequestHeaders,
     max_instance_reuse_count: usize,
     max_instance_concurrent_reuse_count: usize,
+    instance: ProxyPre<Host>,
+    next_instance_id: AtomicU64,
+    next_request_id: AtomicU64,
+    sem_requests: Semaphore,
     _shutdown_guard: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl HostHandlerState {
+    async fn instantiate_into(&self, store: &mut Store<Host>) -> Result<Proxy> {
+        let write_profile = setup_epoch_handler(self, &mut *store)?;
+        store.data_mut().write_profile = Some(write_profile);
+        self.instance.instantiate_async(&mut *store).await
+    }
 }
 
 impl HandlerState for HostHandlerState {
     type StoreData = Host;
+    type WorkerExpiration = HostWorkerExpiration;
+    type WorkerState = HostWorkerState;
 
-    fn new_store(&self, req_id: Option<u64>) -> Result<StoreBundle<Host>> {
-        let mut store = self.cmd.new_store(&self.engine, req_id)?;
-        let write_profile = setup_epoch_handler(&self.cmd, &mut store, self.component.clone())?;
+    async fn instantiate(
+        &self,
+    ) -> Result<Instance<Self::StoreData, Self::WorkerExpiration, Self::WorkerState>> {
+        let instance_id = self.next_instance_id.fetch_add(1, Ordering::Relaxed);
+        let mut store = self
+            .cmd
+            .new_store(self.component.engine(), Some(instance_id))?;
+        let proxy = self.instantiate_into(&mut store).await?;
 
-        Ok(StoreBundle {
+        Ok(Instance {
             store,
-            write_profile,
+            proxy,
+            view: wasmtime_wasi_http::WasiHttpView::http,
+            expiration: HostWorkerExpiration {
+                idle_timeout: self.cmd.idle_instance_timeout,
+                request_timeout: self.cmd.run.common.wasm.timeout.unwrap_or(Duration::MAX),
+                sleep: tokio::time::sleep(Duration::MAX),
+            },
+            state: HostWorkerState {
+                max_instance_reuse_count: self.max_instance_reuse_count,
+                max_instance_concurrent_reuse_count: self.max_instance_concurrent_reuse_count,
+                instance_id,
+                request_timeout: self.cmd.run.common.wasm.timeout.unwrap_or(Duration::MAX),
+                #[cfg(feature = "coredump")]
+                coredump: self.cmd.run.common.debug.coredump.clone(),
+                #[cfg(feature = "coredump")]
+                coredump_name: self.cmd.component.to_str().unwrap_or("unknown").to_string(),
+            },
         })
     }
-
-    fn request_timeout(&self) -> Duration {
-        self.cmd.run.common.wasm.timeout.unwrap_or(Duration::MAX)
-    }
-
-    fn idle_instance_timeout(&self) -> Duration {
-        self.cmd.idle_instance_timeout
-    }
-
-    fn max_instance_reuse_count(&self) -> usize {
-        self.max_instance_reuse_count
-    }
-
-    fn max_instance_concurrent_reuse_count(&self) -> usize {
-        self.max_instance_concurrent_reuse_count
-    }
-
-    fn handle_worker_error(&self, error: wasmtime::Error) {
-        eprintln!("worker error: {error}");
-    }
 }
 
-/// Helper structure to manage graceful shutdown int he accept loop above.
-#[derive(Default)]
-struct GracefulShutdown {
-    /// Async notification that shutdown has been requested.
-    requested: Notify,
-    /// Async notification that shutdown has completed, signaled when
-    /// `notify_when_done` is `true` and `active_tasks` reaches 0.
-    complete: Notify,
-    /// Internal state related to what's in progress when shutdown is requested.
-    state: Mutex<GracefulShutdownState>,
+use shutdown::GracefulShutdown;
+
+/// Waits for ctrl-c or, on Unix, SIGTERM (as sent by systemd and docker).
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r.unwrap(),
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.unwrap();
 }
 
-#[derive(Default)]
-struct GracefulShutdownState {
-    active_tasks: u32,
-    notify_when_done: bool,
-}
+mod shutdown {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::{Notify, watch};
 
-impl GracefulShutdown {
-    /// Increments the number of active tasks and returns a guard indicating
-    fn increment(self: Arc<Self>) -> impl Drop + Send + Sync {
-        struct Guard(Arc<GracefulShutdown>);
+    /// Helper structure to manage graceful shutdown int he accept loop above.
+    #[derive(Default)]
+    pub struct GracefulShutdown {
+        /// Async notification that shutdown has been requested.
+        requested: Notify,
+        /// Async notification that shutdown has completed, signaled when
+        /// `notify_when_done` is `true` and `active_tasks` reaches 0.
+        complete: Notify,
+        /// Internal state related to what's in progress when shutdown is requested.
+        state: Mutex<GracefulShutdownState>,
+        /// Current connections, used for [super::ServeCommand::idle_process_timeout].
+        open_connections: watch::Sender<u32>,
+    }
 
-        let mut state = self.state.lock().unwrap();
-        assert!(!state.notify_when_done);
-        state.active_tasks += 1;
-        drop(state);
+    #[derive(Default)]
+    struct GracefulShutdownState {
+        shutdown_requested: bool,
+        active_tasks: u32,
+        notify_when_done: bool,
+    }
 
-        return Guard(self);
+    impl GracefulShutdown {
+        /// Increments the number of active tasks and returns a guard which,
+        /// when dropped, will signal that the task is no longer active.
+        ///
+        /// Live `increment` return values prevent the `close` return value from
+        /// resolving, for example.
+        ///
+        /// When `for_connection` is enabled, this also tracks the guard in
+        /// [Self::open_connections].
+        pub fn increment(self: Arc<Self>, for_connection: bool) -> impl Drop + Send + Sync {
+            struct Guard {
+                state: Arc<GracefulShutdown>,
+                for_connection: bool,
+            }
 
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                let mut state = self.0.state.lock().unwrap();
-                state.active_tasks -= 1;
-                if state.notify_when_done && state.active_tasks == 0 {
-                    self.0.complete.notify_one();
+            let mut state = self.state.lock().unwrap();
+            assert!(!state.notify_when_done);
+            state.active_tasks += 1;
+            if for_connection {
+                self.open_connections.send_modify(|n| *n += 1);
+            }
+
+            drop(state);
+
+            return Guard {
+                state: self,
+                for_connection,
+            };
+
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    let shutdown = &self.state;
+
+                    let mut state = shutdown.state.lock().unwrap();
+                    state.active_tasks -= 1;
+                    if self.for_connection {
+                        shutdown.open_connections.send_modify(|n| *n -= 1);
+                    }
+
+                    if state.notify_when_done && state.active_tasks == 0 {
+                        self.state.complete.notify_one();
+                    }
                 }
             }
         }
-    }
 
-    /// Flags this state as done spawning tasks and returns whether there are no
-    /// more child tasks remaining.
-    fn close(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
-        state.notify_when_done = true;
-        state.active_tasks == 0
+        /// Returns a future which resolves once no connections have been open for `timeout`.
+        pub fn wait_idle_connections(
+            &self,
+            timeout: Duration,
+        ) -> impl Future<Output = ()> + Send + use<> {
+            let mut connections = self.open_connections.subscribe();
+            async move {
+                // Start the idle timer after the first connection.
+                connections.changed().await.unwrap();
+                loop {
+                    connections.wait_for(|n| *n == 0).await.unwrap();
+                    tokio::select! {
+                        _ = tokio::time::sleep(timeout) => return,
+                        _ = connections.changed() => {
+                            // New connection was opened, reset the idle timer.
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Flags this state as done spawning tasks and returns a future which
+        /// will resolve when all active tasks have completed, if any.
+        pub fn close(&self) -> Option<impl Future<Output = ()> + '_> {
+            let mut state = self.state.lock().unwrap();
+            state.notify_when_done = true;
+            if state.active_tasks == 0 {
+                None
+            } else {
+                Some(self.complete.notified())
+            }
+        }
+
+        /// Initiate a graceful shutdown request.
+        ///
+        /// This will cause futures returned by `.requested` to resolve and will
+        /// cause all future calls to `requested` to immediately resolve.
+        pub fn request_shutdown(&self) {
+            self.state.lock().unwrap().shutdown_requested = true;
+            self.requested.notify_waiters();
+        }
+
+        /// Wait for a graceful shutdown request to be received.
+        ///
+        /// This will return a future that resolves immediately if a shutdown
+        /// has already been requested, or otherwise the future will wait for
+        /// such a shutdown request to happen.
+        pub fn requested(&self) -> impl Future<Output = ()> + '_ {
+            let state = self.state.lock().unwrap();
+            let requested = state.shutdown_requested;
+            let notified = self.requested.notified();
+            async move {
+                if !requested {
+                    notified.await;
+                }
+            }
+        }
     }
 }
 
@@ -897,15 +1246,18 @@ impl Drop for EpochThread {
 
 type WriteProfile = Box<dyn FnOnce(StoreContextMut<Host>) + Send>;
 
-fn setup_epoch_handler(
-    cmd: &ServeCommand,
-    store: &mut Store<Host>,
-    component: Component,
-) -> Result<WriteProfile> {
+fn setup_epoch_handler(state: &HostHandlerState, store: &mut Store<Host>) -> Result<WriteProfile> {
+    let cmd = &state.cmd;
     // Profiling Enabled
     if let Some(Profile::Guest { interval, path }) = &cmd.run.profile {
         #[cfg(feature = "profiling")]
-        return setup_guest_profiler(store, path.clone(), *interval, component.clone());
+        {
+            let modules = state
+                .guest_profiler_modules
+                .as_ref()
+                .expect("modules are prepared when guest profiling is enabled");
+            return setup_guest_profiler(store, path.clone(), *interval, modules);
+        }
         #[cfg(not(feature = "profiling"))]
         {
             let _ = (path, interval);
@@ -914,8 +1266,9 @@ fn setup_epoch_handler(
     }
 
     // Profiling disabled but there's a global request timeout
-    if cmd.run.common.wasm.timeout.is_some() {
+    if cmd.run.common.wasm.timeout.is_some() || cmd.run.common.debug.debugger.is_some() {
         store.epoch_deadline_async_yield_and_update(1);
+        store.set_epoch_deadline(1);
     }
 
     Ok(Box::new(|_store| {}))
@@ -926,22 +1279,20 @@ fn setup_guest_profiler(
     store: &mut Store<Host>,
     path: String,
     interval: Duration,
-    component: Component,
+    modules: &wasmtime::GuestProfilerModules,
 ) -> Result<WriteProfile> {
     use wasmtime::{AsContext, GuestProfiler, StoreContext, StoreContextMut};
 
     let module_name = "<main>";
 
-    store.data_mut().guest_profiler = Some(Arc::new(GuestProfiler::new_component(
-        store.engine(),
+    store.data_mut().guest_profiler = Some(Arc::new(GuestProfiler::new_with_modules(
         module_name,
         interval,
-        component,
-        std::iter::empty(),
-    )?));
+        modules,
+    )));
 
     fn sample(
-        mut store: StoreContextMut<Host>,
+        mut store: wasmtime::StoreHookState<Host>,
         f: impl FnOnce(&mut GuestProfiler, StoreContext<Host>),
     ) {
         let mut profiler = store.data_mut().guest_profiler.take().unwrap();
@@ -986,310 +1337,173 @@ fn setup_guest_profiler(
     Ok(write_profile)
 }
 
-/// Build a minimal error response with an empty body.
-fn error_response(status: StatusCode) -> hyper::Response<UnsyncBoxBody<Bytes, wasmtime::Error>> {
-    Response::builder()
-        .status(status)
-        .body(
-            http_body_util::Empty::new()
-                .map_err(|_| unreachable!())
-                .boxed_unsync(),
-        )
-        .unwrap()
-}
+type Request = hyper::Request<hyper::body::Incoming>;
 
-/// Debuggee body for `wasmtime serve -g`: instantiate the HTTP component
-/// once, then handle requests sequentially on a single store.
-#[cfg(feature = "debug")]
-async fn debug_serve_body(
-    store: &mut Store<Host>,
-    proxy_pre: wasmtime_wasi_http::p2::bindings::ProxyPre<Host>,
-    addr: SocketAddr,
-) -> Result<()> {
-    use hyper::server::conn::http1;
-    use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
-    use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+async fn handle_client(
+    client: impl AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+    handler: &ProxyHandler<HostHandlerState>,
+    shutdown: &GracefulShutdown,
+    debuggee_store: Option<&mut Store<Host>>,
+) {
+    // Hyper's `service_fn` takes an `Fn` closure, so to bridge the need to
+    // transfer a mutable store to each request for debugging a tokio mutex is
+    // used. The tokio mutex is required as the returned future must also be
+    // `Send`.
+    let lock = &debuggee_store.map(tokio::sync::Mutex::new);
 
-    type P2Response = std::result::Result<
-        hyper::Response<HyperOutgoingBody>,
-        wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
-    >;
-
-    let engine_clone = store.engine().clone();
-    let _epoch_thread = std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_millis(1));
-            engine_clone.increment_epoch();
-        }
-    });
-
-    store.epoch_deadline_async_yield_and_update(1);
-
-    // Instantiate the HTTP component once.
-    let proxy = proxy_pre.instantiate_async(&mut *store).await?;
-
-    // Bind the TCP listener.
-    let socket = match addr {
-        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-    };
-    socket.set_reuseaddr(!cfg!(windows))?;
-    socket.bind(addr)?;
-    let listener = socket.listen(100)?;
-    eprintln!("Serving HTTP on http://{}/", listener.local_addr()?);
-
-    // Accept loop: handle one connection at a time, requests sequentially.
-    loop {
-        let (stream, _) = listener.accept().await?;
-        stream.set_nodelay(true)?;
-        let stream = TokioIo::new(stream);
-
-        // Channel to bridge hyper's service_fn with our sequential
-        // request processing on the single store.
-        type RespBody = hyper::Response<UnsyncBoxBody<Bytes, wasmtime::Error>>;
-        let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<(
-            hyper::Request<hyper::body::Incoming>,
-            tokio::sync::oneshot::Sender<std::result::Result<RespBody, Infallible>>,
-        )>(1);
-
-        let serve_conn = http1::Builder::new().keep_alive(true).serve_connection(
-            stream,
-            hyper::service::service_fn(move |req| {
-                let req_tx = req_tx.clone();
-                async move {
-                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                    if req_tx.send((req, resp_tx)).await.is_err() {
-                        return Ok::<_, Infallible>(error_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                        ));
-                    }
-                    resp_rx
-                        .await
-                        .unwrap_or(Ok(error_response(StatusCode::SERVICE_UNAVAILABLE)))
-                }
-            }),
-        );
-
-        tokio::pin!(serve_conn);
-
-        loop {
-            tokio::select! {
-                result = &mut serve_conn => {
-                    if let Err(e) = result {
-                        eprintln!("connection error: {e:?}");
-                    }
-                    break;
-                }
-                msg = req_rx.recv() => {
-                    let Some((req, resp_tx)) = msg else { break };
-
-                    let (p2_tx, p2_rx) = tokio::sync::oneshot::channel::<P2Response>();
-                    let wasi_req = store
-                        .data_mut()
-                        .http()
-                        .new_incoming_request(Scheme::Http, req);
-                    let wasi_out = wasi_req.and_then(|_req| {
-                        let out = store.data_mut().http().new_response_outparam(p2_tx);
-                        out.map(|out| (_req, out))
-                    });
-                    let (wasi_req, wasi_out) = match wasi_out {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            eprintln!("error creating WASI request: {e:?}");
-                            let _ = resp_tx.send(Ok(error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            )));
-                            continue;
-                        }
-                    };
-
-                    if let Err(e) = proxy
-                        .wasi_http_incoming_handler()
-                        .call_handle(&mut *store, wasi_req, wasi_out)
-                        .await
-                    {
-                        eprintln!("handler error: {e:?}");
-                    }
-
-                    let resp = match p2_rx.await {
-                        Ok(Ok(resp)) => resp.map(|body| {
-                            body.map_err(|e| e.into()).boxed_unsync()
-                        }),
-                        Ok(Err(e)) => {
-                            eprintln!("component error: {e:?}");
-                            error_response(StatusCode::INTERNAL_SERVER_ERROR)
-                        }
-                        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR),
-                    };
-                    let _ = resp_tx.send(Ok(resp));
+    let conn = http1::Builder::new().keep_alive(true).serve_connection(
+        TokioIo::new(client),
+        hyper::service::service_fn(move |req| async move {
+            let mut debuggee_store = match &lock {
+                Some(store) => Some(store.lock().await),
+                None => None,
+            };
+            let debuggee_store = debuggee_store.as_mut().map(|s| &mut ***s);
+            match handle_request(handler, debuggee_store, req).await {
+                Ok(r) => Ok::<_, Infallible>(r),
+                Err(e) => {
+                    eprintln!("error: {e:?}");
+                    let status = e
+                        .downcast_ref::<ErrorResponse>()
+                        .map(|e| e.status())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let error_html = format!(
+                        "\
+<!doctype html>
+<html>
+<head>
+    <title>{status}</title>
+</head>
+<body>
+    <center>
+        <h1>{status}</h1>
+        <hr>
+        wasmtime
+    </center>
+</body>
+</html>"
+                    );
+                    Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", "text/html; charset=UTF-8")
+                        .body(
+                            Full::new(bytes::Bytes::from(error_html))
+                                .map_err(|_| unreachable!())
+                                .boxed_unsync(),
+                        )
+                        .unwrap())
                 }
             }
+        }),
+    );
+    let mut conn = std::pin::pin!(conn);
+
+    // Use hyper's built-in support for graceful shutdown whenever the server
+    // here gets a shutdown request.
+    let result = tokio::select! {
+        result = conn.as_mut() => result,
+        _ = shutdown.requested() => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
         }
+    };
+    if let Err(e) = result {
+        eprintln!("error: {e:?}");
     }
 }
 
-type Request = hyper::Request<hyper::body::Incoming>;
-
 async fn handle_request(
-    handler: ProxyHandler<HostHandlerState>,
-    req: Request,
-) -> Result<hyper::Response<UnsyncBoxBody<Bytes, wasmtime::Error>>> {
-    use tokio::sync::oneshot;
+    handler: &ProxyHandler<HostHandlerState>,
+    debuggee_store: Option<&mut Store<Host>>,
+    mut req: Request,
+) -> Result<hyper::Response<wasmtime_wasi_http::WasiBody>> {
+    // This is used to throttle the maximum number of concurrent requests that
+    // can be processed at any one point in time before delegating to
+    // `handler.handle(...)` below.
+    let _request_permit = handler.state().sem_requests.acquire().await?;
 
-    let req_id = handler.next_req_id();
+    handler.state().request_headers.apply(req.headers_mut());
 
+    let request_id = handler
+        .state()
+        .next_request_id
+        .fetch_add(1, Ordering::Relaxed);
     log::info!(
-        "Request {req_id} handling {} to {}",
+        "Received request {request_id}: {} {}",
         req.method(),
         req.uri()
     );
 
-    // Here we must declare different channel types for p2 and p3 since p2's
-    // `WasiHttpView::new_response_outparam` expects a specific kind of sender
-    // that uses `p2::http::types::ErrorCode`, and we don't want to have to
-    // convert from the p3 `ErrorCode` to the p2 one, only to convert again to
-    // `wasmtime::Error`.
+    let req = req.map(|body| body.map_err(|e| e.into()).boxed_unsync());
 
-    type P2Response = Result<
-        hyper::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
-        p2::http::types::ErrorCode,
-    >;
-    type P3Response = hyper::Response<UnsyncBoxBody<Bytes, wasmtime::Error>>;
-
-    enum Sender {
-        P2(oneshot::Sender<P2Response>),
-        P3(oneshot::Sender<P3Response>),
-    }
-
-    enum Receiver {
-        P2(oneshot::Receiver<P2Response>),
-        P3(oneshot::Receiver<P3Response>),
-    }
-
-    let (tx, rx) = match handler.instance_pre() {
-        ProxyPre::P2(_) => {
-            let (tx, rx) = oneshot::channel();
-            (Sender::P2(tx), Receiver::P2(rx))
+    match debuggee_store {
+        // For debugging go ahead and synchronously execute the instance here
+        // in a single instance. This is debugging-specific to use the store
+        // passed in.
+        Some(store) => {
+            let instance = handler.state().instantiate_into(store).await?;
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let prepared = Prepared::new(
+                store.as_context_mut(),
+                &instance,
+                req,
+                wasmtime_wasi_http::WasiHttpView::http,
+                tx,
+            )?;
+            store
+                .run_concurrent(async |store| prepared.run(store, std::future::pending()).await)
+                .await??;
+            rx.await?
         }
-        ProxyPre::P3(_) => {
-            let (tx, rx) = oneshot::channel();
-            (Sender::P3(tx), Receiver::P3(rx))
-        }
-    };
 
-    handler.spawn(
-        if handler.state().max_instance_reuse_count() == 1 {
-            Some(req_id)
-        } else {
-            None
-        },
-        Box::new(move |store, proxy| {
-            Box::pin(
-                async move {
-                    match proxy {
-                        Proxy::P2(proxy) => {
-                            let Sender::P2(tx) = tx else { unreachable!() };
-                            let (req, out) = store.with(move |mut store| {
-                                let req = store
-                                    .data_mut()
-                                    .http()
-                                    .new_incoming_request(p2::http::types::Scheme::Http, req)?;
-                                let out = store.data_mut().http().new_response_outparam(tx)?;
-                                wasmtime::error::Ok((req, out))
-                            })?;
+        // For when debugging is disabled delegate to the default handling path.
+        None => handler.handle(request_id, req).await,
+    }
+}
 
-                            proxy
-                                .wasi_http_incoming_handler()
-                                .call_handle(store, req, out)
-                                .await
-                        }
-                        Proxy::P3(proxy) => {
-                            use wasmtime_wasi_http::p3::bindings::http::types::{
-                                ErrorCode, Request,
-                            };
+#[derive(Clone, Default)]
+struct RequestHeaders {
+    entries: Vec<(HeaderName, HeaderValue)>,
+}
 
-                            let Sender::P3(tx) = tx else { unreachable!() };
-                            let (req, body) = req.into_parts();
-                            let body = body.map_err(ErrorCode::from_hyper_request_error);
-                            let req = http::Request::from_parts(req, body);
-                            let (request, request_io_result) = Request::from_http(req);
-                            let res = proxy.handle(store, request).await??;
-                            let res = store
-                                .with(|mut store| res.into_http(&mut store, request_io_result))?;
-
-                            // With the guest response now transformed into a
-                            // host-compatible response layer one more wrapper
-                            // around the body. This layer is solely responsible
-                            // for dropping a channel half on destruction, and
-                            // this enables waiting here until the body is
-                            // consumed by waiting for this destruction to
-                            // happen.
-                            let (resp_body_tx, resp_body_rx) = oneshot::channel();
-                            let res = res.map(|body| {
-                                let body = body.map_err(|e| e.into());
-                                P3BodyWrapper {
-                                    _tx: resp_body_tx,
-                                    body,
-                                }
-                                .boxed_unsync()
-                            });
-
-                            // If `wasmtime serve` is waiting on this response
-                            // and actually got it then wait for the body to
-                            // finish, otherwise it's thrown away so skip that
-                            // step.
-                            if tx.send(res).is_ok() {
-                                _ = resp_body_rx.await;
-                            }
-
-                            Ok(())
-                        }
-                    }
+impl RequestHeaders {
+    fn parse(headers: &[String]) -> Result<Self> {
+        let mut entries = Vec::new();
+        for header in headers {
+            if let Some(path) = header.strip_prefix('@') {
+                let contents = std::fs::read_to_string(path)
+                    .with_context(|| format!("failed to read header file `{path}`"))?;
+                for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+                    entries.push(parse_header(line)?);
                 }
-                .map(move |result| {
-                    if let Err(error) = result {
-                        eprintln!("[{req_id}] :: {error:?}");
-                    }
-                }),
-            )
-        }),
-    );
-
-    return Ok(match rx {
-        Receiver::P2(rx) => rx
-            .await
-            .context("guest never invoked `response-outparam::set` method")?
-            .map_err(|e| wasmtime::Error::from(e))?
-            .map(|body| body.map_err(|e| e.into()).boxed_unsync()),
-        Receiver::P3(rx) => rx.await?,
-    });
-
-    // Forwarding implementation of `Body` to an inner `B` with the sole purpose
-    // of carrying `_tx` to its destruction.
-    struct P3BodyWrapper<B> {
-        body: B,
-        _tx: oneshot::Sender<()>,
+            } else {
+                entries.push(parse_header(header)?);
+            }
+        }
+        Ok(Self { entries })
     }
 
-    impl<B: Body + Unpin> Body for P3BodyWrapper<B> {
-        type Data = B::Data;
-        type Error = B::Error;
-
-        fn poll_frame(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            Pin::new(&mut self.body).poll_frame(cx)
+    fn apply(&self, headers: &mut HeaderMap) {
+        // Remove all request-provided values before appending CLI-provided
+        // values so repeated CLI headers with the same name are preserved.
+        for name in self.entries.iter().map(|(name, _)| name) {
+            headers.remove(name);
         }
-
-        fn is_end_stream(&self) -> bool {
-            self.body.is_end_stream()
-        }
-
-        fn size_hint(&self) -> SizeHint {
-            self.body.size_hint()
+        for (name, value) in &self.entries {
+            headers.append(name, value.clone());
         }
     }
+}
+
+fn parse_header(header: &str) -> Result<(HeaderName, HeaderValue)> {
+    let (name, value) = header
+        .split_once(':')
+        .with_context(|| format!("header `{header}` is missing `:`"))?;
+    let name = HeaderName::from_bytes(name.trim().as_bytes())
+        .with_context(|| format!("invalid header name in header `{header}`"))?;
+    let value = HeaderValue::from_str(value.trim_start())
+        .with_context(|| format!("invalid header value in header `{header}`"))?;
+    Ok((name, value))
 }
 
 #[derive(Clone)]
@@ -1393,7 +1607,7 @@ impl wasmtime_wasi::p2::OutputStream for LogStream {
     }
 
     fn check_write(&mut self) -> StreamResult<usize> {
-        Ok(1024 * 1024)
+        Ok(64 * 1024)
     }
 }
 
@@ -1415,6 +1629,79 @@ impl AsyncWrite for LogStream {
     }
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+enum SocketServer {
+    Tcp(TcpListener),
+    #[allow(dead_code, reason = "not used on all platforms")]
+    Platform(PlatformListener),
+}
+
+impl SocketServer {
+    async fn accept(&self) -> Result<ClientSocket> {
+        Ok(match self {
+            SocketServer::Tcp(listener) => {
+                let (stream, _) = listener.accept().await?;
+                // The Nagle algorithm can impose a significant latency penalty
+                // (e.g. 40ms on Linux) on guests which write small, intermittent
+                // response body chunks (e.g. SSE streams).  Here we disable that
+                // algorithm and rely on the guest to buffer if appropriate to avoid
+                // TCP fragmentation.
+                stream.set_nodelay(true)?;
+
+                ClientSocket::Tcp(stream)
+            }
+            SocketServer::Platform(listener) => {
+                let (stream, _) = listener.accept().await?;
+                ClientSocket::Platform(stream)
+            }
+        })
+    }
+}
+
+enum ClientSocket {
+    Tcp(TcpStream),
+    Platform(PlatformStream),
+}
+
+impl AsyncRead for ClientSocket {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            ClientSocket::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            ClientSocket::Platform(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ClientSocket {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            ClientSocket::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            ClientSocket::Platform(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            ClientSocket::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            ClientSocket::Platform(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            ClientSocket::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            ClientSocket::Platform(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
     }
 }
 
@@ -1449,10 +1736,176 @@ fn use_pooling_allocator_by_default() -> Result<Option<bool>> {
     let mut store = Store::new(&engine, ());
     // NB: the maximum size is in wasm pages to take out the 16-bits of wasm
     // page size here from the maximum size.
-    let ty = MemoryType::new64(0, Some(1 << (BITS_TO_TEST - 16)));
+    let ty = MemoryType::new64(0, Some(1 << (BITS_TO_TEST - 16)))?;
     if Memory::new(&mut store, ty).is_ok() {
         Ok(Some(true))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(unix)]
+use unix::*;
+#[cfg(unix)]
+mod unix {
+    use super::SocketServer;
+    use rustix::fs::{FileType, fstat};
+    use rustix::net::{AddressFamily, SocketType, getsockname, sockopt::socket_type};
+    use std::mem::ManuallyDrop;
+    use std::net::TcpListener;
+    use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::net::UnixListener;
+    use std::{env, process};
+    use wasmtime::{Result, bail};
+
+    pub use tokio::net::UnixListener as PlatformListener;
+    pub use tokio::net::UnixStream as PlatformStream;
+
+    #[derive(Default)]
+    pub struct InheritedSockets {
+        sockets: Vec<InheritedSocket>,
+    }
+
+    enum InheritedSocket {
+        Tcp(TcpListener),
+        Unix(UnixListener),
+    }
+
+    impl InheritedSockets {
+        /// Takes ownership of file descriptors this process has inherited from a parent process like a
+        /// service manager.
+        ///
+        /// These are looked up with the [protocol from systemd](https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html#Notes).
+        /// This is used to implement socket activation for `wasmtime serve`.
+        ///
+        /// ## Safety
+        ///
+        /// This function takes ownership of raw file descriptors and must be called before any other
+        /// file descriptors are opened.
+        pub unsafe fn inherit_sockets(&mut self) -> Result<()> {
+            // The logic here is taken from https://github.com/systemd/systemd/blob/main/src/libsystemd/sd-daemon/sd-daemon.c.
+            if !env::var("LISTEN_PID")
+                .ok()
+                .and_then(|pid| pid.parse().ok())
+                .is_some_and(|pid: u32| pid == process::id())
+            {
+                bail!("Missing or mismatched LISTEN_PID environment variable");
+            }
+
+            let Some(num_fds) = env::var("LISTEN_FDS")
+                .ok()
+                .and_then(|fds| fds.parse().ok())
+                .take_if(|e| *e >= 1)
+            else {
+                bail!("Missing or invalid LISTEN_FDS environment variable");
+            };
+
+            let first_fd: RawFd = 3;
+            let Some(last_fd) = first_fd.checked_add(num_fds) else {
+                bail!("Invalid amount of file descriptors in LISTEN_FDS");
+            };
+
+            // We want to take ownership of all file descriptors here, but only use the first socket to
+            // listen on it.
+            for fd in first_fd..last_fd {
+                // SAFETY: CLI configuration has indicated that `fd` is probably
+                // owned by us, but we're also not entirely sure of that yet.
+                // The `OwnedFd` is wrapped in `ManuallyDrop` to avoid dropping
+                // it while it's tested below.
+                let mut fd = ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(fd) });
+
+                // Set the close-on-exec flag, matching libsystemd.
+                #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+                rustix::io::ioctl_fioclex(&*fd)?;
+
+                // Check if this file descriptor is a TCP socket.
+                let stat = fstat(&*fd)?;
+                if !FileType::from_raw_mode(stat.st_mode).is_socket() {
+                    continue;
+                }
+
+                if socket_type(&*fd)? != SocketType::STREAM {
+                    continue;
+                }
+
+                // SAFETY: we've done all the checks we can to determine that
+                // `fd` is indeed valid. This function's own unsafe contract
+                // means that we're running very early on in the program, so at
+                // this point it by all means should be safe to take this fd. If
+                // it's not then that's a bug of the CLI configuration
+                // effectively.
+                let fd = unsafe { ManuallyDrop::take(&mut fd) };
+
+                let address_family = getsockname(&fd)?.address_family();
+                let this_listener = if address_family == AddressFamily::INET
+                    || address_family == AddressFamily::INET6
+                {
+                    let listener = TcpListener::from(fd);
+                    listener.set_nonblocking(true)?;
+                    InheritedSocket::Tcp(listener)
+                } else if address_family == AddressFamily::UNIX {
+                    let listener = UnixListener::from(fd);
+                    listener.set_nonblocking(true)?;
+                    InheritedSocket::Unix(listener)
+                } else {
+                    continue;
+                };
+                self.sockets.push(this_listener);
+            }
+
+            if self.sockets.is_empty() {
+                bail!("No socket inherited")
+            }
+
+            Ok(())
+        }
+
+        pub fn take(&mut self) -> Result<Option<Vec<SocketServer>>> {
+            if self.sockets.is_empty() {
+                return Ok(None);
+            }
+            self.sockets
+                .drain(..)
+                .map(|socket| match socket {
+                    InheritedSocket::Tcp(listener) => Ok(SocketServer::Tcp(
+                        tokio::net::TcpListener::from_std(listener)?,
+                    )),
+                    InheritedSocket::Unix(listener) => Ok(SocketServer::Platform(
+                        tokio::net::UnixListener::from_std(listener)?,
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Some)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+use not_unix::*;
+#[cfg(not(unix))]
+mod not_unix {
+    use super::SocketServer;
+    use wasmtime::{Result, bail};
+
+    pub use tokio::io::Empty as PlatformStream;
+
+    #[derive(Default)]
+    pub struct InheritedSockets;
+
+    impl InheritedSockets {
+        pub unsafe fn inherit_sockets(&mut self) -> Result<()> {
+            bail!("The --listenfd option is not available on this platform")
+        }
+        pub fn take(&mut self) -> Result<Option<Vec<SocketServer>>> {
+            Ok(None)
+        }
+    }
+
+    pub enum PlatformListener {}
+
+    impl PlatformListener {
+        pub async fn accept(&self) -> Result<(PlatformStream, ())> {
+            match *self {}
+        }
     }
 }

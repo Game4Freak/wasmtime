@@ -9,6 +9,7 @@
 //! `funcref` we got from inside the GC heap.
 
 use crate::{
+    Result, bail_bug,
     hash_map::HashMap,
     type_registry::TypeRegistry,
     vm::{SendSyncPtr, VMFuncRef},
@@ -21,18 +22,21 @@ use wasmtime_environ::VMSharedTypeIndex;
 
 /// An identifier into the `FuncRefTable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(transparent)]
 pub struct FuncRefTableId(Id);
 
 impl FuncRefTableId {
-    /// Convert this `FuncRefTableId` into its raw `u32` ID.
+    /// Get the raw `u32` to store in the GC heap for this ID.
     pub fn into_raw(self) -> u32 {
-        self.0.into_raw()
+        self.0.into_raw() + 1
     }
 
-    /// Create a `FuncRefTableId` from a raw `u32` ID.
-    pub fn from_raw(raw: u32) -> Self {
-        Self(Id::from_raw(raw))
+    /// Resolve a raw ID loaded from the GC heap, if it is well-formed.
+    ///
+    /// A well-formed ID is not necessarily one this table has handed out;
+    /// `get_typed` and `get_untyped` still check their lookups.
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        let id = raw.checked_sub(1)?;
+        Some(Self(Id::try_from_raw(id)?))
     }
 }
 
@@ -67,8 +71,10 @@ impl FuncRefTable {
         types: &TypeRegistry,
         id: FuncRefTableId,
         expected_ty: VMSharedTypeIndex,
-    ) -> Option<SendSyncPtr<VMFuncRef>> {
-        let f = self.slab.get(id.0).copied().expect("bad FuncRefTableId");
+    ) -> Result<Option<SendSyncPtr<VMFuncRef>>> {
+        let Some(f) = self.slab.get(id.0).copied() else {
+            bail_bug!("bad FuncRefTableId")
+        };
 
         if let Some(f) = f {
             // The safety contract for `intern` ensures that deref'ing `f` is safe.
@@ -76,15 +82,17 @@ impl FuncRefTable {
 
             // Ensure that the funcref actually is a subtype of the expected
             // type. This protects against GC heap corruption being leveraged in
-            // attacks: if the attacker has a write gadget inside the GC heap, they
-            // can overwrite a funcref ID to point to a different funcref, but this
-            // assertion ensures that any calls to that wrong funcref at least
-            // remain well-typed, which reduces the attack surface and maintains
-            // memory safety.
-            assert!(types.is_subtype(actual_ty, expected_ty));
+            // attacks: if the attacker has a write gadget inside the GC heap,
+            // they can overwrite a funcref ID to point to a different funcref,
+            // but this check ensures that any calls to that wrong funcref at
+            // least remain well-typed, which reduces the attack surface and
+            // maintains memory safety.
+            if !types.is_subtype(actual_ty, expected_ty) {
+                bail_bug!("funcref table type mismatch")
+            }
         }
 
-        f
+        Ok(f)
     }
 
     /// Get the `VMFuncRef` associated with the given ID, without checking the
@@ -93,7 +101,10 @@ impl FuncRefTable {
     /// Prefer `get_typed`. This method is only suitable for getting a
     /// `VMFuncRef` as an untyped `funcref` function reference, and never as a
     /// typed `(ref $some_func_type)` function reference.
-    pub fn get_untyped(&self, id: FuncRefTableId) -> Option<SendSyncPtr<VMFuncRef>> {
-        self.slab.get(id.0).copied().expect("bad FuncRefTableId")
+    pub fn get_untyped(&self, id: FuncRefTableId) -> Result<Option<SendSyncPtr<VMFuncRef>>> {
+        match self.slab.get(id.0).copied() {
+            Some(f) => Ok(f),
+            None => bail_bug!("bad FuncRefTableId"),
+        }
     }
 }

@@ -173,7 +173,7 @@ const _: () = {
             host_getter: fn(&mut T) -> D::Data<'_>,
         ) -> wasmtime::Result<()>
         where
-            D: foo::foo::records::HostWithStore + Send,
+            D: foo::foo::records::HostWithStore<T> + Send,
             for<'a> D::Data<'a>: foo::foo::records::Host + Send,
             T: 'static + Send,
         {
@@ -196,15 +196,21 @@ pub mod foo {
             #[derive(wasmtime::component::Lower)]
             #[component(record)]
             #[derive(Clone, Copy)]
-            pub struct Empty {}
-            impl core::fmt::Debug for Empty {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                    f.debug_struct("Empty").finish()
+            pub struct Empty {
+                #[component(name = "a")]
+                pub a: u32,
+            }
+            impl ::core::fmt::Debug for Empty {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("Empty").field("a", &self.a).finish()
                 }
             }
             const _: () = {
-                assert!(0 == < Empty as wasmtime::component::ComponentType >::SIZE32);
-                assert!(1 == < Empty as wasmtime::component::ComponentType >::ALIGN32);
+                assert!(4 == < Empty as wasmtime::component::ComponentType >::SIZE32);
+                assert!(4 == < Empty as wasmtime::component::ComponentType >::ALIGN32);
             };
             /// A record containing two scalar fields
             /// that both have the same type
@@ -221,8 +227,11 @@ pub mod foo {
                 #[component(name = "b")]
                 pub b: u32,
             }
-            impl core::fmt::Debug for Scalars {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for Scalars {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     f.debug_struct("Scalars")
                         .field("a", &self.a)
                         .field("b", &self.b)
@@ -260,8 +269,11 @@ pub mod foo {
                 #[component(name = "i")]
                 pub i: bool,
             }
-            impl core::fmt::Debug for ReallyFlags {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for ReallyFlags {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     f.debug_struct("ReallyFlags")
                         .field("a", &self.a)
                         .field("b", &self.b)
@@ -300,8 +312,11 @@ pub mod foo {
                 #[component(name = "e")]
                 pub e: ReallyFlags,
             }
-            impl core::fmt::Debug for Aggregates {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for Aggregates {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     f.debug_struct("Aggregates")
                         .field("a", &self.a)
                         .field("b", &self.b)
@@ -313,7 +328,7 @@ pub mod foo {
             }
             const _: () = {
                 assert!(
-                    32 == < Aggregates as wasmtime::component::ComponentType >::SIZE32
+                    36 == < Aggregates as wasmtime::component::ComponentType >::SIZE32
                 );
                 assert!(
                     4 == < Aggregates as wasmtime::component::ComponentType >::ALIGN32
@@ -368,8 +383,11 @@ pub mod foo {
                     >,
                 >,
             }
-            impl core::fmt::Debug for FuturesAndStreams {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for FuturesAndStreams {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     f.debug_struct("FuturesAndStreams")
                         .field("a", &self.a)
                         .field("b", &self.b)
@@ -388,10 +406,10 @@ pub mod foo {
                     >::ALIGN32
                 );
             };
-            pub trait HostWithStore: wasmtime::component::HasData + Send {}
-            impl<_T: ?Sized> HostWithStore for _T
+            pub trait HostWithStore<T>: wasmtime::component::HasData + Send {}
+            impl<H: ?Sized, T> HostWithStore<T> for H
             where
-                _T: wasmtime::component::HasData + Send,
+                H: wasmtime::component::HasData + Send,
             {}
             pub trait Host: Send {
                 fn tuple_arg(
@@ -497,16 +515,15 @@ pub mod foo {
                     async move { Host::typedef_inout(*self, e).await }
                 }
             }
-            pub fn add_to_linker<T, D>(
-                linker: &mut wasmtime::component::Linker<T>,
+            pub fn add_to_linker_instance<T, D>(
+                inst: &mut wasmtime::component::LinkerInstance<'_, T>,
                 host_getter: fn(&mut T) -> D::Data<'_>,
             ) -> wasmtime::Result<()>
             where
-                D: HostWithStore,
+                D: HostWithStore<T>,
                 for<'a> D::Data<'a>: Host,
                 T: 'static + Send,
             {
-                let mut inst = linker.instance("foo:foo/records")?;
                 inst.func_wrap_async(
                     "tuple-arg",
                     move |
@@ -637,6 +654,18 @@ pub mod foo {
                 )?;
                 Ok(())
             }
+            pub fn add_to_linker<T, D>(
+                linker: &mut wasmtime::component::Linker<T>,
+                host_getter: fn(&mut T) -> D::Data<'_>,
+            ) -> wasmtime::Result<()>
+            where
+                D: HostWithStore<T>,
+                for<'a> D::Data<'a>: Host,
+                T: 'static + Send,
+            {
+                let mut inst = linker.instance("foo:foo/records")?;
+                add_to_linker_instance::<T, D>(&mut inst, host_getter)
+            }
         }
     }
 }
@@ -652,21 +681,24 @@ pub mod exports {
                 #[derive(wasmtime::component::Lower)]
                 #[component(record)]
                 #[derive(Clone, Copy)]
-                pub struct Empty {}
-                impl core::fmt::Debug for Empty {
+                pub struct Empty {
+                    #[component(name = "a")]
+                    pub a: u32,
+                }
+                impl ::core::fmt::Debug for Empty {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
-                        f.debug_struct("Empty").finish()
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
+                        f.debug_struct("Empty").field("a", &self.a).finish()
                     }
                 }
                 const _: () = {
                     assert!(
-                        0 == < Empty as wasmtime::component::ComponentType >::SIZE32
+                        4 == < Empty as wasmtime::component::ComponentType >::SIZE32
                     );
                     assert!(
-                        1 == < Empty as wasmtime::component::ComponentType >::ALIGN32
+                        4 == < Empty as wasmtime::component::ComponentType >::ALIGN32
                     );
                 };
                 /// A record containing two scalar fields
@@ -684,11 +716,11 @@ pub mod exports {
                     #[component(name = "b")]
                     pub b: u32,
                 }
-                impl core::fmt::Debug for Scalars {
+                impl ::core::fmt::Debug for Scalars {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         f.debug_struct("Scalars")
                             .field("a", &self.a)
                             .field("b", &self.b)
@@ -730,11 +762,11 @@ pub mod exports {
                     #[component(name = "i")]
                     pub i: bool,
                 }
-                impl core::fmt::Debug for ReallyFlags {
+                impl ::core::fmt::Debug for ReallyFlags {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         f.debug_struct("ReallyFlags")
                             .field("a", &self.a)
                             .field("b", &self.b)
@@ -775,11 +807,11 @@ pub mod exports {
                     #[component(name = "e")]
                     pub e: ReallyFlags,
                 }
-                impl core::fmt::Debug for Aggregates {
+                impl ::core::fmt::Debug for Aggregates {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         f.debug_struct("Aggregates")
                             .field("a", &self.a)
                             .field("b", &self.b)
@@ -791,7 +823,7 @@ pub mod exports {
                 }
                 const _: () = {
                     assert!(
-                        32 == < Aggregates as wasmtime::component::ComponentType
+                        36 == < Aggregates as wasmtime::component::ComponentType
                         >::SIZE32
                     );
                     assert!(
@@ -853,11 +885,11 @@ pub mod exports {
                         >,
                     >,
                 }
-                impl core::fmt::Debug for FuturesAndStreams {
+                impl ::core::fmt::Debug for FuturesAndStreams {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         f.debug_struct("FuturesAndStreams")
                             .field("a", &self.a)
                             .field("b", &self.b)
@@ -922,7 +954,7 @@ pub mod exports {
                                     "no exported instance named `foo:foo/records`"
                                 )
                             })?;
-                        let mut lookup = move |name| {
+                        let mut lookup = move |name: &str| {
                             _instance_pre
                                 .component()
                                 .get_export_index(Some(&instance), name)
@@ -1048,6 +1080,16 @@ pub mod exports {
                     }
                 }
                 impl Guest {
+                    pub fn func_tuple_arg(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<((char, u32),), ()> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                ((char, u32),),
+                                (),
+                            >::new_unchecked(self.tuple_arg)
+                        }
+                    }
                     pub async fn call_tuple_arg<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
@@ -1056,16 +1098,21 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                ((char, u32),),
-                                (),
-                            >::new_unchecked(self.tuple_arg)
-                        };
+                        let callee = self.func_tuple_arg();
                         let () = callee
                             .call_async(store.as_context_mut(), (arg0,))
                             .await?;
                         Ok(())
+                    }
+                    pub fn func_tuple_result(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), ((char, u32),)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                ((char, u32),),
+                            >::new_unchecked(self.tuple_result)
+                        }
                     }
                     pub async fn call_tuple_result<S: wasmtime::AsContextMut>(
                         &self,
@@ -1074,16 +1121,21 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                ((char, u32),),
-                            >::new_unchecked(self.tuple_result)
-                        };
+                        let callee = self.func_tuple_result();
                         let (ret0,) = callee
                             .call_async(store.as_context_mut(), ())
                             .await?;
                         Ok(ret0)
+                    }
+                    pub fn func_empty_arg(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(Empty,), ()> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (Empty,),
+                                (),
+                            >::new_unchecked(self.empty_arg)
+                        }
                     }
                     pub async fn call_empty_arg<S: wasmtime::AsContextMut>(
                         &self,
@@ -1093,16 +1145,21 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (Empty,),
-                                (),
-                            >::new_unchecked(self.empty_arg)
-                        };
+                        let callee = self.func_empty_arg();
                         let () = callee
                             .call_async(store.as_context_mut(), (arg0,))
                             .await?;
                         Ok(())
+                    }
+                    pub fn func_empty_result(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (Empty,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (Empty,),
+                            >::new_unchecked(self.empty_result)
+                        }
                     }
                     pub async fn call_empty_result<S: wasmtime::AsContextMut>(
                         &self,
@@ -1111,16 +1168,21 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (Empty,),
-                            >::new_unchecked(self.empty_result)
-                        };
+                        let callee = self.func_empty_result();
                         let (ret0,) = callee
                             .call_async(store.as_context_mut(), ())
                             .await?;
                         Ok(ret0)
+                    }
+                    pub fn func_scalar_arg(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(Scalars,), ()> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (Scalars,),
+                                (),
+                            >::new_unchecked(self.scalar_arg)
+                        }
                     }
                     pub async fn call_scalar_arg<S: wasmtime::AsContextMut>(
                         &self,
@@ -1130,16 +1192,21 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (Scalars,),
-                                (),
-                            >::new_unchecked(self.scalar_arg)
-                        };
+                        let callee = self.func_scalar_arg();
                         let () = callee
                             .call_async(store.as_context_mut(), (arg0,))
                             .await?;
                         Ok(())
+                    }
+                    pub fn func_scalar_result(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (Scalars,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (Scalars,),
+                            >::new_unchecked(self.scalar_result)
+                        }
                     }
                     pub async fn call_scalar_result<S: wasmtime::AsContextMut>(
                         &self,
@@ -1148,16 +1215,21 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (Scalars,),
-                            >::new_unchecked(self.scalar_result)
-                        };
+                        let callee = self.func_scalar_result();
                         let (ret0,) = callee
                             .call_async(store.as_context_mut(), ())
                             .await?;
                         Ok(ret0)
+                    }
+                    pub fn func_flags_arg(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(ReallyFlags,), ()> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (ReallyFlags,),
+                                (),
+                            >::new_unchecked(self.flags_arg)
+                        }
                     }
                     pub async fn call_flags_arg<S: wasmtime::AsContextMut>(
                         &self,
@@ -1167,16 +1239,21 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (ReallyFlags,),
-                                (),
-                            >::new_unchecked(self.flags_arg)
-                        };
+                        let callee = self.func_flags_arg();
                         let () = callee
                             .call_async(store.as_context_mut(), (arg0,))
                             .await?;
                         Ok(())
+                    }
+                    pub fn func_flags_result(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (ReallyFlags,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (ReallyFlags,),
+                            >::new_unchecked(self.flags_result)
+                        }
                     }
                     pub async fn call_flags_result<S: wasmtime::AsContextMut>(
                         &self,
@@ -1185,16 +1262,21 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (ReallyFlags,),
-                            >::new_unchecked(self.flags_result)
-                        };
+                        let callee = self.func_flags_result();
                         let (ret0,) = callee
                             .call_async(store.as_context_mut(), ())
                             .await?;
                         Ok(ret0)
+                    }
+                    pub fn func_aggregate_arg(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(&Aggregates,), ()> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (&Aggregates,),
+                                (),
+                            >::new_unchecked(self.aggregate_arg)
+                        }
                     }
                     pub async fn call_aggregate_arg<S: wasmtime::AsContextMut>(
                         &self,
@@ -1204,16 +1286,21 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (&Aggregates,),
-                                (),
-                            >::new_unchecked(self.aggregate_arg)
-                        };
+                        let callee = self.func_aggregate_arg();
                         let () = callee
                             .call_async(store.as_context_mut(), (arg0,))
                             .await?;
                         Ok(())
+                    }
+                    pub fn func_aggregate_result(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (Aggregates,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (Aggregates,),
+                            >::new_unchecked(self.aggregate_result)
+                        }
                     }
                     pub async fn call_aggregate_result<S: wasmtime::AsContextMut>(
                         &self,
@@ -1222,16 +1309,21 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (Aggregates,),
-                            >::new_unchecked(self.aggregate_result)
-                        };
+                        let callee = self.func_aggregate_result();
                         let (ret0,) = callee
                             .call_async(store.as_context_mut(), ())
                             .await?;
                         Ok(ret0)
+                    }
+                    pub fn func_typedef_inout(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(TupleTypedef2,), (i32,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (TupleTypedef2,),
+                                (i32,),
+                            >::new_unchecked(self.typedef_inout)
+                        }
                     }
                     pub async fn call_typedef_inout<S: wasmtime::AsContextMut>(
                         &self,
@@ -1241,12 +1333,7 @@ pub mod exports {
                     where
                         <S as wasmtime::AsContext>::Data: Send,
                     {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (TupleTypedef2,),
-                                (i32,),
-                            >::new_unchecked(self.typedef_inout)
-                        };
+                        let callee = self.func_typedef_inout();
                         let (ret0,) = callee
                             .call_async(store.as_context_mut(), (arg0,))
                             .await?;

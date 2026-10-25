@@ -1,5 +1,3 @@
-use crate::Config;
-use crate::RRConfig;
 use crate::prelude::*;
 #[cfg(feature = "runtime")]
 pub use crate::runtime::code_memory::CustomCodeMemory;
@@ -7,6 +5,7 @@ pub use crate::runtime::code_memory::CustomCodeMemory;
 use crate::runtime::type_registry::TypeRegistry;
 #[cfg(feature = "runtime")]
 use crate::runtime::vm::{GcRuntime, ModuleRuntimeInfo};
+use crate::{Config, RRConfig};
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 #[cfg(target_has_atomic = "64")]
@@ -45,6 +44,24 @@ mod serialization;
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<EngineInner>,
+}
+
+// These impls are strictly not necessary but they're currently serving the
+// purpose of the reducing the recursion limit necessary to prove
+// types/futures/etc are `Send` in Wasmtime. This is related to
+// rust-lang/rust#159228.
+//
+// SAFETY: we're re-stating what rustc itself is already going to infer. The
+// `_assert_send_sync` function beneath this is intended to serve as a
+// double-assertion that this actually holds.
+unsafe impl Send for Engine {}
+unsafe impl Sync for Engine {}
+
+fn _assert_send_sync(e: &Engine) {
+    fn _assert<T: Send + Sync>(_: &T) {}
+    let Engine { inner } = e;
+    _assert(e);
+    _assert(inner);
 }
 
 struct EngineInner {
@@ -499,6 +516,7 @@ information about this check\
             | "is_pic"
             | "bb_padding_log2_minus_one"
             | "log2_min_function_alignment"
+            | "enable_compact_unwind_abi"
             | "machine_code_cfg_info"
             | "tls_model" // wasmtime doesn't use tls right now
             | "opt_level" // opt level doesn't change semantics
@@ -570,6 +588,8 @@ information about this check\
             "has_lse" => "lse",
             "has_pauth" => "paca",
             "has_fp16" => "fp16",
+            "has_dotprod" => "dotprod",
+            "has_i8mm" => "i8mm",
 
             // aarch64 features which don't need detection
             // No effect on its own.
@@ -600,6 +620,7 @@ information about this check\
             "has_avx" => "avx",
             "has_avx2" => "avx2",
             "has_fma" => "fma",
+            "has_avx_vnni" => "avxvnni",
             "has_bmi1" => "bmi1",
             "has_bmi2" => "bmi2",
             "has_avx512bitalg" => "avx512bitalg",
@@ -607,6 +628,7 @@ information about this check\
             "has_avx512f" => "avx512f",
             "has_avx512vl" => "avx512vl",
             "has_avx512vbmi" => "avx512vbmi",
+            "has_avx512vnni" => "avx512vnni",
             "has_lzcnt" => "lzcnt",
 
             // pulley features
@@ -784,6 +806,52 @@ impl Engine {
     #[cfg(feature = "pooling-allocator")]
     pub fn pooling_allocator_metrics(&self) -> Option<crate::vm::PoolingAllocatorMetrics> {
         crate::runtime::vm::PoolingAllocatorMetrics::new(self)
+    }
+
+    /// Releases memory the pooling allocator is keeping resident for slots
+    /// that are not currently in use, returning how many bytes were released.
+    ///
+    /// [`PoolingAllocationConfig::linear_memory_keep_resident`] keeps memory
+    /// resident after an instance slot is freed, in order to enable faster
+    /// instantiation on the next use of the same module. This increases
+    /// resident memory size. If an embedder knows that load has decreased and
+    /// wishes to free up memory, it might wish to purge these "warm slots".
+    ///
+    /// This method releases all resident memory held by warm but unused
+    /// slots. The tradeoff is that the next instantiation of any given module
+    /// may be slower, because no cached memory mappings are present anymore.
+    ///
+    /// Note that while this method is running the warm slots it is releasing
+    /// are unavailable for allocation. Instantiations running concurrently
+    /// with this method may therefore fail with a "maximum concurrent limit
+    /// reached" error, even if few instances are live, when the pool's other
+    /// free slots are exhausted.
+    ///
+    /// Returns 0 if this engine is not using the pooling allocator, or if
+    /// nothing was resident to release.
+    ///
+    /// [`PoolingAllocationConfig::linear_memory_keep_resident`]: crate::PoolingAllocationConfig::linear_memory_keep_resident
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use wasmtime::{Config, Engine, InstanceAllocationStrategy};
+    /// # fn main() -> wasmtime::Result<()> {
+    /// let mut config = Config::new();
+    /// config.allocation_strategy(InstanceAllocationStrategy::pooling());
+    /// let engine = Engine::new(&config)?;
+    ///
+    /// // ... once the embedder knows load has decreased ...
+    /// let _bytes = engine.release_idle_pool_memory();
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "pooling-allocator")]
+    pub fn release_idle_pool_memory(&self) -> usize {
+        match self.allocator().as_pooling() {
+            Some(pool) => pool.release_resident_unused_memory(),
+            None => 0,
+        }
     }
 
     pub(crate) fn allocator(&self) -> &dyn crate::runtime::vm::InstanceAllocator {

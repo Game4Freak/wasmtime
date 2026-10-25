@@ -1,9 +1,12 @@
 use crate::store::{Ctx, MyWasiCtx};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use test_programs_artifacts::*;
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Result, error::Context as _, format_err};
 use wasmtime_wasi::p3::bindings::Command;
+use wasmtime_wasi::{
+    FsPerms, NamedId, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiNamedView, WasiView,
+};
 
 async fn run(path: &str) -> Result<()> {
     run_allow_blocking_current_thread(path, false).await
@@ -12,6 +15,14 @@ async fn run(path: &str) -> Result<()> {
 async fn run_allow_blocking_current_thread(
     path: &str,
     allow_blocking_current_thread: bool,
+) -> Result<()> {
+    run_with_builder(path, allow_blocking_current_thread, |_| {}).await
+}
+
+async fn run_with_builder(
+    path: &str,
+    allow_blocking_current_thread: bool,
+    configure: impl FnOnce(&mut WasiCtxBuilder),
 ) -> Result<()> {
     let path = Path::new(path);
     let name = path.file_stem().unwrap().to_str().unwrap();
@@ -25,6 +36,7 @@ async fn run_allow_blocking_current_thread(
     wasmtime_wasi::p3::add_to_linker(&mut linker).context("failed to link `wasi:cli@0.3.x`")?;
 
     let (mut store, _td) = Ctx::new(&engine, name, |builder| {
+        configure(builder);
         MyWasiCtx::new(
             builder
                 .allow_blocking_current_thread(allow_blocking_current_thread)
@@ -53,6 +65,57 @@ async fn p3_big_random_buf() -> wasmtime::Result<()> {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p3_cli() -> wasmtime::Result<()> {
     run(P3_CLI_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_large_stdio_write() -> wasmtime::Result<()> {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use wasmtime_wasi::cli::AsyncStdoutStream;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl tokio::io::AsyncWrite for Capture {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Use a write budget much smaller than the guest's single write to
+    // exercise partial writes through `AsyncStdoutStream`.
+    const SIZE: usize = 100_000;
+    let stdout = Capture::default();
+    let stderr = Capture::default();
+    run_with_builder(P3_LARGE_STDIO_WRITE_COMPONENT, false, |builder| {
+        builder
+            .arg(SIZE.to_string())
+            .stdout(AsyncStdoutStream::new(1024, stdout.clone()))
+            .stderr(AsyncStdoutStream::new(1024, stderr.clone()));
+    })
+    .await?;
+
+    assert!(
+        *stdout.0.lock().unwrap() == vec![0; SIZE],
+        "stdout mismatch"
+    );
+    assert!(
+        *stderr.0.lock().unwrap() == vec![1; SIZE],
+        "stderr mismatch"
+    );
+    Ok(())
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -166,6 +229,17 @@ async fn p3_readdir_blocking() -> wasmtime::Result<()> {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_path_rename_trailing_slashes() -> wasmtime::Result<()> {
+    let fixture = crate::store::SandboxFixture::new()?;
+    run_with_builder(P3_PATH_RENAME_TRAILING_SLASHES_COMPONENT, false, |b| {
+        fixture.configure_wasi(b)
+    })
+    .await?;
+    fixture.assert_secure();
+    Ok(())
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p3_file_write() -> wasmtime::Result<()> {
     run(P3_FILE_WRITE_COMPONENT).await
 }
@@ -173,4 +247,122 @@ async fn p3_file_write() -> wasmtime::Result<()> {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p3_file_write_blocking() -> wasmtime::Result<()> {
     run_allow_blocking_current_thread(P3_FILE_WRITE_COMPONENT, true).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_write_chunked() -> wasmtime::Result<()> {
+    run(P3_FILE_WRITE_CHUNKED_COMPONENT).await
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_settime_overflow() -> wasmtime::Result<()> {
+    run(P3_FILE_SETTIME_OVERFLOW_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_truncation_readonly() -> wasmtime::Result<()> {
+    run_with_readonly_testfile(P3_FILE_TRUNCATION_READONLY_COMPONENT).await
+}
+async fn run_with_readonly_testfile(component_path: &str) -> wasmtime::Result<()> {
+    let prefix = "wasi_components_p3_ro_";
+    let tempdir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create readonly tempdir");
+    const FILENAME: &str = "test.txt";
+    const EXPECTED_CONTENTS: &[u8] = b"read only test file\n";
+    let mut file = PathBuf::from(tempdir.path());
+    file.push(FILENAME);
+    std::fs::write(&file, EXPECTED_CONTENTS).expect("write read only test file");
+
+    run_with_builder(component_path, false, |builder| {
+        builder
+            .preopened_dir(tempdir.path(), "readonly", FsPerms::ReadOnly)
+            .unwrap();
+    })
+    .await?;
+
+    let contents = std::fs::read(&file).expect("read read only test file");
+    assert_eq!(EXPECTED_CONTENTS, contents);
+    Ok(())
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_hardlink_across_perms() -> wasmtime::Result<()> {
+    run_with_readonly_testfile(P3_FILE_HARDLINK_ACROSS_PERMS_COMPONENT).await
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_rename_across_perms() -> wasmtime::Result<()> {
+    run_with_readonly_testfile(P3_FILE_RENAME_ACROSS_PERMS_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_environment_named_imports() -> Result<()> {
+    struct StoreData {
+        default: WasiCtx,
+        a: WasiCtx,
+        b: WasiCtx,
+        table: ResourceTable,
+    }
+
+    impl WasiView for Ctx<StoreData> {
+        fn ctx(&mut self) -> WasiCtxView<'_> {
+            WasiCtxView {
+                ctx: &mut self.wasi.default,
+                table: &mut self.wasi.table,
+            }
+        }
+    }
+
+    impl WasiNamedView for Ctx<StoreData> {
+        fn ctx(&mut self, id: NamedId) -> WasiCtxView<'_> {
+            WasiCtxView {
+                ctx: match id.0 {
+                    0 => &mut self.wasi.a,
+                    1 => &mut self.wasi.b,
+                    _ => panic!("unexpected id: {}", id.0),
+                },
+                table: &mut self.wasi.table,
+            }
+        }
+    }
+
+    let path = Path::new(P3_ENVIRONMENT_NAMED_IMPORTS_COMPONENT);
+    let name = path.file_stem().unwrap().to_str().unwrap();
+    let engine = test_programs_artifacts::engine(|config| {
+        config.wasm_component_model_implements(true);
+    });
+    let component = Component::from_file(&engine, path)?;
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+    wasmtime_wasi::p3::add_named_to_linker(&mut linker, &component, |i, name| {
+        assert_eq!(i, wasmtime_wasi::p3::Interface::CliEnvironment);
+        Ok(match name {
+            "a" => NamedId(0),
+            "b" => NamedId(1),
+            _ => panic!("unexpected name: {name}"),
+        })
+    })?;
+
+    let (mut store, _td) = Ctx::new_with_workspace_setup(
+        &engine,
+        name,
+        |_| Ok(()),
+        |builder| StoreData {
+            default: builder.env("DEFAULT", "0").build(),
+            a: WasiCtx::builder().env("A", "0").build(),
+            b: WasiCtx::builder().env("B", "0").build(),
+            table: ResourceTable::default(),
+        },
+    )?;
+    let command = Command::instantiate_async(&mut store, &component, &linker).await?;
+    store
+        .run_concurrent(async |store| {
+            command
+                .wasi_cli_run()
+                .call_run(store)
+                .await?
+                .map_err(|()| wasmtime::format_err!("run returned a failure"))
+        })
+        .await?
 }

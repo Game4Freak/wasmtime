@@ -138,6 +138,11 @@ fn arbitrary_val(
                 })
                 .collect::<arbitrary::Result<_>>()?,
         ),
+        Type::FixedLengthList(list) => Val::FixedLengthList(
+            (0..list.len())
+                .map(|_| arbitrary_val(&list.ty(), fuel, input))
+                .collect::<arbitrary::Result<_>>()?,
+        ),
 
         Type::Map(map) => {
             let mut pairs = Vec::new();
@@ -194,6 +199,8 @@ fn store<T>(input: &mut Unstructured<'_>, val: T) -> arbitrary::Result<Store<T>>
         }
     }
 
+    const MEMORY_NEEDED: usize = 100 << 20; // 100 MiB
+
     if let InstanceAllocationStrategy::Pooling(p) = &mut config.wasmtime.strategy {
         set_min(&mut p.total_component_instances, 5);
         set_min(&mut p.total_core_instances, 5);
@@ -204,11 +211,11 @@ fn store<T>(input: &mut Unstructured<'_>, val: T) -> arbitrary::Result<Store<T>>
         set_min(&mut p.component_instance_size, 64 << 10);
         set_min(&mut p.core_instance_size, 64 << 10);
         p.memory_protection_keys = Enabled::No;
-        p.max_memory_size = 10 << 20; // 10 MiB
+        p.max_memory_size = MEMORY_NEEDED;
     }
     set_opt_min(
         &mut config.wasmtime.memory_config.memory_reservation,
-        10 << 20,
+        MEMORY_NEEDED as u64,
     );
 
     // Re-enforce internal consistency after the adjustments above (e.g.

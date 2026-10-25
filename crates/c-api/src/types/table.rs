@@ -1,5 +1,5 @@
 use crate::{CExternType, wasm_externtype_t, wasm_limits_t, wasm_valtype_t};
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 use wasmtime::{TableType, ValType};
 
 #[repr(transparent)]
@@ -13,8 +13,8 @@ wasmtime_c_api_macros::declare_ty!(wasm_tabletype_t);
 #[derive(Clone)]
 pub(crate) struct CTableType {
     pub(crate) ty: TableType,
-    element_cache: OnceCell<wasm_valtype_t>,
-    limits_cache: OnceCell<wasm_limits_t>,
+    element_cache: OnceLock<wasm_valtype_t>,
+    limits_cache: OnceLock<wasm_limits_t>,
 }
 
 impl wasm_tabletype_t {
@@ -43,8 +43,8 @@ impl CTableType {
     pub(crate) fn new(ty: TableType) -> CTableType {
         CTableType {
             ty,
-            element_cache: OnceCell::new(),
-            limits_cache: OnceCell::new(),
+            element_cache: OnceLock::new(),
+            limits_cache: OnceLock::new(),
         }
     }
 }
@@ -55,11 +55,8 @@ pub extern "C" fn wasm_tabletype_new(
     limits: &wasm_limits_t,
 ) -> Option<Box<wasm_tabletype_t>> {
     let ty = (*ty).as_ref()?.clone();
-    Some(Box::new(wasm_tabletype_t::new(TableType::new(
-        ty,
-        limits.min,
-        limits.max(),
-    ))))
+    let ty = TableType::new(ty, limits.min, limits.max()).ok()?;
+    Some(Box::new(wasm_tabletype_t::new(ty)))
 }
 
 #[unsafe(no_mangle)]
@@ -76,6 +73,27 @@ pub extern "C" fn wasm_tabletype_limits(tt: &wasm_tabletype_t) -> &wasm_limits_t
         min: u32::try_from(tt.ty.minimum()).unwrap(),
         max: u32::try_from(tt.ty.maximum().unwrap_or(u64::from(u32::MAX))).unwrap(),
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_tabletype_minimum(tt: &wasm_tabletype_t) -> u64 {
+    tt.ty().ty.minimum()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_tabletype_maximum(tt: &wasm_tabletype_t, out: &mut u64) -> bool {
+    match tt.ty().ty.maximum() {
+        Some(max) => {
+            *out = max;
+            true
+        }
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_tabletype_is64(tt: &wasm_tabletype_t) -> bool {
+    tt.ty().ty.is_64()
 }
 
 #[unsafe(no_mangle)]

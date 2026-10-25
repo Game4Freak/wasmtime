@@ -96,6 +96,7 @@ impl Inst {
             | Inst::Args { .. }
             | Inst::Rets { .. }
             | Inst::StackSwitchBasic { .. }
+            | Inst::InterruptPoll { .. }
             | Inst::TrapIf { .. }
             | Inst::TrapIfAnd { .. }
             | Inst::TrapIfOr { .. }
@@ -671,6 +672,22 @@ impl PrettyPrint for Inst {
                 )
             }
 
+            Inst::InterruptPoll {
+                dst,
+                load_ptr,
+                context,
+                trap_code,
+                next_load_ptr,
+            } => {
+                let dst = pretty_print_reg(*dst.to_reg(), 8);
+                let load_ptr = pretty_print_reg(**load_ptr, 8);
+                let context = pretty_print_reg(**context, 8);
+                let next_load_ptr = pretty_print_reg(*next_load_ptr.to_reg(), 8);
+                format!(
+                    "{next_load_ptr} = interrupt_poll load_ptr={load_ptr}, context={context}, scratch={dst} #trap={trap_code}"
+                )
+            }
+
             Inst::JmpKnown { dst } => {
                 let op = ljustify("jmp".to_string());
                 let dst = dst.to_string();
@@ -1051,6 +1068,41 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_clobbers(clobbers);
         }
 
+        Inst::InterruptPoll {
+            dst,
+            load_ptr,
+            context,
+            trap_code: _,
+            next_load_ptr,
+        } => {
+            // `load_ptr` is an input param. It is pinned to r11 so an update of
+            // `next_load_ptr` updates this as well. r11 is chosen because it is
+            // a caller-saved reg not used for arg-passing in Linux/x64.
+            collector.reg_fixed_use(load_ptr, regs::r11());
+            // Demand context (vmctx) go into RDI.
+            collector.reg_fixed_use(context, regs::rdi());
+            // Reserve r10 as scratch space.
+            //
+            // r10 is chosen because it is caller-saved and not used for
+            // arg passing in Linux/x64. It is used as "a static chain pointer
+            // in case of nested functions" according to SystemV, but Cranelift
+            // does not emit those. (Do take care if you are interacting with
+            // external ones.) It is also used to store the function stack limit
+            // in Cranelift, but the stack-limit check is confined to the
+            // function prologue and thus over by the time this instruction is
+            // used.
+            //
+            // Also def it so we can use it as the destination of the dead load
+            // rather than consuming another arbitrary reg.
+            collector.reg_fixed_def(dst, regs::r10());
+            // `next_load_ptr` is pinned so embedders know where to write to
+            // fill it. It takes on the value of `load_ptr` unless a signal
+            // handler invoked at the load overwrites it. We constrain
+            // `next_load_ptr` and `load_ptr` to the same register so this
+            // dataflow happens without a move.
+            collector.reg_fixed_def(next_load_ptr, regs::r11());
+        }
+
         Inst::ReturnCallKnown { info } => {
             let ReturnCallInfo {
                 dest, uses, tmp, ..
@@ -1407,16 +1459,14 @@ impl MachInst for Inst {
         ]
     }
 
-    fn rc_for_type(ty: Type) -> CodegenResult<(&'static [RegClass], &'static [Type])> {
-        match ty {
-            types::I8 => Ok((&[RegClass::Int], &[types::I8])),
-            types::I16 => Ok((&[RegClass::Int], &[types::I16])),
-            types::I32 => Ok((&[RegClass::Int], &[types::I32])),
-            types::I64 => Ok((&[RegClass::Int], &[types::I64])),
-            types::F16 => Ok((&[RegClass::Float], &[types::F16])),
-            types::F32 => Ok((&[RegClass::Float], &[types::F32])),
-            types::F64 => Ok((&[RegClass::Float], &[types::F64])),
-            types::F128 => Ok((&[RegClass::Float], &[types::F128])),
+    fn rc_for_type(ty: &Type) -> CodegenResult<(&[RegClass], &[Type])> {
+        match *ty {
+            types::I8 | types::I16 | types::I32 | types::I64 => {
+                Ok((&[RegClass::Int], core::slice::from_ref(ty)))
+            }
+            types::F16 | types::F32 | types::F64 | types::F128 => {
+                Ok((&[RegClass::Float], core::slice::from_ref(ty)))
+            }
             types::I128 => Ok((&[RegClass::Int, RegClass::Int], &[types::I64, types::I64])),
             _ if ty.is_vector() && ty.bits() <= 128 => {
                 let types = &[types::I8X2, types::I8X4, types::I8X8, types::I8X16];
@@ -1463,13 +1513,15 @@ impl MachInst for Inst {
         15
     }
 
-    fn ref_type_regclass(_: &settings::Flags) -> RegClass {
-        RegClass::Int
+    fn worst_case_island_growth() -> CodeOffset {
+        0
     }
 
     fn is_safepoint(&self) -> bool {
         match self {
-            Inst::CallKnown { .. } | Inst::CallUnknown { .. } => true,
+            Inst::CallKnown { .. } | Inst::CallUnknown { .. } | Inst::StackSwitchBasic { .. } => {
+                true
+            }
             _ => false,
         }
     }
@@ -1578,6 +1630,9 @@ impl asm::AvailableFeatures for &EmitInfo {
     fn fma(&self) -> bool {
         self.isa_flags.has_fma()
     }
+    fn avx_vnni(&self) -> bool {
+        self.isa_flags.has_avx_vnni()
+    }
 
     fn avx512dq(&self) -> bool {
         self.isa_flags.has_avx512dq()
@@ -1589,6 +1644,14 @@ impl asm::AvailableFeatures for &EmitInfo {
 
     fn avx512vbmi(&self) -> bool {
         self.isa_flags.has_avx512vbmi()
+    }
+
+    fn avx512vnni(&self) -> bool {
+        self.isa_flags.has_avx512vnni()
+    }
+
+    fn apx(&self) -> bool {
+        self.isa_flags.has_apx()
     }
 }
 
@@ -1684,7 +1747,7 @@ impl MachInstLabelUse for LabelUse {
 
     fn from_reloc(reloc: Reloc, addend: Addend) -> Option<Self> {
         match (reloc, addend) {
-            (Reloc::X86CallPCRel4, -4) => Some(LabelUse::JmpRel32),
+            (Reloc::X86PCRel4 | Reloc::X86CallPCRel4, -4) => Some(LabelUse::JmpRel32),
             _ => None,
         }
     }

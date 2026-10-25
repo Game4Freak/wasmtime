@@ -4,7 +4,22 @@ use criterion::{Bencher, Criterion, criterion_group, criterion_main};
 use std::{mem, time::Instant};
 use wasmtime::{component::Component, *};
 
-const HOST_BUF_LEN: usize = 100_000;
+// The nearest power of two to 100,000 (2^17 = 131_072). Using a power of two
+// lets the PRNG's high bits map directly onto the buffer without division.
+const HOST_BUF_LEN: usize = 1 << 17;
+
+// We'll generate random indices of the buffer by taking the high bits from a
+// multiplicative congruence generator modulo 2^64. So we'll get the sequence
+// x_0, x_1, ...  where x_n+1 = a * x_n mod 2^64 and the nth buffer access will
+// be at index x_n > 17.
+//
+// Recommended as a "good" multiplier by Steele and Vigna mod 2^64 (see
+// https://arxiv.org/pdf/2001.05304, page 18, table 7).
+const MCG_MULTIPLIER: u64 = 0xf1357aea2e62a9c5;
+const MCG_SEED: u64 = 1;
+// The shift required to take the highest bits of a u64 get an index to the
+// buffer.
+const MCG_OUTPUT_SHIFT: u32 = u64::BITS - HOST_BUF_LEN.trailing_zeros();
 
 /// A `*mut u8` pointer that is exposed directly to Wasm via unsafe intrinsics.
 #[repr(align(8))]
@@ -86,13 +101,10 @@ impl ExposedBuf {
     }
 }
 
-fn make_engine() -> Result<Engine, Error> {
+fn make_engine(concurrency_support: bool) -> Result<Engine, Error> {
     let mut config = Config::new();
-    config.compiler_inlining(true);
-    config.concurrency_support(false);
-    unsafe {
-        config.cranelift_flag_set("wasmtime_inlining_intra_module", "yes");
-    }
+    config.compiler_inlining(wasmtime::Inlining::Yes);
+    config.concurrency_support(concurrency_support);
     let engine = Engine::new(&config)?;
     Ok(engine)
 }
@@ -223,16 +235,18 @@ static COMPILE_TIME_BUILTINS: &str = r#"
 mod inc_list {
     use super::*;
 
-    pub fn bench(c: &mut Criterion) {
-        let mut g = c.benchmark_group("increment-each-byte-in-buf");
+    pub fn bench(c: &mut Criterion, concurrency_support: bool) {
+        let mut g = c.benchmark_group(&format!(
+            "increment-each-byte-in-buf/concurrency_support={concurrency_support}"
+        ));
         g.bench_function("func-wrap-host-buf-api", |b| {
-            func_wrap_host_buf_api(b).unwrap();
+            func_wrap_host_buf_api(b, concurrency_support).unwrap();
         });
         g.bench_function("compile-time-builtins-host-buf-api", |b| {
-            compile_time_builtins_host_buf_api(b).unwrap();
+            compile_time_builtins_host_buf_api(b, concurrency_support).unwrap();
         });
         g.bench_function("take-and-return-list-u8", |b| {
-            take_and_return_list_u8(b).unwrap();
+            take_and_return_list_u8(b, concurrency_support).unwrap();
         });
     }
 
@@ -303,8 +317,8 @@ mod inc_list {
         )
     "#;
 
-    fn func_wrap_host_buf_api(b: &mut Bencher<'_>) -> Result<()> {
-        let engine = make_engine()?;
+    fn func_wrap_host_buf_api(b: &mut Bencher<'_>, concurrency_support: bool) -> Result<()> {
+        let engine = make_engine(concurrency_support)?;
         let linker = make_linker(&engine)?;
         let component = Component::new(&engine, HOST_BUF_API_GUEST_WASM.as_bytes())?;
 
@@ -337,8 +351,11 @@ mod inc_list {
         Ok(())
     }
 
-    fn compile_time_builtins_host_buf_api(b: &mut Bencher<'_>) -> Result<()> {
-        let engine = make_engine()?;
+    fn compile_time_builtins_host_buf_api(
+        b: &mut Bencher<'_>,
+        concurrency_support: bool,
+    ) -> Result<()> {
+        let engine = make_engine(concurrency_support)?;
         let linker = make_linker(&engine)?;
 
         let mut builder = CodeBuilder::new(&engine);
@@ -393,7 +410,7 @@ mod inc_list {
     static TAKE_AND_RETURN_INT_LIST_GUEST_WASM: &str = r#"
         (component
             (core module $m
-                (memory (export "memory") 2)
+                (memory (export "memory") 3)
                 (func (export "realloc") (param i32 i32 i32 i32) (result i32)
                     ;; Reserve the first two `u32`s of memory for the return-values buffer.
                     (i32.const 8)
@@ -431,14 +448,14 @@ mod inc_list {
             (core instance $i (instantiate $m))
             (func (export "inc-list") (param "xs" (list u8)) (result (list u8))
               (canon lift (core func $i "inc-list")
-                          (memory $i "memory")
-                          (realloc (func $i "realloc")))
+                          (memory (core memory $i "memory"))
+                          (realloc (core func $i "realloc")))
             )
         )
     "#;
 
-    fn take_and_return_list_u8(b: &mut Bencher<'_>) -> Result<()> {
-        let engine = make_engine()?;
+    fn take_and_return_list_u8(b: &mut Bencher<'_>, concurrency_support: bool) -> Result<()> {
+        let engine = make_engine(concurrency_support)?;
         let linker = make_linker(&engine)?;
         let component = Component::new(&engine, TAKE_AND_RETURN_INT_LIST_GUEST_WASM.as_bytes())?;
 
@@ -476,20 +493,24 @@ mod inc_random {
     use super::*;
     use rand::{RngExt, SeedableRng as _};
 
-    pub fn bench(c: &mut Criterion) {
-        let mut g = c.benchmark_group("increment-random-byte-in-buf");
+    pub fn bench(c: &mut Criterion, concurrency_support: bool) {
+        let mut g = c.benchmark_group(&format!(
+            "increment-random-byte-in-buf/concurrency_support={concurrency_support}"
+        ));
         g.bench_function("func-wrap-host-buf-api", |b| {
-            func_wrap_host_buf_api(b).unwrap();
+            func_wrap_host_buf_api(b, concurrency_support).unwrap();
         });
         g.bench_function("compile-time-builtins-host-buf-api", |b| {
-            compile_time_builtins_host_buf_api(b).unwrap();
+            compile_time_builtins_host_buf_api(b, concurrency_support).unwrap();
         });
         g.bench_function("take-and-return-list-u8", |b| {
-            take_and_return_list_u8(b).unwrap();
+            take_and_return_list_u8(b, concurrency_support).unwrap();
         });
     }
 
-    static HOST_BUF_API_GUEST_WASM: &str = r#"
+    fn host_buf_api_guest_wasm() -> String {
+        format!(
+            r#"
         (component
             ;; Import the safe API.
             (import "host-buf"
@@ -504,10 +525,39 @@ mod inc_random {
                 (import "" "get" (func $get (param i64) (result i32)))
                 (import "" "set" (func $set (param i64 i32)))
 
-                (func (export "inc-random") (param $i i64)
-                    (call $set (local.get $i)
-                               (i32.add (call $get (local.get $i))
-                                        (i32.const 1)))
+                (func (export "inc-random")
+                    (param $iters i64)
+                    (local $state i64)
+                    (local $i i64)
+
+                    (local.set $state (i64.const {MCG_SEED}))
+                    loop $l
+                        ;; Take the highest bits of random state for the index.
+                        (local.set $i
+                            (i64.shr_u
+                                (local.get $state)
+                                (i64.const {MCG_OUTPUT_SHIFT})
+                            )
+                        )
+                        ;; Increment the buffer.
+                        (call $set (local.get $i)
+                                (i32.add (call $get (local.get $i))
+                                            (i32.const 1)))
+                        (local.set $iters (i64.sub (local.get $iters) (i64.const 1)))
+                        local.get $iters
+                        i64.eqz
+                        if
+                          return
+                        end
+                        ;; Get next random number by multiplying by multiplier.
+                        (local.set $state
+                            (i64.mul
+                                (local.get $state)
+                                (i64.const {MCG_MULTIPLIER})
+                            )
+                        )
+                        br $l
+                    end
                 )
             )
 
@@ -527,11 +577,13 @@ mod inc_random {
 
             ;; Lift the implementation's `inc-random` from a core function to a component function
             ;; and export it!
-            (func (export "inc-random") (param "i" u64)
+            (func (export "inc-random") (param "iters" u64)
                 (canon lift (core func $instance "inc-random"))
             )
         )
-    "#;
+    "#
+        )
+    }
 
     fn get_random_index() -> Result<u64, Error> {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
@@ -540,10 +592,22 @@ mod inc_random {
         Ok(i)
     }
 
-    fn func_wrap_host_buf_api(b: &mut Bencher<'_>) -> Result<()> {
-        let engine = make_engine()?;
+    fn get_expected(iters: u64) -> Vec<u8> {
+        let mut state = MCG_SEED;
+        let mut buf = vec![0u8; HOST_BUF_LEN];
+        for _ in 0..iters {
+            let i = usize::try_from(state >> MCG_OUTPUT_SHIFT).unwrap();
+            buf[i] = buf[i].wrapping_add(1);
+            state = state.wrapping_mul(MCG_MULTIPLIER);
+        }
+        buf
+    }
+
+    fn func_wrap_host_buf_api(b: &mut Bencher<'_>, concurrency_support: bool) -> Result<()> {
+        let engine = make_engine(concurrency_support)?;
         let linker = make_linker(&engine)?;
-        let component = Component::new(&engine, HOST_BUF_API_GUEST_WASM.as_bytes())?;
+        let guest_wasm = host_buf_api_guest_wasm();
+        let component = Component::new(&engine, guest_wasm.as_bytes())?;
 
         let iter_func = |iters| -> Result<_> {
             let mut store = Store::new(
@@ -552,20 +616,14 @@ mod inc_random {
             );
             let instance = linker.instantiate(&mut store, &component)?;
             let inc_random = instance.get_typed_func::<(u64,), ()>(&mut store, "inc-random")?;
-            let i = get_random_index()?;
 
             let start = Instant::now();
-            for _ in 0..iters {
-                inc_random.call(&mut store, (i,))?;
-            }
+            inc_random.call(&mut store, (iters,))?;
             let elapsed = start.elapsed();
 
-            let expected = iters as u8;
-            let actual = store.data().get()[usize::try_from(i)?];
-            assert_eq!(
-                actual, expected,
-                "buf[{i}] = {actual}, but should be {expected}"
-            );
+            let expected = get_expected(iters);
+            let actual = store.data().get();
+            assert_eq!(actual, expected);
 
             Ok(elapsed)
         };
@@ -574,12 +632,16 @@ mod inc_random {
         Ok(())
     }
 
-    fn compile_time_builtins_host_buf_api(b: &mut Bencher<'_>) -> Result<()> {
-        let engine = make_engine()?;
+    fn compile_time_builtins_host_buf_api(
+        b: &mut Bencher<'_>,
+        concurrency_support: bool,
+    ) -> Result<()> {
+        let engine = make_engine(concurrency_support)?;
         let linker = make_linker(&engine)?;
 
         let mut builder = CodeBuilder::new(&engine);
-        builder.wasm_binary_or_text(HOST_BUF_API_GUEST_WASM.as_bytes(), None)?;
+        let guest_wasm = host_buf_api_guest_wasm();
+        builder.wasm_binary_or_text(guest_wasm.as_bytes(), None)?;
 
         // Allow the code we are building to use Wasmtime's unsafe intrinsics.
         unsafe {
@@ -605,20 +667,14 @@ mod inc_random {
             );
             let instance = linker.instantiate(&mut store, &component)?;
             let inc_random = instance.get_typed_func::<(u64,), ()>(&mut store, "inc-random")?;
-            let i = get_random_index()?;
 
             let start = Instant::now();
-            for _ in 0..iters {
-                inc_random.call(&mut store, (i,))?;
-            }
+            inc_random.call(&mut store, (iters,))?;
             let elapsed = start.elapsed();
 
-            let expected = iters as u8;
-            let actual = store.data().get()[usize::try_from(i)?];
-            assert_eq!(
-                actual, expected,
-                "buf[{i}] = {actual}, but should be {expected}"
-            );
+            let expected = get_expected(iters);
+            let actual = store.data().get();
+            assert_eq!(actual, expected);
 
             Ok(elapsed)
         };
@@ -630,7 +686,7 @@ mod inc_random {
     static TAKE_AND_RETURN_INT_LIST_GUEST_WASM: &str = r#"
         (component
             (core module $m
-                (memory (export "memory") 2)
+                (memory (export "memory") 3)
                 (func (export "realloc") (param i32 i32 i32 i32) (result i32)
                     ;; Reserve the first two `u32`s of memory for the return-values buffer.
                     (i32.const 8)
@@ -651,14 +707,14 @@ mod inc_random {
             (core instance $i (instantiate $m))
             (func (export "inc-random") (param "i" u32) (param "xs" (list u8)) (result (list u8))
               (canon lift (core func $i "inc-random")
-                          (memory $i "memory")
-                          (realloc (func $i "realloc")))
+                          (memory (core memory $i "memory"))
+                          (realloc (core func $i "realloc")))
             )
         )
     "#;
 
-    fn take_and_return_list_u8(b: &mut Bencher<'_>) -> Result<()> {
-        let engine = make_engine()?;
+    fn take_and_return_list_u8(b: &mut Bencher<'_>, concurrency_support: bool) -> Result<()> {
+        let engine = make_engine(concurrency_support)?;
         let linker = make_linker(&engine)?;
         let component = Component::new(&engine, TAKE_AND_RETURN_INT_LIST_GUEST_WASM.as_bytes())?;
 
@@ -694,8 +750,10 @@ mod inc_random {
 fn bench(c: &mut Criterion) {
     let _ = env_logger::try_init();
 
-    inc_list::bench(c);
-    inc_random::bench(c);
+    for concurrency_support in [true, false] {
+        inc_list::bench(c, concurrency_support);
+        inc_random::bench(c, concurrency_support);
+    }
 }
 
 criterion_group!(benches, bench);

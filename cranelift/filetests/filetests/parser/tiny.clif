@@ -91,8 +91,10 @@ function %icmp(i32, i32) {
 block0(v90: i32, v91: i32):
     v0 = icmp eq v90, v91
     v1 = icmp ult v90, v91
-    v2 = icmp_imm sge v90, -12
-    v3 = irsub_imm v91, 45
+    v92 = iconst.i32 -12
+    v2 = icmp sge v90, v92
+    v93 = iconst.i32 45
+    v3 = isub v93, v91
     v4 = icmp eq v90, v91
     brif v4, block0(v91, v90), block0(v91, v90)
 }
@@ -100,8 +102,10 @@ block0(v90: i32, v91: i32):
 ; nextln: block0(v90: i32, v91: i32):
 ; nextln:     v0 = icmp eq v90, v91
 ; nextln:     v1 = icmp ult v90, v91
-; nextln:     v2 = icmp_imm sge v90, -12
-; nextln:     v3 = irsub_imm v91, 45
+; nextln:     v92 = iconst.i32 -12
+; nextln:     v2 = icmp sge v90, v92
+; nextln:     v93 = iconst.i32 45
+; nextln:     v3 = isub v93, v91
 ; nextln:     v4 = icmp eq v90, v91
 ; nextln:     brif v4, block0(v91, v90), block0(v91, v90)
 ; nextln: }
@@ -139,20 +143,28 @@ function %stack() {
     ss2 = explicit_slot 4
 
 block0:
-    v1 = stack_load.i32 ss10
-    v2 = stack_load.i32 ss10+4
-    stack_store v1, ss10+2
-    stack_store v2, ss2
+    v3 = stack_addr.i64 ss10
+    v1 = load.i32 notrap v3
+    v4 = stack_addr.i64 ss10+4
+    v2 = load.i32 notrap v4
+    v5 = stack_addr.i64 ss10+2
+    store notrap v1, v5
+    v6 = stack_addr.i64 ss2
+    store notrap v2, v6
 }
 ; sameln: function %stack() fast {
 ; check:     ss2 = explicit_slot 4
 ; check:     ss10 = explicit_slot 8
 
 ; check: block0:
-; nextln: v1 = stack_load.i32 ss10
-; nextln: v2 = stack_load.i32 ss10+4
-; nextln: stack_store v1, ss10+2
-; nextln: stack_store v2, ss2
+; nextln: v3 = stack_addr.i64 ss10
+; nextln: v1 = load.i32 notrap v3
+; nextln: v4 = stack_addr.i64 ss10+4
+; nextln: v2 = load.i32 notrap v4
+; nextln: v5 = stack_addr.i64 ss10+2
+; nextln: store notrap v1, v5
+; nextln: v6 = stack_addr.i64 ss2
+; nextln: store notrap v2, v6
 
 ; Memory access instructions.
 function %memory(i32) {
@@ -184,7 +196,8 @@ block0(v1: i32):
 function %cond_traps(i32) {
 block0(v0: i32):
     trapz v0, stk_ovf
-    v1 = icmp_imm ugt v0, 5
+    v4 = iconst.i32 5
+    v1 = icmp ugt v0, v4
     trapnz v1, heap_oob
     v2 = bitcast.f32 v1
     v3 = fcmp uno v2, v2
@@ -194,7 +207,8 @@ block0(v0: i32):
 ; sameln: function %cond_traps(i32)
 ; nextln: block0(v0: i32):
 ; nextln:     trapz v0, stk_ovf
-; nextln:     v1 = icmp_imm ugt v0, 5
+; nextln:     v4 = iconst.i32 5
+; nextln:     v1 = icmp ugt v0, v4
 ; nextln:     trapnz v1, heap_oob
 ; nextln:     v2 = bitcast.f32 v1
 ; nextln:     v3 = fcmp uno v2, v2

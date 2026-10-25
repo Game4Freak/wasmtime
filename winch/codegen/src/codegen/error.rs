@@ -17,9 +17,6 @@ pub(crate) enum CodeGenError {
     /// Unimplemented MacroAssembler instruction.
     #[error("Unimplemented Masm instruction")]
     UnimplementedMasmInstruction,
-    /// Unimplemented Wasm load kind.
-    #[error("Unimplemented Wasm load kind")]
-    UnimplementedWasmLoadKind,
     /// Unimplemented due to requiring AVX.
     #[error("Instruction not implemented for CPUs without AVX support")]
     UnimplementedForNoAvx,
@@ -35,6 +32,15 @@ pub(crate) enum CodeGenError {
     /// Unsupported eager initialization of tables.
     #[error("Unsupported eager initialization of tables")]
     UnsupportedTableEagerInit,
+    /// A `br_table` has more targets than the implementation limit.
+    #[error(
+        "`br_table` has {0} targets, which exceeds the implementation limit of {limit}",
+        limit = wasmtime_cranelift::MAX_BR_TABLE_TARGETS
+    )]
+    BrTableTooLarge(u32),
+    /// An allocation is too large to represent.
+    #[error("Allocation size is too large")]
+    AllocationTooLarge,
     /// An internal error.
     ///
     /// This error means that an internal invariant was not met and usually
@@ -82,6 +88,9 @@ pub(crate) enum InternalError {
     /// Expected memory location to be addressed via the stack pointer.
     #[error("Expected stack pointer addressing")]
     SPAddressingExpected,
+    /// Expected a fully resolved results area.
+    #[error("Results area expected")]
+    ResultsAreaExpected,
     /// Stack pointer offset is illegal.
     #[error("Invalid stack pointer offset")]
     InvalidSPOffset,
@@ -91,9 +100,6 @@ pub(crate) enum InternalError {
     /// Invalid local offset.
     #[error("Invalid local offset")]
     InvalidLocalOffset,
-    /// Unsupported immediate for instruction.
-    #[error("Unsupported immediate")]
-    UnsupportedImm,
     /// Invalid operand combination.
     #[error("Invalid operand combination")]
     InvalidOperandCombination,
@@ -119,12 +125,24 @@ impl CodeGenError {
         Self::Unsupported32BitPlatform
     }
 
+    pub(crate) const fn br_table_too_large(len: u32) -> Self {
+        Self::BrTableTooLarge(len)
+    }
+
+    pub(crate) const fn allocation_too_large() -> Self {
+        Self::AllocationTooLarge
+    }
+
     pub(crate) const fn unexpected_function_call() -> Self {
         Self::Internal(InternalError::UnexpectedFunctionCall)
     }
 
     pub(crate) const fn sp_addressing_expected() -> Self {
         Self::Internal(InternalError::SPAddressingExpected)
+    }
+
+    pub(crate) const fn results_area_expected() -> Self {
+        Self::Internal(InternalError::ResultsAreaExpected)
     }
 
     pub(crate) const fn invalid_sp_offset() -> Self {
@@ -177,10 +195,6 @@ impl CodeGenError {
 
     pub(crate) const fn invalid_local_offset() -> Self {
         Self::Internal(InternalError::InvalidLocalOffset)
-    }
-
-    pub(crate) const fn unsupported_imm() -> Self {
-        Self::Internal(InternalError::UnsupportedImm)
     }
 
     pub(crate) const fn invalid_two_arg_form() -> Self {

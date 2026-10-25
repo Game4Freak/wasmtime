@@ -1,12 +1,11 @@
 [package]
 name = "cranelift-jit"
-version = "0.132.0"
+version = "0.138.0-dev"
 authors = ["The Cranelift Project Developers"]
 description = "A JIT library backed by Cranelift"
 repository = "https://github.com/bytecodealliance/wasmtime"
 documentation = "https://docs.rs/cranelift-jit"
 license = "Apache-2.0 WITH LLVM-exception"
-readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 
@@ -24,7 +23,7 @@ anyhow = { workspace = true }
 region = "3.0.2"
 libc = { workspace = true }
 target-lexicon = { workspace = true }
-memmap2 = "0.2.1"
+memmap2 = "0.9.11"
 log = { workspace = true }
 wasmtime-jit-icache-coherence = { workspace = true }
 

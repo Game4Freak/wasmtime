@@ -53,7 +53,6 @@ pub enum BoundsCheck {
     /// ```ignore
     /// index + object_size <= bound
     /// ```
-    #[cfg(feature = "gc")]
     StaticObjectField {
         offset: u32,
         access_size: u8,
@@ -64,7 +63,6 @@ pub enum BoundsCheck {
     ///
     /// It is *your* responsibility to ensure that the `offset + access_size <=
     /// object_size` precondition holds.
-    #[cfg(feature = "gc")]
     DynamicObjectField {
         offset: ir::Value,
         object_size: ir::Value,
@@ -91,7 +89,6 @@ pub fn bounds_check_and_compute_addr(
             access_size,
         } => bounds_check_field_access(builder, env, heap, index, offset, access_size, trap),
 
-        #[cfg(feature = "gc")]
         BoundsCheck::StaticObjectField {
             offset,
             access_size,
@@ -129,7 +126,6 @@ pub fn bounds_check_and_compute_addr(
         // Compute the index of the end of the object, bounds check that and get
         // a pointer to just after the object, and then reverse offset from that
         // to get the pointer to the field being accessed.
-        #[cfg(feature = "gc")]
         BoundsCheck::DynamicObjectField {
             offset,
             object_size,
@@ -332,7 +328,7 @@ fn bounds_check_field_access(
     // Special case for when we can rely on virtual memory, the minimum
     // byte size of this memory fits within the memory reservation, and
     // memory isn't allowed to move. In this situation we know that
-    // memory will statically not grow beyond `memory_reservation` so we
+    // memory will statically not grow beyond `memory_reservation`
     // and we know that memory from 0 to that limit is guaranteed to be
     // valid or trap. Here we effectively assume that the dynamic size
     // of linear memory is its maximal value, `memory_reservation`, and
@@ -347,7 +343,15 @@ fn bounds_check_field_access(
     // Since we have to emit explicit bounds checks, we might as well be
     // precise, not rely on the virtual memory subsystem at all, and not
     // factor in the guard pages here.
+    //
+    // Note that this is not applicable to imported memories. The minimum size
+    // of an imported memory's type is only a lower bound on the actual
+    // memory's minimum size, which may be larger than `memory_reservation`.
+    // In that situation the actual memory's allocation is larger than
+    // `memory_reservation` and accesses beyond `memory_reservation` may be
+    // in-bounds.
     if can_use_virtual_memory
+        && !heap.imported
         && heap.memory.minimum_byte_size().unwrap_or(u64::MAX) <= memory_reservation
         && !heap.memory.memory_may_move(&memory_tunables)
         && memory_reservation >= offset_and_size
@@ -489,6 +493,12 @@ fn bounds_check_field_access(
     ))
 }
 
+fn vmctx(pos: &mut FuncCursor<'_>) -> ir::Value {
+    pos.func
+        .special_param(ir::ArgumentPurpose::VMContext)
+        .expect("missing vmctx parameter")
+}
+
 /// Get the bound of a dynamic heap as an `ir::Value`.
 fn get_dynamic_heap_bound(
     builder: &mut FunctionBuilder,
@@ -500,8 +510,11 @@ fn get_dynamic_heap_bound(
         // bound.
         Some(max_size) => builder.ins().iconst(env.pointer_type(), max_size as i64),
 
-        // Load the heap bound from its global variable.
-        _ => builder.ins().global_value(env.pointer_type(), heap.bound),
+        // Emit the load chain that computes the heap bound.
+        _ => {
+            let vmctx = vmctx(&mut builder.cursor());
+            heap.bound.emit(&mut builder.cursor(), vmctx)
+        }
     }
 }
 
@@ -618,7 +631,15 @@ fn explicit_check_oob_condition_and_compute_addr(
 /// It is the caller's responsibility to ensure that any necessary bounds and
 /// overflow checks are emitted, and that the resulting address is never used
 /// unless they succeed.
-fn compute_addr(
+///
+/// Arguments are:
+///
+/// * `pos` - where to generate instructions
+/// * `heap` - the memory being accessed
+/// * `addr_ty` - the host's pointer type
+/// * `index` - the raw wasm index, of type `addr_ty`
+/// * `offset` - a static offset to add to `index`
+pub fn compute_addr(
     pos: &mut FuncCursor,
     heap: &HeapData,
     addr_ty: ir::Type,
@@ -627,7 +648,8 @@ fn compute_addr(
 ) -> ir::Value {
     debug_assert_eq!(pos.func.dfg.value_type(index), addr_ty);
 
-    let heap_base = pos.ins().global_value(addr_ty, heap.base);
+    let vmctx = vmctx(pos);
+    let heap_base = heap.base.emit(pos, vmctx);
     let base_and_index = pos.ins().iadd(heap_base, index);
 
     if offset == 0 {

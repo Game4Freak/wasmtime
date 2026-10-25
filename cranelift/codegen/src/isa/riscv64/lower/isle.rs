@@ -15,8 +15,8 @@ use crate::machinst::{CallInfo, MachInst, isle::*};
 use crate::machinst::{VCodeConstant, VCodeConstantData};
 use crate::{
     ir::{
-        AtomicRmwOp, BlockCall, ExternalName, Inst, InstructionData, MemFlags, Opcode, TrapCode,
-        Value, ValueList, immediates::*, types::*,
+        AtomicRmwOp, BlockCall, ExternalName, Inst, InstructionData, MemFlagsData, Opcode,
+        TrapCode, Value, ValueList, immediates::*, types::*,
     },
     isa::riscv64::inst::*,
     machinst::{ArgPair, CallArgList, CallRetList, InstOutput},
@@ -223,28 +223,8 @@ impl generated_code::Context for RV64IsleContext<'_, '_, MInst, Riscv64Backend> 
             // F128 is currently stored in a pair of integer registers
             F128 => true,
 
-            // The base vector extension supports all integer types, up to 64 bits
-            // as long as they fit in a register
-            ty if self.ty_vec_fits_in_register(ty).is_some()
-                && lane_type.is_int()
-                && lane_type.bits() <= 64 =>
-            {
-                true
-            }
-
-            // If the vector type has floating point lanes then the spec states:
-            //
-            // Vector instructions where any floating-point vector operand’s EEW is not a
-            // supported floating-point type width (which includes when FLEN < SEW) are reserved.
-            //
-            // So we also have to check if we support the scalar version of the type.
-            ty if self.ty_vec_fits_in_register(ty).is_some()
-                && lane_type.is_float()
-                && self.ty_supported(lane_type).is_some()
-                // Additionally the base V spec only supports 32 and 64 bit floating point types.
-                && (lane_type.bits() == 32 || lane_type.bits() == 64 || (lane_type.bits() == 16 && self.backend.isa_flags.has_zvfh())) =>
-            {
-                true
+            ty if self.ty_vec_fits_in_register(ty).is_some() => {
+                self.backend.supports_vector_element_type(lane_type)
             }
 
             // Otherwise do not match
@@ -273,6 +253,14 @@ impl generated_code::Context for RV64IsleContext<'_, '_, MInst, Riscv64Backend> 
         self.ty_supported(ty).filter(|ty| ty.is_vector())
     }
 
+    fn ty_supported_vec_repr(&mut self, ty: Type) -> Option<Type> {
+        if ty.is_vector() && self.ty_supported_vec(ty.as_int()).is_some() {
+            Some(ty)
+        } else {
+            None
+        }
+    }
+
     fn ty_reg_pair(&mut self, ty: Type) -> Option<Type> {
         match ty {
             I128 | F128 => Some(ty),
@@ -286,7 +274,7 @@ impl generated_code::Context for RV64IsleContext<'_, '_, MInst, Riscv64Backend> 
             self.emit(&MInst::Load {
                 rd: tmp,
                 op: LoadOP::Ld,
-                flags: MemFlags::trusted(),
+                flags: MemFlagsData::trusted(),
                 from: AMode::FPOffset(8),
             });
             tmp.to_reg()
@@ -525,6 +513,10 @@ impl generated_code::Context for RV64IsleContext<'_, '_, MInst, Riscv64Backend> 
         self.backend.isa_flags.has_zicond()
     }
 
+    fn has_zvbb(&mut self) -> bool {
+        self.backend.isa_flags.has_zvbb()
+    }
+
     fn gen_reg_offset_amode(&mut self, base: Reg, offset: i64) -> AMode {
         AMode::RegOffset(base, offset)
     }
@@ -582,7 +574,7 @@ impl generated_code::Context for RV64IsleContext<'_, '_, MInst, Riscv64Backend> 
         let i = self
             .lower_ctx
             .abi()
-            .sized_stackslot_addr(slot, i64::from(offset) as u32, result);
+            .sized_stackslot_addr(slot, i32::from(offset), result);
         self.emit(&i);
         result.to_reg()
     }
@@ -616,6 +608,10 @@ impl generated_code::Context for RV64IsleContext<'_, '_, MInst, Riscv64Backend> 
             rs1: rs1.to_reg(),
             rs2: rs2.to_reg(),
         }
+    }
+
+    fn int_compare_inverse(&mut self, c: IntegerCompare) -> IntegerCompare {
+        c.inverse()
     }
 
     #[inline]

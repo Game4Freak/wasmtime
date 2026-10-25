@@ -2,7 +2,7 @@
 #![cfg(feature = "gc")]
 use crate::{
     AnyRef, ArrayRef, ArrayType, AsContext, AsContextMut, GcRefImpl, GcRootIndex, HeapType, I31,
-    OwnedRooted, RefType, Rooted, StructRef, StructType, ValRaw, ValType, WasmTy,
+    OwnedRooted, RefType, Rooted, StructRef, StructType, ValRaw, ValType, WasmTy, bail_bug,
     prelude::*,
     runtime::vm::VMGcRef,
     store::{AutoAssertNoGc, StoreOpaque},
@@ -167,8 +167,8 @@ impl EqRef {
             gc_ref.is_i31()
                 || store
                     .unwrap_gc_store()
-                    .header(&gc_ref)
-                    .kind()
+                    .kind(&gc_ref)
+                    .unwrap()
                     .matches(VMGcKind::EqRef)
         );
         Rooted::new(store, gc_ref)
@@ -198,22 +198,31 @@ impl EqRef {
             return Ok(HeapType::I31);
         }
 
-        let header = store.require_gc_store()?.header(gc_ref);
+        let header = store.require_gc_store()?.header(gc_ref)?;
+        let kind = match header.kind() {
+            Some(kind) => kind,
+            None => bail_bug!("invalid `VMGcKind`"),
+        };
+        let ty = match header.ty() {
+            Some(ty) => ty,
+            None => bail_bug!("ty should be present"),
+        };
 
-        if header.kind().matches(VMGcKind::StructRef) {
-            return Ok(HeapType::ConcreteStruct(
-                StructType::from_shared_type_index(store.engine(), header.ty().unwrap()),
-            ));
+        if kind.matches(VMGcKind::StructRef) {
+            return match StructType::from_shared_type_index(store.engine(), ty) {
+                Some(ty) => Ok(HeapType::ConcreteStruct(ty)),
+                None => bail_bug!("invalid struct type index"),
+            };
         }
 
-        if header.kind().matches(VMGcKind::ArrayRef) {
-            return Ok(HeapType::ConcreteArray(ArrayType::from_shared_type_index(
-                store.engine(),
-                header.ty().unwrap(),
-            )));
+        if kind.matches(VMGcKind::ArrayRef) {
+            return match ArrayType::from_shared_type_index(store.engine(), ty) {
+                Some(ty) => Ok(HeapType::ConcreteArray(ty)),
+                None => bail_bug!("invalid array type index"),
+            };
         }
 
-        unreachable!("no other kinds of `eqref`s")
+        bail_bug!("no other kinds of `eqref`s")
     }
 
     /// Does this `eqref` match the given type?
@@ -350,7 +359,7 @@ impl EqRef {
         Ok(!gc_ref.is_i31()
             && store
                 .require_gc_store()?
-                .kind(gc_ref)
+                .kind(gc_ref)?
                 .matches(VMGcKind::StructRef))
     }
 
@@ -418,7 +427,7 @@ impl EqRef {
         Ok(!gc_ref.is_i31()
             && store
                 .require_gc_store()?
-                .kind(gc_ref)
+                .kind(gc_ref)?
                 .matches(VMGcKind::ArrayRef))
     }
 

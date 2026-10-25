@@ -107,15 +107,15 @@ impl wasmtime_wasi::WasiView for WasmtimeStoreData {
 }
 
 #[cfg(all(feature = "component-model", feature = "wasi-http"))]
-impl wasmtime_wasi_http::p2::WasiHttpView for WasmtimeStoreData {
-    fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
+impl wasmtime_wasi_http::WasiHttpView for WasmtimeStoreData {
+    fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
         use wasmtime_wasi::WasiView;
         let ctx = self.wasi_http.as_mut().unwrap();
         let table = self.wasi.as_mut().unwrap().ctx().table;
-        wasmtime_wasi_http::p2::WasiHttpCtxView {
+        wasmtime_wasi_http::WasiHttpCtxView {
             ctx,
             table,
-            hooks: wasmtime_wasi_http::p2::default_hooks(),
+            hooks: wasmtime_wasi_http::default_hooks(),
         }
     }
 }
@@ -151,7 +151,7 @@ pub const WASMTIME_UPDATE_DEADLINE_YIELD: wasmtime_update_deadline_kind_t = 1;
 pub extern "C" fn wasmtime_store_epoch_deadline_callback(
     store: &mut wasmtime_store_t,
     func: extern "C" fn(
-        WasmtimeStoreContextMut<'_>,
+        WasmtimeStoreContext<'_>,
         *mut c_void,
         *mut u64,
         *mut wasmtime_update_deadline_kind_t,
@@ -160,12 +160,12 @@ pub extern "C" fn wasmtime_store_epoch_deadline_callback(
     finalizer: Option<extern "C" fn(*mut c_void)>,
 ) {
     let foreign = crate::ForeignData { data, finalizer };
-    store.store.epoch_deadline_callback(move |mut store_ctx| {
+    store.store.epoch_deadline_callback(move |store_ctx| {
         let _ = &foreign; // Move foreign into this closure
         let mut delta: u64 = 0;
         let mut kind = WASMTIME_UPDATE_DEADLINE_CONTINUE;
         let result = (func)(
-            store_ctx.as_context_mut(),
+            store_ctx.as_context(),
             foreign.data,
             &mut delta as *mut u64,
             &mut kind as *mut wasmtime_update_deadline_kind_t,

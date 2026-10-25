@@ -1,6 +1,5 @@
 ;;! component_model_async = true
 ;;! reference_types = true
-;;! gc_types = true
 ;;! multi_memory = true
 
 (component
@@ -33,7 +32,7 @@
       (canon lift
         (core func $a "yield-loop")
         async
-        (callback (func $a "callback"))
+        (callback (core func $a "callback"))
       )
     )
     (func (export "noop") (canon lift (core func $a "noop")))

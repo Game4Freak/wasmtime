@@ -8,7 +8,7 @@
   (core module $m
     (import "" "error-context.new" (func $error-context-new (param i32 i32) (result i32)))
   )
-  (core func $error-context-new (canon error-context.new (memory $libc "memory")))
+  (core func $error-context-new (canon error-context.new (memory (core memory $libc "memory"))))
   (core instance $i (instantiate $m (with "" (instance (export "error-context.new" (func $error-context-new))))))
 )
 
@@ -22,7 +22,7 @@
   (core module $m
     (import "" "error-context.debug-message" (func $error-context-debug-message (param i32 i32)))
   )
-  (core func $error-context-debug-message (canon error-context.debug-message (memory $libc "memory") (realloc (func $libc "realloc"))))
+  (core func $error-context-debug-message (canon error-context.debug-message (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
   (core instance $i (instantiate $m (with "" (instance (export "error-context.debug-message" (func $error-context-debug-message))))))
 )
 
@@ -67,8 +67,8 @@
     )
   )
 
-  (core func $error-context.new (canon error-context.new (memory $libc "memory")))
-  (core func $error-context.debug-message (canon error-context.debug-message (memory $libc "memory") (realloc (func $libc "realloc"))))
+  (core func $error-context.new (canon error-context.new (memory (core memory $libc "memory"))))
+  (core func $error-context.debug-message (canon error-context.debug-message (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
   (core func $error-context.drop (canon error-context.drop))
 
   (core instance $core (instantiate $Core (with "" (instance
@@ -84,3 +84,9 @@
 (component instance $A $A)
 (assert_return (invoke "run" (u32.const 65528)))
 (assert_trap (invoke "run" (u32.const 65532)) "invalid debug message pointer")
+
+(component instance $A2 $A)
+(assert_trap (invoke "run" (u32.const 1)) "invalid debug message pointer: not aligned")
+
+(component instance $A3 $A)
+(assert_trap (invoke "run" (u32.const 65526)) "invalid debug message pointer: not aligned")

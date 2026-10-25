@@ -19,21 +19,23 @@
     i32.load8_u offset=0xffff0000))
 
 ;; function u0:0(i64 vmctx, i64, i32, i32) tail {
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 215 ""
+;;     region3 = 105 ""
+;;     region4 = 171 ""
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
-;;     gv3 = vmctx
-;;     gv4 = load.i64 notrap aligned gv3+64
-;;     gv5 = load.i64 notrap aligned readonly can_move gv3+56
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32, v3: i32):
 ;; @0040                               v4 = uextend.i64 v2
-;; @0040                               v5 = load.i64 notrap aligned readonly can_move v0+56
+;; @0040                               v5 = load.i64 notrap aligned readonly can_move region2 v0+56
 ;; @0040                               v6 = iadd v5, v4
 ;; @0040                               v7 = iconst.i64 0xffff_0000
 ;; @0040                               v8 = iadd v6, v7  ; v7 = 0xffff_0000
-;; @0040                               istore8 little heap v3, v8
+;; @0040                               istore8 little region4 v3, v8
 ;; @0047                               jump block1
 ;;
 ;;                                 block1:
@@ -41,23 +43,25 @@
 ;; }
 ;;
 ;; function u0:1(i64 vmctx, i64, i32) -> i32 tail {
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 215 ""
+;;     region3 = 105 ""
+;;     region4 = 171 ""
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
-;;     gv3 = vmctx
-;;     gv4 = load.i64 notrap aligned gv3+64
-;;     gv5 = load.i64 notrap aligned readonly can_move gv3+56
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32):
-;; @004c                               v4 = uextend.i64 v2
-;; @004c                               v5 = load.i64 notrap aligned readonly can_move v0+56
-;; @004c                               v6 = iadd v5, v4
-;; @004c                               v7 = iconst.i64 0xffff_0000
-;; @004c                               v8 = iadd v6, v7  ; v7 = 0xffff_0000
-;; @004c                               v9 = uload8.i32 little heap v8
+;; @004c                               v3 = uextend.i64 v2
+;; @004c                               v4 = load.i64 notrap aligned readonly can_move region2 v0+56
+;; @004c                               v5 = iadd v4, v3
+;; @004c                               v6 = iconst.i64 0xffff_0000
+;; @004c                               v7 = iadd v5, v6  ; v6 = 0xffff_0000
+;; @004c                               v8 = uload8.i32 little region4 v7
 ;; @0053                               jump block1
 ;;
 ;;                                 block1:
-;; @0053                               return v9
+;; @0053                               return v8
 ;; }

@@ -1,6 +1,6 @@
 //! Module for configuring the cache system.
 
-use directories_next::ProjectDirs;
+use directories::ProjectDirs;
 use log::{trace, warn};
 use serde::{
     Deserialize,
@@ -262,9 +262,9 @@ macro_rules! generate_deserializer {
 generate_deserializer!(deserialize_duration(num: u64, unit: &str) -> Duration {
     match unit {
         "s" => Some(Duration::from_secs(num)),
-        "m" => Some(Duration::from_secs(num * 60)),
-        "h" => Some(Duration::from_secs(num * 60 * 60)),
-        "d" => Some(Duration::from_secs(num * 60 * 60 * 24)),
+        "m" => num.checked_mul(60).map(Duration::from_secs),
+        "h" => num.checked_mul(60 * 60).map(Duration::from_secs),
+        "d" => num.checked_mul(60 * 60 * 24).map(Duration::from_secs),
         _ => None,
     }
 });

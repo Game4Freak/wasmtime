@@ -172,7 +172,7 @@ use alloc::sync::{Arc, Weak};
 use core::any;
 use core::marker;
 use core::mem::{self, MaybeUninit};
-use core::num::{NonZeroU64, NonZeroUsize};
+use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use core::{
     fmt::{self, Debug},
     hash::{Hash, Hasher},
@@ -325,6 +325,26 @@ impl GcRootIndex {
         let gc_ref = self.try_gc_ref(store)?.unchecked_copy();
         Ok(store.clone_gc_ref(&gc_ref))
     }
+
+    /// Exposes this value's raw `VMGcRef` to wasm as a `u32`.
+    pub(crate) fn expose_gc_ref_to_wasm(
+        &self,
+        store: &mut AutoAssertNoGc<'_>,
+    ) -> Result<NonZeroU32> {
+        let gc_ref = self.try_clone_gc_ref(store)?;
+
+        let raw = match store.optional_gc_store_mut() {
+            Some(s) => s.expose_gc_ref_to_wasm(gc_ref)?,
+            None => {
+                // NB: do not force the allocation of a GC heap just because the
+                // program is using `i31ref`s.
+                debug_assert!(gc_ref.is_i31());
+                gc_ref.as_raw_non_zero_u32()
+            }
+        };
+
+        Ok(raw)
+    }
 }
 
 /// This is a bit-packed version of
@@ -408,7 +428,7 @@ impl PackedIndex {
 
     fn as_owned(&self) -> Option<SlabId> {
         if self.is_owned() {
-            Some(SlabId::from_raw(self.payload()))
+            Some(SlabId::try_from_raw(self.payload()).unwrap())
         } else {
             None
         }
@@ -496,7 +516,12 @@ impl RootSet {
     #[inline(never)]
     #[cold]
     fn exit_lifo_scope_slow(&mut self, mut gc_store: Option<&mut GcStore>, scope: usize) {
-        self.lifo_generation += 1;
+        // Note that this explicitly uses `wrapping_add` to avoid panicking on
+        // overflow. This is intended to assist with the lifetime issues on the
+        // host but is not required for memory safety, so in the event of a
+        // wraparound it may mean that preexisting issues on the host go
+        // undetected.
+        self.lifo_generation = self.lifo_generation.wrapping_add(1);
 
         // TODO: In the case where we have a tracing GC that doesn't need to
         // drop barriers, this should really be:
@@ -1210,18 +1235,7 @@ impl<T: GcRef> Rooted<T> {
         ptr: &mut MaybeUninit<ValRaw>,
         val_raw: impl Fn(u32) -> ValRaw,
     ) -> Result<()> {
-        let gc_ref = self.inner.try_clone_gc_ref(store)?;
-
-        let raw = match store.optional_gc_store_mut() {
-            Some(s) => s.expose_gc_ref_to_wasm(gc_ref),
-            None => {
-                // NB: do not force the allocation of a GC heap just because the
-                // program is using `i31ref`s.
-                debug_assert!(gc_ref.is_i31());
-                gc_ref.as_raw_non_zero_u32()
-            }
-        };
-
+        let raw = self.inner.expose_gc_ref_to_wasm(store)?;
         ptr.write(val_raw(raw.get()));
         Ok(())
     }
@@ -1276,6 +1290,14 @@ impl<T: GcRef> Rooted<T> {
         let gc_ref = VMGcRef::from_raw_u32(raw_gc_ref)?;
         let gc_ref = store.clone_gc_ref(&gc_ref);
         Some(from_cloned_gc_ref(store, gc_ref))
+    }
+
+    pub(crate) fn try_gc_ref<'a>(&self, store: &'a StoreOpaque) -> Result<&'a VMGcRef> {
+        <Self as RootedGcRefImpl<_>>::try_gc_ref(self, store)
+    }
+
+    pub(crate) fn try_clone_gc_ref(&self, store: &mut AutoAssertNoGc<'_>) -> Result<VMGcRef> {
+        <Self as RootedGcRefImpl<_>>::try_clone_gc_ref(self, store)
     }
 }
 
@@ -1826,16 +1848,7 @@ where
         ptr: &mut MaybeUninit<ValRaw>,
         val_raw: impl Fn(u32) -> ValRaw,
     ) -> Result<()> {
-        let gc_ref = self.try_clone_gc_ref(store)?;
-
-        let raw = match store.optional_gc_store_mut() {
-            Some(s) => s.expose_gc_ref_to_wasm(gc_ref),
-            None => {
-                debug_assert!(gc_ref.is_i31());
-                gc_ref.as_raw_non_zero_u32()
-            }
-        };
-
+        let raw = self.inner.expose_gc_ref_to_wasm(store)?;
         ptr.write(val_raw(raw.get()));
         Ok(())
     }

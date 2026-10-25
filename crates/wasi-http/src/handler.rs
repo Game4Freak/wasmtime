@@ -1,50 +1,45 @@
 //! Provides utilities useful for dispatching incoming HTTP requests
 //! `wasi:http/handler` guest instances.
 
+#[cfg(feature = "p2")]
+use crate::p2;
+#[cfg(feature = "p2")]
+use crate::p2::bindings::http::types as p2_types;
 #[cfg(feature = "p3")]
 use crate::p3;
-use futures::stream::{FuturesUnordered, Stream};
+use crate::{WasiBody, WasiHttpCtxView};
+use futures::{
+    channel::oneshot,
+    future::{Either, FutureExt},
+    stream::{FuturesUnordered, Stream},
+};
+#[cfg(feature = "p3")]
+use p3::bindings::http::types as p3_types;
 use std::collections::VecDeque;
 use std::collections::btree_map::{BTreeMap, Entry};
+use std::error;
+use std::fmt;
 use std::future;
+use std::mem;
+use std::ops::DerefMut;
 use std::pin::{Pin, pin};
 use std::sync::{
     Arc, Mutex,
-    atomic::{
-        AtomicBool, AtomicU64, AtomicUsize,
-        Ordering::{Relaxed, SeqCst},
-    },
+    atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
 };
-use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::sync::Notify;
-use wasmtime::AsContextMut;
-use wasmtime::component::Accessor;
-use wasmtime::{Result, Store, StoreContextMut, format_err};
-
-/// Alternative p2 bindings generated with `exports: { default: async | store }`
-/// so we can use `TypedFunc::call_concurrent` with both p2 and p3 instances.
+use wasmtime::component::{Accessor, Resource, TaskGroupId, TypedFuncCallConcurrent};
 #[cfg(feature = "p2")]
-pub mod p2 {
-    #[expect(missing_docs, reason = "bindgen-generated code")]
-    pub mod bindings {
-        wasmtime::component::bindgen!({
-            path: "wit",
-            world: "wasi:http/proxy",
-            imports: { default: tracing },
-            exports: { default: async | store },
-            require_store_data_send: true,
-            with: {
-                // http is in this crate
-                "wasi:http": crate::p2::bindings::http,
-                // Upstream package dependencies
-                "wasi:io": wasmtime_wasi::p2::bindings::io,
-            }
-        });
+use wasmtime::error::Context as _;
+use wasmtime::{AsContextMut, Result, Store, StoreContextMut, format_err};
 
-        pub use wasi::*;
-    }
-}
+/// A Request to be handled using `ProxyHandler::handle`.
+pub type Request = http::Request<WasiBody>;
+
+/// A Response returned by `ProxyHandler::handle`.
+pub type Response = http::Response<WasiBody>;
 
 /// Represents either a `wasi:http/incoming-handler@0.2.x` or
 /// `wasi:http/handler@0.3.x` pre-instance.
@@ -58,7 +53,8 @@ pub enum ProxyPre<T: 'static> {
 }
 
 impl<T: 'static> ProxyPre<T> {
-    async fn instantiate_async(&self, store: impl AsContextMut<Data = T>) -> Result<Proxy>
+    /// Instantiates the pre-instance.
+    pub async fn instantiate_async(&self, store: impl AsContextMut<Data = T>) -> Result<Proxy>
     where
         T: Send,
     {
@@ -82,24 +78,17 @@ pub enum Proxy {
     P3(p3::bindings::Service),
 }
 
-/// Represents a task to run using a `wasi:http/incoming-handler@0.2.x` or
-/// `wasi:http/handler@0.3.x` instance.
-pub type TaskFn<T> = Box<
-    dyn for<'a> FnOnce(&'a Accessor<T>, &'a Proxy) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
-        + Send,
->;
-
 /// Async MPMC channel where each item is delivered to at most one consumer.
 struct Queue<T> {
     queue: Mutex<VecDeque<T>>,
-    notify: Notify,
+    notify_push: Notify,
 }
 
 impl<T> Default for Queue<T> {
     fn default() -> Self {
         Self {
             queue: Default::default(),
-            notify: Default::default(),
+            notify_push: Default::default(),
         }
     }
 }
@@ -109,21 +98,16 @@ impl<T> Queue<T> {
         self.queue.lock().unwrap().is_empty()
     }
 
-    fn push(&self, item: T) {
-        self.queue.lock().unwrap().push_back(item);
-        self.notify.notify_one();
-    }
-
     fn try_pop(&self) -> Option<T> {
         self.queue.lock().unwrap().pop_front()
     }
 
     async fn pop(&self) -> T {
-        // This code comes from the Unbound MPMC Channel example in [the
+        // This code comes from the Unbounded MPMC Channel example in [the
         // `tokio::sync::Notify`
         // docs](https://docs.rs/tokio/latest/tokio/sync/struct.Notify.html).
 
-        let mut notified = pin!(self.notify.notified());
+        let mut notified = pin!(self.notify_push.notified());
 
         loop {
             notified.as_mut().enable();
@@ -131,69 +115,188 @@ impl<T> Queue<T> {
                 return item;
             }
             notified.as_mut().await;
-            notified.set(self.notify.notified());
+            notified.set(self.notify_push.notified());
         }
     }
 }
 
-/// Bundles a [`Store`] with a callback to write a profile (if configured).
-pub struct StoreBundle<T: 'static> {
-    /// The [`Store`] to use to handle requests.
+/// Represents the status of a `ProxyHandler` worker task.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum WorkerStatus {
+    /// The worker is not handling any requests, nor is it doing any post-return
+    /// work.  It _might_ be doing background work which the guest has indicated
+    /// can be interrupted and/or abandoned at any time, i.e. does not prevent
+    /// the instance from being disposed.
+    Idle,
+    /// The instance is handling one or more requests, waiting for each to
+    /// either produce a response or expire.
+    Requests,
+    /// All requests handled so far have either produced a response or expired,
+    /// but the guest has post-return work which needs to finish before the
+    /// instance can be considered idle.
+    PostReturn,
+}
+
+/// Represents the application-specific state of a `ProxyHandler` worker.
+///
+/// [`HandlerState::instantiate`] returns an implementation of this trait for
+/// each component instance (and thus each worker) created.  The worker uses it
+/// to determine when to exit.
+pub trait WorkerExpiration: 'static + Send + Sync {
+    /// Poll whether the worker has expired.
+    ///
+    /// This will return `Poll::Ready(())` if the worker has expired, meaning
+    /// the component instance should be dropped.  Otherwise, it will return
+    /// `Poll::Pending` and wake the `Waker` if and when it should be polled
+    /// again.
+    ///
+    /// `state` represents the current state of the worker, and `start`
+    /// represents when it transitioned into that state (or in the case of
+    /// `WorkerState::Requests`, when the most recent outstanding request
+    /// was accepted).
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        state: WorkerStatus,
+        start: Instant,
+    ) -> Poll<()>;
+}
+
+/// Represents the application-specific state of a `ProxyHandler` worker.
+///
+/// [`HandlerState::instantiate`] returns an implementation of this trait for
+/// each component instance (and thus each worker) created.  The worker uses it
+/// to determine how many requests to accept, how long to wait for the guest to
+/// produce responses, etc.
+pub trait WorkerState: 'static + Send + Sync {
+    /// The type of the associated data for [`Store`] belonging to this worker.
+    type StoreData: Send;
+
+    /// Opaque data that hosts can attach to requests which is threaded from
+    /// [`ProxyHandler::handle`] into [`WorkerState::on_request_start`].
+    type RequestData: Send + Sync;
+
+    /// Indicate whether the worker should accept another request given the
+    /// current number it is already handling concurrently and the total it has
+    /// handled so far.
+    fn should_accept_request(&self, concurrent_count: usize, total_count: usize) -> ShouldAccept;
+
+    /// Notification that a request has been accepted by the worker.
+    ///
+    /// This method can be used to record anything within `store`, if necessary.
+    /// If the `task-group-hook` feature is enabled, the task group
+    /// corresponding to the component-model-level async task about to be
+    /// created is additionally passed here.
+    ///
+    /// If the future returned by this function resolves before the guest has
+    /// produced a response, the request will be considered "expired" and the
+    /// original `ProxyHandler::handle` future will resolve to an
+    /// `Err(ExpirationError.into())`.  In addition, the worker
+    /// will stop accepting new requests but will continue running until all
+    /// requests that have been accepted by the worker have either produced a
+    /// response or expired, at which point the state of the worker will
+    /// transition to either `WorkerState::PostReturn` or `WorkerState::Idle`.
+    ///
+    /// Note that the returned future is polled from within the
+    /// `Store::run_concurrent` event loop, and due to #11869 and #11870, it may
+    /// not be polled at all for arbitrary lengths of time.  Consequently, the
+    /// `Self::Expiration` implementation (which is polled from _outside_ the
+    /// `Store::run_concurrent` event loop) must also enforce request expiration
+    /// as a second level of defence if desired.
+    ///
+    /// For example, if a request timeout of N seconds is to be enforced, the
+    /// `Self::Expiration::poll` implementation, when called with
+    /// `WorkerState::Requests` should calculate the time elapsed since the most
+    /// recent outstanding request was accepted as indicated by the `start`
+    /// parameter.  If that time is greater than N seconds, we can expire the
+    /// instance immediately, confident that all outstanding requests have
+    /// expired.
+    ///
+    /// Once #11869 and #11870 have been addressed, this "second level of
+    /// defence" will no longer be necessary.
+    fn on_request_start(
+        &self,
+        store: StoreContextMut<'_, Self::StoreData>,
+        data: Self::RequestData,
+        task_group: TaskGroupId,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'static + Send + Sync>>;
+
+    /// Dispose of the store belonging to the now-exited worker.
+    ///
+    /// This may be used to e.g. collect metrics from the store or its
+    /// associated data before the store is dropped, as well as e.g. retry
+    /// failed instantiations after the store is dropped.
+    ///
+    /// If the store is being dropped due to an error (e.g. a guest trap or a
+    /// host panic) `result` will be `Err(_)`; otherwise it will be `Ok(())`.
+    fn drop(&self, store: Store<Self::StoreData>, result: Result<(), wasmtime::Error>);
+
+    /// Poll the specified future representing the event loop for the store to
+    /// which the worker belongs.
+    fn poll<T>(&self, future: Pin<&mut impl Future<Output = T>>, cx: &mut Context) -> Poll<T> {
+        future.poll(cx)
+    }
+}
+
+/// Represents the combination of a store and instance with which to handle
+/// requests.
+pub struct Instance<T: 'static, E: WorkerExpiration, S: WorkerState> {
+    /// The store to use to handle requests.
     pub store: Store<T>,
-    /// Callback to write a profile (if enabled) once all requests have been
-    /// handled.
-    pub write_profile: Box<dyn FnOnce(StoreContextMut<T>) + Send>,
+    /// The instance to use to handle requests.
+    pub proxy: Proxy,
+    /// `WasiHttpCtxView` getter function.
+    pub view: fn(&mut T) -> WasiHttpCtxView<'_>,
+    /// See [`WorkerExpiration`].
+    pub expiration: E,
+    /// See [`WorkerState`].
+    pub state: S,
+}
+
+/// Indicates whether a worker should accept new requests.
+pub enum ShouldAccept {
+    /// Yes, it should.
+    Yes,
+    /// No, it shouldn't (but ask again later).
+    No,
+    /// No, it shouldn't (and don't ask again).
+    Never,
 }
 
 /// Represents the application-specific state of a web server.
-pub trait HandlerState: 'static + Sync + Send {
+pub trait HandlerState: 'static + Sync + Send + Sized {
     /// The type of the associated data for [`Store`]s created using
-    /// [`Self::new_store`].
+    /// [`Self::instantiate`].
     type StoreData: Send;
+    /// The type of the `WorkerExpiration` implementation to be returned from
+    /// [`Self::instantiate`].
+    type WorkerExpiration: WorkerExpiration;
+    /// The type of the `WorkerState` implementation to be returned from
+    /// [`Self::instantiate`].
+    type WorkerState: WorkerState<StoreData = Self::StoreData>;
 
-    /// Create a new [`Store`] for handling one or more requests.
+    /// Create a new store and instance for handling one or more requests.
     ///
-    /// The `req_id` parameter is the value passed in the call to
-    /// [`ProxyHandler::spawn`] that created the worker to which the new `Store`
-    /// will belong.  See that function's documentation for details.
-    fn new_store(&self, req_id: Option<u64>) -> Result<StoreBundle<Self::StoreData>>;
-
-    /// Maximum time allowed to handle a request.
-    ///
-    /// In practice, a guest may be allowed to run up to 2x this time in the
-    /// case of instance reuse to avoid penalizing concurrent requests being
-    /// handled by the same instance.
-    fn request_timeout(&self) -> Duration;
-
-    /// Maximum time to keep an idle instance around before dropping it.
-    fn idle_instance_timeout(&self) -> Duration;
-
-    /// Maximum number of requests to handle using a single instance before
-    /// dropping it.
-    fn max_instance_reuse_count(&self) -> usize;
-
-    /// Maximum number of requests to handle concurrently using a single
-    /// instance.
-    fn max_instance_concurrent_reuse_count(&self) -> usize;
-
-    /// Called when a worker exits with an error.
-    fn handle_worker_error(&self, error: wasmtime::Error);
+    /// Note that the implementer is responsible for applying a timeout to the
+    /// guest instantiation if appropriate (e.g. as part of an overall request
+    /// timeout).
+    fn instantiate(
+        &self,
+    ) -> impl Future<
+        Output = Result<Instance<Self::StoreData, Self::WorkerExpiration, Self::WorkerState>>,
+    > + Send;
 }
 
 struct ProxyHandlerInner<S: HandlerState> {
     state: S,
-    instance_pre: ProxyPre<S::StoreData>,
-    next_id: AtomicU64,
-    task_queue: Queue<TaskFn<S::StoreData>>,
+    request_queue: Queue<WorkerRequest<S>>,
     worker_count: AtomicUsize,
 }
 
-/// Helper utility to track the start times of tasks accepted by a worker.
+/// Tracks request start times.
 ///
-/// This is used to ensure that timeouts are enforced even when the
-/// `StoreContextMut::run_concurrent` event loop is unable to make progress due
-/// to the guest either busy looping or being blocked on a synchronous call to a
-/// host function which has exclusive access to the `Store`.
+/// This is useful for keeping a [`WorkerState`] appraised of the most recently
+/// accepted outstanding request.
 #[derive(Default)]
 struct StartTimes(BTreeMap<Instant, usize>);
 
@@ -217,10 +320,16 @@ impl StartTimes {
         }
     }
 
-    fn earliest(&self) -> Option<Instant> {
-        self.0.first_key_value().map(|(&k, _)| k)
+    fn most_recent(&self) -> Option<Instant> {
+        self.0.last_key_value().map(|(&k, _)| k)
     }
 }
+
+type WorkerRequest<S> = (
+    <<S as HandlerState>::WorkerState as WorkerState>::RequestData,
+    Request,
+    oneshot::Sender<Result<Response, wasmtime::Error>>,
+);
 
 struct Worker<S>
 where
@@ -240,114 +349,193 @@ where
             if available {
                 self.handler.0.worker_count.fetch_add(1, Relaxed);
             } else {
-                // Here we use `SeqCst` to ensure the load/store is ordered
-                // correctly with respect to the `Queue::is_empty` check we do
-                // below.
-                let count = self.handler.0.worker_count.fetch_sub(1, SeqCst);
+                // Decrement the count _before_ checking if the request queue is
+                // empty.  This helps ensure that `ProxyHandler::spawn` sees the
+                // new value before deciding whether to spawn a new worker.
+                let count = self.handler.0.worker_count.fetch_sub(1, Relaxed);
+                assert!(count >= 1);
+
                 // This addresses what would otherwise be a race condition in
                 // `ProxyHandler::spawn` where it only starts a worker if the
                 // available worker count is zero.  If we decrement the count to
                 // zero right after `ProxyHandler::spawn` checks it, then no
                 // worker will be started; thus it becomes our responsibility to
                 // start a worker here instead.
-                if count == 1 && !self.handler.0.task_queue.is_empty() {
-                    self.handler.start_worker(None, None);
+                if count == 1 && !self.handler.0.request_queue.is_empty() {
+                    self.handler.start_worker(None);
                 }
             }
         }
     }
 
-    async fn run(mut self, task: Option<TaskFn<S::StoreData>>, req_id: Option<u64>) {
-        if let Err(error) = self.run_(task, req_id).await {
-            self.handler.0.state.handle_worker_error(error);
+    async fn run(self, request: Option<WorkerRequest<S>>) {
+        match self.handler.0.state.instantiate().await {
+            Ok(Instance {
+                store,
+                proxy,
+                view,
+                expiration,
+                state,
+            }) => {
+                self.run_(store, proxy, view, expiration, state, request)
+                    .await
+            }
+
+            Err(error) => {
+                let error = Arc::new(error);
+                if let Some((request_data, request, tx)) = request {
+                    _ = tx.send(Err(InstantiationError {
+                        request_data,
+                        request: Mutex::new(request),
+                        error,
+                    }
+                    .into()));
+                } else {
+                    // In this case, the worker was spawned to handle any queued
+                    // requests.  Since we can't handle those requests, we send
+                    // them all an instantiation error.
+                    for (request_data, request, tx) in mem::take(
+                        self.handler
+                            .0
+                            .request_queue
+                            .queue
+                            .lock()
+                            .unwrap()
+                            .deref_mut(),
+                    ) {
+                        _ = tx.send(Err(InstantiationError {
+                            request_data,
+                            request: Mutex::new(request),
+                            error: error.clone(),
+                        }
+                        .into()));
+                    }
+                }
+            }
         }
     }
 
     async fn run_(
-        &mut self,
-        task: Option<TaskFn<S::StoreData>>,
-        req_id: Option<u64>,
-    ) -> Result<()> {
+        mut self,
+        store: Store<S::StoreData>,
+        proxy: Proxy,
+        view: fn(&mut S::StoreData) -> WasiHttpCtxView<'_>,
+        expiration: S::WorkerExpiration,
+        state: S::WorkerState,
+        request: Option<WorkerRequest<S>>,
+    ) {
         // NB: The code the follows is rather subtle in that it is structured
-        // carefully to provide a few key invariants related to how instance
-        // reuse and request timeouts interact:
+        // carefully to give the `HandlerState` implementation full control over
+        // the component instance lifetime. Specifically, we must keep the
+        // `HandlerState` informed of the worker's state and how long it has
+        // been in that state, as well as allow it to expire the instance based
+        // on whatever combination of timeouts, dynamic resource usage, etc. it
+        // may take into consideration.
         //
-        // - A task must never be allowed to run for more than 2x the request
-        // timeout, if any.
+        // Note that, when more than one request is handled concurrently in the
+        // same instance, we must stop accepting new requests as soon as any
+        // existing request reaches its expiration.  This serves to cap the
+        // amount of time we need to keep the instance alive before _all_
+        // requests have either completed or expired.
         //
-        // - Every task we accept here must be allowed to run for at least 1x
-        // the request timeout, if any.
-        //
-        // - When more than one task is run concurrently in the same instance,
-        // we must stop accepting new tasks as soon as any existing task reaches
-        // the request timeout.  This serves to cap the amount of time we need
-        // to keep the instance alive before _all_ tasks have either completed
-        // or timed out.
-        //
-        // As of this writing, there's an additional wrinkle that makes
-        // guaranteeing those invariants particularly tricky: per #11869 and
-        // #11870, busy guest loops, epoch interruption, and host functions
-        // registered using `Linker::func_{wrap,new}_async` all require
-        // blocking, exclusive access to the `Store`, which effectively prevents
-        // the `StoreContextMut::run_concurrent` event loop from making
-        // progress.  That, in turn, prevents any concurrent tasks from
-        // executing, and also prevents the `AsyncFnOnce` passed to
-        // `run_concurrent` from being polled.  Consequently, we must rely on a
-        // "second line of defense" to ensure tasks are timed out promptly,
-        // which is to check for timeouts _outside_ the `run_concurrent` future.
-        // Once the aforementioned issues have been addressed, we'll be able to
-        // remove that check and its associated baggage.
+        // As of this writing, there's an additional wrinkle that makes tracking
+        // expiration particularly tricky: per #11869 and #11870, busy guest
+        // loops, epoch interruption, and host functions registered using
+        // `Linker::func_{wrap,new}_async` all require blocking, exclusive
+        // access to the `Store`, which effectively prevents the
+        // `StoreContextMut::run_concurrent` event loop from making progress.
+        // That, in turn, prevents any concurrent tasks from executing, and also
+        // prevents the `AsyncFnOnce` passed to `run_concurrent` from being
+        // polled.  Consequently, we must poll `S::WorkerState` from _outside_
+        // the `run_concurrent` future to ensure expirations are enforced.  Once
+        // the aforementioned issues have been addressed, we'll be able to
+        // simplify the code and eliminate the need for communication between
+        // the "inside" future and the "outside" one.
 
-        let handler = &self.handler.0;
+        // Wrap `store` in an object which, prior to leaving this scope, will
+        // pass the `store` to `HandlerState::drop`.
+        struct Dropper<S: HandlerState> {
+            state: S::WorkerState,
+            store: Option<Store<S::StoreData>>,
+        }
 
-        let StoreBundle {
-            mut store,
-            write_profile,
-        } = handler.state.new_store(req_id)?;
+        impl<S: HandlerState> Drop for Dropper<S> {
+            fn drop(&mut self) {
+                if let Some(store) = self.store.take() {
+                    self.state
+                        .drop(store, Err(wasmtime::format_err!("worker panicked")));
+                }
+            }
+        }
 
-        let request_timeout = handler.state.request_timeout();
-        let idle_instance_timeout = handler.state.idle_instance_timeout();
-        let max_instance_reuse_count = handler.state.max_instance_reuse_count();
-        let max_instance_concurrent_reuse_count =
-            handler.state.max_instance_concurrent_reuse_count();
+        let mut dropper = Dropper::<S> {
+            state,
+            store: Some(store),
+        };
 
-        let proxy = &handler.instance_pre.instantiate_async(&mut store).await?;
+        let proxy = &proxy;
+
         let accept_concurrent = AtomicBool::new(true);
-        let task_start_times = Mutex::new(StartTimes::default());
+        let status = Mutex::new((WorkerStatus::Idle, Instant::now()));
+        let mut expiration = pin!(expiration);
 
-        let mut future = pin!(store.run_concurrent(async |accessor| {
+        let function = async |accessor: &Accessor<_>| {
             let mut reuse_count = 0;
-            let mut timed_out = false;
+            let mut may_accept = true;
             let mut futures = FuturesUnordered::new();
+            let mut start_times = StartTimes::default();
 
-            let accept_task = |task: TaskFn<S::StoreData>,
-                               futures: &mut FuturesUnordered<_>,
-                               reuse_count: &mut usize| {
+            let accept_request = |(request_data, request, tx): WorkerRequest<S>,
+                                  futures: &mut FuturesUnordered<_>,
+                                  start_times: &mut StartTimes,
+                                  reuse_count: &mut usize| {
                 // Set `accept_concurrent` to false, conservatively assuming
                 // that the new task will be CPU-bound, at least to begin with.
                 // Only once the `StoreContextMut::run_concurrent` event loop
                 // returns `Pending` will we set `accept_concurrent` back to
-                // true and consider accepting more tasks.
+                // true and consider accepting more requests.
                 //
                 // This approach avoids taking on more than one CPU-bound task
                 // at a time, which would hurt throughput vs. leaving the
-                // additional tasks for other workers to handle.
+                // additional requests for other workers to handle.
                 accept_concurrent.store(false, Relaxed);
                 *reuse_count += 1;
 
-                let start_time = Instant::now().checked_add(request_timeout);
-                if let Some(start_time) = start_time {
-                    task_start_times.lock().unwrap().add(start_time);
-                }
+                let prepared = accessor.with(|mut store| {
+                    let prepared = Prepared::new(store.as_context_mut(), proxy, request, view, tx);
+                    match prepared {
+                        Ok(prepared) => {
+                            // Notify the `HandlerState` that we're starting to
+                            // handle a request and retrieve the deadline by
+                            // which it must produce a response.
+                            //
+                            // If it fails to produce a response by the
+                            // deadline, we'll stop accepting new requests and
+                            // eventually exit the worker.
+                            let expiration = dropper.state.on_request_start(
+                                store.as_context_mut(),
+                                request_data,
+                                prepared.group(),
+                            );
+                            Ok((prepared, expiration))
+                        }
+                        Err(e) => Err(e),
+                    }
+                });
 
-                futures.push(tokio::time::timeout(request_timeout, async move {
-                    (task)(accessor, proxy).await;
-                    start_time
-                }));
+                let start_time = Instant::now();
+                start_times.add(start_time);
+                *status.try_lock().unwrap() = (WorkerStatus::Requests, start_time);
+
+                futures.push(async move {
+                    let (prepared, expiration) = prepared?;
+                    let sent = prepared.run(accessor, expiration).await?;
+                    wasmtime::error::Ok((sent, start_time))
+                });
             };
 
-            if let Some(task) = task {
-                accept_task(task, &mut futures, &mut reuse_count);
+            if let Some(req) = request {
+                accept_request(req, &mut futures, &mut start_times, &mut reuse_count);
             }
 
             // This is the main driver loop for this worker. This is modeled as
@@ -355,25 +543,24 @@ where
             // Events are sourced from the locals here, pinned outside of the
             // `poll_fn` closure.
             let mut futures = pin!(futures);
-            let mut idle_timeout_set = false;
-            let mut idle_timeout = pin!(tokio::time::sleep(Duration::MAX));
             let handler = self.handler.clone();
-            let mut incoming_tasks = pin!(futures::stream::unfold(
-                &handler.0.task_queue,
+            let mut incoming_requests = pin!(futures::stream::unfold(
+                &handler.0.request_queue,
                 |queue| async move {
-                    let task = queue.pop().await;
-                    Some((task, queue))
+                    let pair = queue.pop().await;
+                    Some((pair, queue))
                 }
             ));
+            let func = match proxy {
+                #[cfg(feature = "p3")]
+                Proxy::P3(guest) => *guest.wasi_http_handler().func_handle().func(),
+                #[cfg(feature = "p2")]
+                Proxy::P2(guest) => *guest.wasi_http_incoming_handler().func_handle().func(),
+            };
             future::poll_fn(|cx| {
-                // See docs about the idle timeout handling at the very bottom
-                // for what this is doing.
-                let prev_idle_timeout_set = idle_timeout_set;
-                idle_timeout_set = false;
-
                 loop {
-                    // First, and crucially first , poll `futures` first. This
-                    // way we'll discover any tasks that may have timed out, at
+                    // First, and crucially first, poll `futures`. This way
+                    // we'll discover any tasks that may have timed out, at
                     // which point we'll stop accepting new tasks altogether
                     // (see below for details). This is especially important in
                     // the case where the task was blocked on a synchronous call
@@ -383,33 +570,40 @@ where
                     // task first, then we'd have to wait for _that_ task to
                     // finish or time out before we could kill the instance.
                     match futures.as_mut().poll_next(cx) {
-                        // Task completed; carry on!
-                        Poll::Ready(Some(Ok(start_time))) => {
-                            if let Some(start_time) = start_time {
-                                task_start_times.lock().unwrap().remove(start_time);
+                        // A request either produced a response or expired.
+                        Poll::Ready(Some(Ok((responded, start_time)))) => {
+                            // Remove its start time from the map and update the
+                            // state.
+                            start_times.remove(start_time);
+                            *status.try_lock().unwrap() =
+                                if let Some(start_time) = start_times.most_recent() {
+                                    (WorkerStatus::Requests, start_time)
+                                } else {
+                                    (WorkerStatus::PostReturn, Instant::now())
+                                };
+
+                            if responded {
+                                // Response produced; carry on!
+                            } else {
+                                // Request expired; stop accepting new requests, but
+                                // continue polling until any other, in-progress
+                                // tasks until they have either finished or expired.
+                                // This effectively kicks off a "graceful shutdown"
+                                // of the worker, allowing any other concurrent
+                                // tasks time to finish before we drop the instance.
+                                may_accept = false;
                             }
                         }
 
-                        // Task timed out; stop accepting new tasks, but
-                        // continue polling until any other, in-progress tasks
-                        // until they have either finished or timed out. This
-                        // effectively kicks off a "graceful shutdown" of the
-                        // worker, allowing any other concurrent tasks time to
-                        // finish before we drop the instance.
-                        //
-                        // TODO: We should also send a cancel request to the
-                        // timed-out task to give it a chance to shut down
-                        // gracefully (and delay dropping the instance for a
-                        // reasonable amount of time), but as of this writing
-                        // Wasmtime does not yet provide an API for doing that.
-                        // See issue #11833.
-                        Poll::Ready(Some(Err(_))) => {
-                            timed_out = true;
-                            reuse_count = max_instance_reuse_count;
+                        // Instance trapped.
+                        Poll::Ready(Some(Err(error))) => {
+                            break Poll::Ready(Err(error));
                         }
 
                         Poll::Ready(None) | Poll::Pending => {}
                     }
+
+                    let is_ready = accessor.poll_ready_for_concurrent_call(func, cx).is_ready();
 
                     // At this point `futures` is either empty or it's `Pending`
                     // meaning nothing is ready. Note that `Pending` here
@@ -421,9 +615,21 @@ where
                     // have capacity for another task if either we have no tasks
                     // at all or all our tasks really are blocked on I/O.
                     self.set_available(
-                        reuse_count < max_instance_reuse_count
-                            && futures.len() < max_instance_concurrent_reuse_count
-                            && (futures.is_empty() || accept_concurrent.load(Relaxed)),
+                        may_accept
+                            && is_ready
+                            && match dropper
+                                .state
+                                .should_accept_request(futures.len(), reuse_count)
+                            {
+                                ShouldAccept::Yes => {
+                                    futures.is_empty() || accept_concurrent.load(Relaxed)
+                                }
+                                ShouldAccept::No => false,
+                                ShouldAccept::Never => {
+                                    may_accept = false;
+                                    false
+                                }
+                            },
                     );
 
                     // If we're available for accepting more requests after the
@@ -431,9 +637,9 @@ where
                     // successful then push it into `futures` and turn this loop
                     // again to see where we're at next time around.
                     if self.available
-                        && let Poll::Ready(Some(task)) = incoming_tasks.as_mut().poll_next(cx)
+                        && let Poll::Ready(Some(req)) = incoming_requests.as_mut().poll_next(cx)
                     {
-                        accept_task(task, &mut futures, &mut reuse_count);
+                        accept_request(req, &mut futures, &mut start_times, &mut reuse_count);
                         continue;
                     }
 
@@ -456,133 +662,91 @@ where
                     // then we're done with this iteration of `poll`. We'll get
                     // woken up when anything changes, but otherwise it's time
                     // to let something else happen.
-                    //
-                    // This is all skipped if something has timed out though. In
-                    // that situation we're basically no longer interested in
-                    // this store so we're no longer cooperatively trying to let
-                    // it keep going.
-                    if !timed_out && !accessor.poll_no_interesting_tasks(cx).is_ready() {
+                    if accessor.poll_no_interesting_tasks(cx).is_pending() {
                         break Poll::Pending;
                     }
 
                     // And now at this point we (a) have no `futures`, (b) no
-                    // new connections came in, and (c) the store is completely
-                    // devoid of interesting work. In this situation if we're
-                    // not actually capable of accepting any more work, then
-                    // we're completely done and it's time to exit this worker.
-                    if !self.available {
-                        break Poll::Ready(());
+                    // new requests are available, and (c) the store is
+                    // completely devoid of interesting work. In this situation
+                    // if we're not actually capable of accepting any more work,
+                    // then we're completely done and it's time to exit this
+                    // worker.
+                    if !(may_accept && is_ready) {
+                        break Poll::Ready(Ok(()));
                     }
 
-                    // And now, finally, we wait for a timeout. Here we're just
-                    // like above except that we're candidate for accepting more
-                    // work in the future. If this is our first time here then
-                    // reset the idle timeout to `idle_instance_timeout` from
-                    // now, but othrewise just go take a look at `idle_timeout`
-                    // and see if it's elapsed yet.
-                    //
-                    // Note that the way that this entire loop is structured is
-                    // that we've already polled all the interesting sources of
-                    // events we're interested in at this point, for example
-                    // `futures`, `accessor`, and `incoming_tasks`. Here we add
-                    // `idle_timeout` to that set and once anything is ready and
-                    // fires then this entire loop will restart and we'll check
-                    // everything again.
-                    //
-                    // Also note that the idle timeout is supposed to start when
-                    // the store is itself entirely idle. The way this loop is
-                    // structured is that when we entire this `poll` closure the
-                    // `idle_timeout_set` variable is unconditionally set to
-                    // `false`. That way if we exit out for some other reason,
-                    // such as getting work, then the idle timeout will get
-                    // reset next time we fall down here. Otherwise though if we
-                    // fell down this far we actually want to preserve
-                    // `idle_timeout_set` from when we first started, so that's
-                    // restored here.
-                    idle_timeout_set = prev_idle_timeout_set;
-                    if !idle_timeout_set {
-                        idle_timeout
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + idle_instance_timeout);
-                        idle_timeout_set = true;
+                    // Finally, at this point we're idle but still eligible to
+                    // accept new work, so update the state if appropriate and
+                    // then return pending while we wait for new work.
+                    {
+                        let mut status = status.try_lock().unwrap();
+                        if status.0 != WorkerStatus::Idle {
+                            *status = (WorkerStatus::Idle, Instant::now());
+                        }
                     }
-                    break idle_timeout.as_mut().poll(cx);
+                    break Poll::Pending;
                 }
             })
-            .await;
+            .await
+        };
 
-            accessor.with(|mut access| write_profile(access.as_context_mut()));
-
-            if timed_out {
-                Err(format_err!("guest timed out"))
-            } else {
-                wasmtime::error::Ok(())
-            }
-        }));
-
-        let mut sleep = pin!(tokio::time::sleep(Duration::MAX));
-
-        future::poll_fn(|cx| {
-            let poll = future.as_mut().poll(cx);
-            if poll.is_pending() {
-                // If the future returns `Pending`, that's either because it's
-                // idle (in which case it can definitely accept a new task) or
-                // because all its tasks are awaiting I/O, in which case it may
-                // have capacity for additional tasks to run concurrently.
-                //
-                // However, if one of the tasks is blocked on a sync call to a
-                // host function which has exclusive access to the `Store`, the
-                // `StoreContextMut::run_concurrent` event loop will be unable
-                // to make progress until that call finishes.  Similarly, if the
-                // task loops indefinitely, subject only to epoch interruption,
-                // the event loop will also be stuck.  Either way, any task
-                // timeouts created inside the `AsyncFnOnce` we passed to
-                // `run_concurrent` won't have a chance to trigger.
-                // Consequently, we need to _also_ enforce timeouts here,
-                // outside the event loop.
-                //
-                // Therefore, we check if the oldest outstanding task has been
-                // running for at least `request_timeout*2`, which is the
-                // maximum time needed for any other concurrent tasks to
-                // complete or time out, at which point we can safely discard
-                // the instance.  If that deadline has not yet arrived, we
-                // schedule a wakeup to occur when it does.
-                //
-                // We uphold the "never kill an instance with a task which has
-                // been running for less than the request timeout" invariant
-                // here by noting that this timeout will only trigger if the
-                // `AsyncFnOnce` we passed to `run_concurrent` has been unable
-                // to run for at least the past `request_timeout` amount of
-                // time, meaning it can't possibly have accepted a task newer
-                // than that.
-                if let Some(deadline) = task_start_times
-                    .lock()
+        let result = {
+            let mut future = pin!(
+                dropper
+                    .store
+                    .as_mut()
                     .unwrap()
-                    .earliest()
-                    .and_then(|v| v.checked_add(request_timeout.saturating_mul(2)))
-                {
-                    sleep.as_mut().reset(deadline.into());
-                    // Note that this will schedule a wakeup for later if the
-                    // deadline has not yet arrived:
-                    if sleep.as_mut().poll(cx).is_ready() {
-                        // Deadline has been reached; kill the instance with an
-                        // error.
-                        return Poll::Ready(Err(format_err!("guest timed out")));
+                    .run_concurrent(function)
+                    .map(|v| v.flatten())
+            );
+
+            future::poll_fn(|cx| {
+                let poll = dropper.state.poll(future.as_mut(), cx);
+                if poll.is_pending() {
+                    // If the future returns `Pending`, that's either because it's
+                    // idle (in which case it can definitely accept a new request) or
+                    // because all its tasks are awaiting I/O, in which case it may
+                    // have capacity for additional tasks to run concurrently.
+                    //
+                    // However, per #11869 and #11870, if one of the tasks is
+                    // blocked on a sync call to a host function which has exclusive
+                    // access to the `Store`, the `StoreContextMut::run_concurrent`
+                    // event loop will be unable to make progress until that call
+                    // finishes.  Similarly, if the task loops indefinitely, subject
+                    // only to epoch interruption, the event loop will also be
+                    // stuck.  Either way, any request expirations created inside
+                    // the `AsyncFnOnce` we passed to `run_concurrent` won't have a
+                    // chance to trigger.  Consequently, we poll for instance
+                    // expiration here, outside the event loop, based on the most
+                    // recently recorded state of the worker.
+
+                    let (status, start) = *status.try_lock().unwrap();
+
+                    if let Poll::Ready(()) = expiration.as_mut().poll(cx, status, start) {
+                        return Poll::Ready(match status {
+                            WorkerStatus::Requests | WorkerStatus::PostReturn => {
+                                Err(format_err!("guest timed out"))
+                            }
+                            WorkerStatus::Idle => Ok(()),
+                        });
+                    }
+
+                    // Otherwise, if the instance has not yet expired, we set
+                    // `accept_concurrent` to true and, if it wasn't already true
+                    // before, poll the future one more time so it can ask for
+                    // another request if appropriate.
+                    if !accept_concurrent.swap(true, Relaxed) {
+                        return dropper.state.poll(future.as_mut(), cx);
                     }
                 }
 
-                // Otherwise, if no timeouts have elapsed, we set
-                // `accept_concurrent` to true and, if it wasn't already true
-                // before, poll the future one more time so it can ask for
-                // another task if appropriate.
-                if !accept_concurrent.swap(true, Relaxed) {
-                    return future.as_mut().poll(cx);
-                }
-            }
+                poll
+            })
+            .await
+        };
 
-            poll
-        })
-        .await?
+        dropper.state.drop(dropper.store.take().unwrap(), result);
     }
 }
 
@@ -598,8 +762,8 @@ where
 /// Represents the state of a web server.
 ///
 /// Note that this supports optional instance reuse, enabled when
-/// `S::max_instance_reuse_count()` returns a number greater than one.  See
-/// [`Self::spawn`] for details.
+/// `S::WorkerState::should_accept_request` returns [`ShouldAccept::Yes`] more
+/// than once for a given instance.  See [`WorkerState`] for details.
 pub struct ProxyHandler<S: HandlerState>(Arc<ProxyHandlerInner<S>>);
 
 impl<S: HandlerState> Clone for ProxyHandler<S> {
@@ -608,76 +772,173 @@ impl<S: HandlerState> Clone for ProxyHandler<S> {
     }
 }
 
+/// This error is returned if, when handling the request, a new worker and
+/// associated instance needed to be created, but instantiation failed, e.g. due
+/// to reaching a pooling allocator limit or running out of memory.  In this
+/// case, the caller may be able to recover and retry (e.g. after waiting for
+/// existing instances to be dropped and/or freeing memory used by caches,
+/// etc.).  Otherwise, it will probably need to return an HTTP 500 error.
+pub struct InstantiationError<T> {
+    /// The host data originally passed with the request.
+    pub request_data: T,
+    /// The original request passed to `ProxyHandler::handle`.
+    ///
+    /// This is wrapped in a `Mutex` to satisfy the `Send + Sync` bounds
+    /// required by `wasmtime::Error`.
+    pub request: Mutex<Request>,
+    /// The original instantiation error.
+    ///
+    /// This is wrapped in an `Arc` because a single instantiation error may
+    /// affect multiple requests, and each caller will be given a clone.
+    pub error: Arc<wasmtime::Error>,
+}
+
+impl<T> fmt::Display for InstantiationError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(f, "instantiation error: {}", self.error)
+    }
+}
+
+impl<T> fmt::Debug for InstantiationError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(f, "instantiation error: {:?}", self.error)
+    }
+}
+
+impl<T> error::Error for InstantiationError<T> {}
+
+/// Returned when the guest failed to produce a response before the expiration
+/// returned by `HandlerState::on_request_start` elapsed.
+pub struct ExpirationError;
+
+impl fmt::Display for ExpirationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+impl fmt::Debug for ExpirationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(f, "guest timed out")
+    }
+}
+
+impl error::Error for ExpirationError {}
+
+/// A worker trapped or panicked and failed to produce a result.
+pub struct TrapOrPanicError;
+
+impl fmt::Display for TrapOrPanicError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+impl fmt::Debug for TrapOrPanicError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(f, "worker trapped or panicked")
+    }
+}
+
+impl error::Error for TrapOrPanicError {}
+
 impl<S> ProxyHandler<S>
 where
     S: HandlerState,
 {
     /// Create a new `ProxyHandler` with the specified application state and
     /// pre-instance.
-    pub fn new(state: S, instance_pre: ProxyPre<S::StoreData>) -> Self {
+    pub fn new(state: S) -> Self {
         Self(Arc::new(ProxyHandlerInner {
             state,
-            instance_pre,
-            next_id: AtomicU64::from(0),
-            task_queue: Default::default(),
+            request_queue: Default::default(),
             worker_count: AtomicUsize::from(0),
         }))
     }
 
-    /// Push a task to the task queue for this handler.
+    /// Handle the specified request, returning a response on success or the
+    /// tuple of the request and error on failure.
     ///
-    /// This will either spawn a new background worker to run the task or
-    /// deliver it to an already-running worker.
+    /// This function will return a `wasmtime::Error` on failure, which may be
+    /// downcast to a more specific type in certain scenarios:
     ///
-    /// The `req_id` will be passed to `<S as HandlerState>::new_store` _if_ a
-    /// new worker is started for this task.  It is intended to be used as a
-    /// "request identifier" corresponding to that task and can be used e.g. to
-    /// prefix all logging from the `Store` with that identifier.  Note that a
-    /// non-`None` value only makes sense when `<S as
-    /// HandlerState>::max_instance_reuse_count == 1`; otherwise the identifier
-    /// will not match subsequent tasks handled by the worker.
-    pub fn spawn(&self, req_id: Option<u64>, task: TaskFn<S::StoreData>) {
-        match self.0.state.max_instance_reuse_count() {
-            0 => panic!("`max_instance_reuse_count` must be at least 1"),
-            _ => {
-                if self.0.worker_count.load(Relaxed) == 0 {
-                    // There are no available workers; skip the queue and pass
-                    // the task directly to the worker, which improves
-                    // performance as measured by `wasmtime-server-rps.sh` by
-                    // about 15%.
-                    self.start_worker(Some(task), req_id);
-                } else {
-                    self.0.task_queue.push(task);
-                    // Start a new worker to handle the task if the last worker
-                    // just went unavailable.  See also `Worker::set_available`
-                    // for what happens if the available worker count goes to
-                    // zero right after we check it here, and note that we only
-                    // check the count _after_ we've pushed the task to the
-                    // queue.  We use `SeqCst` here to ensure that we get an
-                    // updated view of `worker_count` as it exists after the
-                    // `Queue::push` above.
-                    //
-                    // The upshot is that at least one (or more) of the
-                    // following will happen:
-                    //
-                    // - An existing worker will accept the task
-                    // - We'll start a new worker here to accept the task
-                    // - `Worker::set_available` will start a new worker to accept the task
-                    //
-                    // I.e. it should not be possible for the task to be
-                    // orphaned indefinitely in the queue without being
-                    // accepted.
-                    if self.0.worker_count.load(SeqCst) == 0 {
-                        self.start_worker(None, None);
-                    }
-                }
+    /// - [`InstantiationError`] if a new worker was created to handle the
+    /// request but could not instantiate the guest component.
+    ///
+    /// - [`ExpirationError`] if the request expired before it produced a
+    /// response.  See [`WorkerState::on_request_start`] for details.
+    ///
+    /// - [`ErrorResponse`](crate::ErrorResponse) if the request could not be
+    /// converted into a guest request.
+    ///
+    /// - [`TrapOrPanicError`] if the worker responsible for handling the
+    /// request trapped or panicked before it produced a response.  This may be
+    /// used when a trap occurs but cannot be traced to a specific request,
+    /// e.g. during concurrent request handling.
+    ///
+    /// In other failure cases (e.g. `wasi:http/types#error-code` return values
+    /// and/or traps when executing synchronous WASIp2 handler functions), the
+    /// original error returned by the handler will be returned.
+    ///
+    /// # Backpressure
+    ///
+    /// Note that this API does not implement any form of backpressure to limit
+    /// the number of in-flight `Request`s being processed. This function
+    /// may spawn new tokio tasks, instantiate new modules under new stores, and
+    /// queue up pending `Request`s while waiting for previous instances. In all
+    /// of these situations invoking this function will consume some host-side
+    /// resources until the request is done.
+    ///
+    /// Embedders using this API must ensure to take this into account. If an
+    /// infinite number of requests can be fed into this function then it's
+    /// recommended to take a semaphore, for example, around this function call
+    /// to limit the number of concurrent requests that are being processed.
+    pub async fn handle(
+        &self,
+        data: <S::WorkerState as WorkerState>::RequestData,
+        request: Request,
+    ) -> Result<Response, wasmtime::Error> {
+        let (tx, rx) = oneshot::channel();
+        let req = (data, request, tx);
+        if self.0.worker_count.load(Relaxed) == 0 {
+            // There are no available workers; skip the queue and pass
+            // the request directly to the worker, which improves
+            // performance as measured by `wasmtime-server-rps.sh` by
+            // about 15%.
+            self.start_worker(Some(req));
+        } else {
+            let mut queue = self.0.request_queue.queue.lock().unwrap();
+            queue.push_back(req);
+
+            // Start a new worker to handle the request if the last worker just
+            // went unavailable.  See also `Worker::set_available` for what
+            // happens if the available worker count goes to zero right after we
+            // check it here, and note that we only check the count _after_
+            // we've pushed the request to the queue.
+            //
+            // The upshot is that at least one (or more) of the
+            // following will happen:
+            //
+            // - An existing worker will accept the request
+            // - We'll start a new worker here to accept the request
+            // - `Worker::set_available` will start a new worker to accept the request
+            //
+            // I.e. it should not be possible for the request to be orphaned
+            // indefinitely in the queue without being accepted except in the
+            // case of a panic or an instantiation error.  In the case of an
+            // instantiation error, we'll give the request back to the caller in
+            // an `Err(_)`, allowing the application to decide what to do next.
+            if self.0.worker_count.load(Relaxed) == 0 {
+                let req = queue.pop_back().unwrap();
+                drop(queue);
+                self.start_worker(Some(req));
+            } else {
+                drop(queue);
+                self.0.request_queue.notify_push.notify_one();
             }
         }
-    }
 
-    /// Generate a unique request ID.
-    pub fn next_req_id(&self) -> u64 {
-        self.0.next_id.fetch_add(1, Relaxed)
+        rx.await.map_err(|_| TrapOrPanicError)?
     }
 
     /// Return a reference to the application state.
@@ -685,18 +946,257 @@ where
         &self.0.state
     }
 
-    /// Return a reference to the pre-instance.
-    pub fn instance_pre(&self) -> &ProxyPre<S::StoreData> {
-        &self.0.instance_pre
-    }
-
-    fn start_worker(&self, task: Option<TaskFn<S::StoreData>>, req_id: Option<u64>) {
+    fn start_worker(&self, request: Option<WorkerRequest<S>>) {
         tokio::spawn(
             Worker {
                 handler: self.clone(),
                 available: false,
             }
-            .run(task, req_id),
+            .run(request),
         );
+    }
+}
+
+/// Representation of a "prepared" call for a guest, used to extract the
+/// `TaskGroupId` before actually executing any handlers.
+///
+/// Right now this is a bit gross since it has to type out a bunch of types by
+/// hand.
+pub enum Prepared<'a, T: 'static> {
+    #[doc(hidden)]
+    #[cfg(feature = "p2")]
+    P2 {
+        guest: &'a p2::bindings::Proxy,
+        call: TypedFuncCallConcurrent<
+            T,
+            (
+                Resource<p2_types::IncomingRequest>,
+                Resource<p2_types::ResponseOutparam>,
+            ),
+            (),
+        >,
+        tx: Arc<Mutex<Option<oneshot::Sender<Result<Response, wasmtime::Error>>>>>,
+    },
+    #[doc(hidden)]
+    #[cfg(feature = "p3")]
+    P3 {
+        guest: &'a p3::bindings::Service,
+        call: TypedFuncCallConcurrent<
+            T,
+            (Resource<p3_types::Request>,),
+            (Result<Resource<p3_types::Response>, p3_types::ErrorCode>,),
+        >,
+        tx: oneshot::Sender<Result<Response, wasmtime::Error>>,
+        request_io_result: Pin<Box<dyn Future<Output = Result<(), crate::Error>> + Send>>,
+        view: fn(&mut T) -> crate::WasiHttpCtxView,
+    },
+}
+
+impl<'a, T: Send> Prepared<'a, T> {
+    /// Creates a new prepared request.
+    pub fn new(
+        mut store: StoreContextMut<'_, T>,
+        proxy: &'a Proxy,
+        request: Request,
+        view: fn(&mut T) -> WasiHttpCtxView<'_>,
+        tx: oneshot::Sender<Result<Response, wasmtime::Error>>,
+    ) -> Result<Prepared<'a, T>> {
+        match proxy {
+            #[cfg(feature = "p3")]
+            Proxy::P3(guest) => {
+                use http::header::HOST;
+                use http::uri::Authority;
+
+                let (parts, body) = request.into_parts();
+                let http::request::Parts {
+                    method,
+                    uri,
+                    headers: request_headers,
+                    ..
+                } = parts;
+                let http::uri::Parts {
+                    authority,
+                    path_and_query,
+                    ..
+                } = uri.into_parts();
+                // HTTP/1.1 requires an authority in the request target or the
+                // `Host` header (RFC 9112 section 3.2.2), so fall back to the latter.
+                let authority = match authority {
+                    Some(authority) => Some(authority),
+                    None => request_headers
+                        .get(HOST)
+                        .and_then(|host| host.to_str().ok())
+                        .and_then(|host| host.parse::<Authority>().ok()),
+                };
+                let hooks = view(store.data_mut()).hooks;
+                let headers = crate::FieldMap::new_immutable(hooks, request_headers);
+                // `serve` speaks plaintext HTTP, so that is the scheme of every
+                // request, whatever scheme its request target names (as in p2).
+                let (request, request_io_result) = p3::Request::new(
+                    method,
+                    Some(http::uri::Scheme::HTTP),
+                    authority,
+                    path_and_query,
+                    headers,
+                    None,
+                    body,
+                );
+                let request = view(store.data_mut()).table.push(request)?;
+
+                Ok(Prepared::P3 {
+                    tx,
+                    request_io_result: Box::pin(request_io_result),
+                    guest,
+                    view,
+                    call: guest
+                        .wasi_http_handler()
+                        .func_handle()
+                        .start_call_concurrent(store, (request,))?,
+                })
+            }
+            #[cfg(feature = "p2")]
+            Proxy::P2(guest) => {
+                // Here we wrap the sender in an `Arc<Mutex<Option<_>>>`, with one
+                // clone used in the `response-outparam` and the other used to send
+                // an error if the request expires or the handler returns without
+                // producing a response.
+                let tx = Arc::new(Mutex::new(Some(tx)));
+
+                let request = match view(store.data_mut())
+                    .new_incoming_request(p2_types::Scheme::Http, request)
+                {
+                    Ok(request) => request,
+                    Err(e) => {
+                        // The request never reached the guest, so there is no
+                        // `response-outparam` to report the failure with, and
+                        // `tx` would otherwise be dropped along with the error.
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            _ = tx.send(Err(e));
+                        }
+                        wasmtime::bail!(
+                            "request was rejected before it could be turned into a guest request"
+                        );
+                    }
+                };
+
+                let out = view(store.data_mut()).new_response_outparam_from_callback({
+                    let tx = tx.clone();
+                    move |value| {
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            _ = tx.send(value.map_err(|e| e.into()));
+                        }
+                    }
+                })?;
+
+                Ok(Prepared::P2 {
+                    guest,
+                    tx,
+                    call: guest
+                        .wasi_http_incoming_handler()
+                        .func_handle()
+                        .start_call_concurrent(store, (request, out))?,
+                })
+            }
+        }
+    }
+
+    fn group(&self) -> TaskGroupId {
+        match self {
+            #[cfg(feature = "p3")]
+            Prepared::P3 { call, .. } => call.group(),
+            #[cfg(feature = "p2")]
+            Prepared::P2 { call, .. } => call.group(),
+        }
+    }
+
+    /// Executes this request to completion.
+    pub async fn run(
+        self,
+        accessor: &Accessor<T>,
+        expiration: impl Future<Output = ()>,
+    ) -> Result<bool> {
+        let expiration = pin!(expiration);
+
+        match self {
+            #[cfg(feature = "p3")]
+            Prepared::P3 {
+                guest,
+                call,
+                tx,
+                request_io_result,
+                view,
+            } => {
+                let handle = pin!(async move {
+                    let response = guest
+                        .wasi_http_handler()
+                        .func_handle()
+                        .finish_call_concurrent(accessor, call)
+                        .await?
+                        .0?;
+
+                    accessor.with(|mut store| {
+                        let response = view(store.get()).table.delete(response)?;
+                        response.into_http_with_getter(&mut store, request_io_result, view)
+                    })
+                });
+
+                // TODO: We should also use `oneshot::Sender::poll_close` to be
+                // notified when the receiver is dropped, in which case we should
+                // expire the request since the response is no longer of interest to
+                // the original `ProxyHandler::handle` caller.
+                let (result, sent) = match futures::future::select(handle, expiration).await {
+                    Either::Left((result, _)) => (result, true),
+                    // TODO: We should also send a cancel request to the expired
+                    // task to give it a chance to shut down gracefully, but as of
+                    // this writing Wasmtime does not yet provide an API for doing
+                    // that.  See issue #11833.  Instead, we let it continue running
+                    // as a background task until it either returns a response
+                    // (which we'll ignore) or the instance itself has expired.
+                    Either::Right(((), _)) => (Err(ExpirationError.into()), false),
+                };
+
+                _ = tx.send(result);
+
+                Ok(sent)
+            }
+            #[cfg(feature = "p2")]
+            Prepared::P2 { guest, call, tx } => {
+                let handle = pin!(
+                    guest
+                        .wasi_http_incoming_handler()
+                        .func_handle()
+                        .finish_call_concurrent(accessor, call)
+                );
+
+                const MESSAGE: &str = "guest never invoked `response-outparam::set` method";
+
+                struct Dropper(
+                    Arc<Mutex<Option<oneshot::Sender<Result<Response, wasmtime::Error>>>>>,
+                );
+
+                impl Drop for Dropper {
+                    fn drop(&mut self) {
+                        if let Some(tx) = self.0.lock().unwrap().take() {
+                            _ = tx.send(Err(format_err!("{MESSAGE}")));
+                        }
+                    }
+                }
+
+                let tx = Dropper(tx);
+
+                // See corresponding TODO comment for the p3 case above.
+                let (result, sent) = match futures::future::select(handle, expiration).await {
+                    Either::Left((result, _)) => (result.context(MESSAGE), true),
+                    // See corresponding TODO comment for the p3 case above.
+                    Either::Right(((), _)) => (Err(ExpirationError.into()), false),
+                };
+
+                if let Some(tx) = tx.0.lock().unwrap().take() {
+                    _ = tx.send(result.and_then(|()| Err(format_err!("{MESSAGE}"))));
+                }
+
+                Ok(sent)
+            }
+        }
     }
 }

@@ -25,8 +25,28 @@ async fn p2_http_outbound_request_get() -> Result<()> {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_http_outbound_request_between_bytes_timeout() -> Result<()> {
+    let server = Server::http1_stalled_body(1, std::time::Duration::from_secs(5))?;
+    run(
+        P2_HTTP_OUTBOUND_REQUEST_BETWEEN_BYTES_TIMEOUT_COMPONENT,
+        &server,
+    )
+    .await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_http_outbound_request_first_byte_timeout() -> Result<()> {
+    let server = Server::http1_delayed(1, std::time::Duration::from_secs(5))?;
+    run(
+        P2_HTTP_OUTBOUND_REQUEST_FIRST_BYTE_TIMEOUT_COMPONENT,
+        &server,
+    )
+    .await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p2_http_outbound_request_timeout() -> Result<()> {
-    let server = Server::http1(1)?;
+    let server = Server::http1(3)?;
     run(P2_HTTP_OUTBOUND_REQUEST_TIMEOUT_COMPONENT, &server).await
 }
 
@@ -40,6 +60,12 @@ async fn p2_http_outbound_request_post() -> Result<()> {
 async fn p2_http_outbound_request_large_post() -> Result<()> {
     let server = Server::http1(1)?;
     run(P2_HTTP_OUTBOUND_REQUEST_LARGE_POST_COMPONENT, &server).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_http_outbound_request_long_path() -> Result<()> {
+    let server = Server::http1(1)?;
+    run(P2_HTTP_OUTBOUND_REQUEST_LONG_PATH_COMPONENT, &server).await
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -108,4 +134,34 @@ async fn p2_http_outbound_request_missing_path_and_query() -> Result<()> {
         &server,
     )
     .await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_http_named_imports() -> Result<()> {
+    crate::shared::run_named_imports_test(
+        P2_HTTP_NAMED_IMPORTS_COMPONENT,
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async,
+        wasmtime_wasi_http::p2::add_named_to_linker_async,
+        async |store, component, linker| {
+            let command = Command::instantiate_async(&mut *store, component, linker).await?;
+            let result = command.wasi_cli_run().call_run(&mut *store).await?;
+            result.map_err(|()| wasmtime::format_err!("run returned an error"))
+        },
+    )
+    .await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p2_http_outbound_body_write_backpressure() -> Result<()> {
+    let server = Server::http1(0)?;
+    let e = run(P2_HTTP_OUTBOUND_BODY_WRITE_BACKPRESSURE_COMPONENT, &server)
+        .await
+        .err()
+        .expect("guest execution should trap");
+    let e_debug = format!("{e:?}");
+    assert!(
+        e_debug.contains("write exceeded budget"),
+        "expected trap to contain 'write exceeded budget': {e:?}"
+    );
+    Ok(())
 }

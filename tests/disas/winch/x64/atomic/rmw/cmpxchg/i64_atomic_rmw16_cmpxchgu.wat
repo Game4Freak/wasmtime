@@ -1,5 +1,6 @@
 ;;! target = "x86_64"
 ;;! test = "winch"
+;;! flags = "-W threads"
 
 (module
   (memory 1 1 shared)
@@ -10,9 +11,9 @@
 ;;       movq    %rsp, %rbp
 ;;       movq    8(%rdi), %r11
 ;;       movq    0x18(%r11), %r11
-;;       addq    $0x20, %r11
+;;       addq    $0x28, %r11
 ;;       cmpq    %rsp, %r11
-;;       ja      0x74
+;;       ja      0x76
 ;;   1c: movq    %rdi, %r14
 ;;       subq    $0x10, %rsp
 ;;       movq    %rdi, 8(%rsp)
@@ -20,22 +21,24 @@
 ;;       movl    $0x539, %eax
 ;;       movl    $0x2a, %ecx
 ;;       movl    $0, %edx
-;;       andw    $1, %dx
-;;       cmpw    $0, %dx
-;;       jne     0x76
+;;       andl    $1, %edx
+;;       cmpl    $0, %edx
+;;       jne     0x78
 ;;   4d: movl    $0, %edx
 ;;       movq    0x30(%r14), %r11
 ;;       movq    (%r11), %rbx
 ;;       movl    %edx, %edx
 ;;       addq    %rdx, %rbx
+;;       pushq   %rbx
 ;;       pushq   %rcx
 ;;       pushq   %rax
 ;;       popq    %rcx
 ;;       popq    %rax
-;;       lock cmpxchgw %cx, (%rbx)
+;;       popq    %rdx
+;;       lock cmpxchgw %cx, (%rdx)
 ;;       movzwq  %ax, %rax
 ;;       addq    $0x10, %rsp
 ;;       popq    %rbp
 ;;       retq
-;;   74: ud2
 ;;   76: ud2
+;;   78: ud2

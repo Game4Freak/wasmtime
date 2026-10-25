@@ -15,9 +15,7 @@ pub fn dummy_linker<T>(store: &mut Store<T>, module: &Module) -> Result<Linker<T
                 import.ty(),
             )
         })?;
-        linker
-            .define(&store, import.module(), import.name(), extern_)
-            .unwrap();
+        linker.define(&store, import.module(), import.name(), extern_)?;
     }
     Ok(linker)
 }
@@ -37,7 +35,7 @@ mod tests {
     #[test]
     fn dummy_table_import() {
         let mut store = store();
-        let table_type = TableType::new(RefType::EXTERNREF, 10, None);
+        let table_type = TableType::new(RefType::EXTERNREF, 10, None).unwrap();
         let table = table_type.default_value(&mut store).unwrap();
         assert_eq!(table.size(&store), 10);
         for i in 0..10 {
@@ -57,7 +55,7 @@ mod tests {
     #[test]
     fn dummy_memory_import() {
         let mut store = store();
-        let memory_type = MemoryType::new(1, None);
+        let memory_type = MemoryType::new(1, None).unwrap();
         let memory = memory_type
             .default_value(&mut store)
             .unwrap()

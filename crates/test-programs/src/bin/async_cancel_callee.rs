@@ -97,6 +97,16 @@ unsafe extern "C" fn export_dec_backpressure() {
     wit_bindgen::backpressure_dec();
 }
 
+#[unsafe(export_name = "[async-lift]local:local/backpressure#inc-then-later-dec-backpressure")]
+unsafe extern "C" fn export_inc_then_later_dec_backpressure() -> u32 {
+    todo!()
+}
+
+#[unsafe(export_name = "[callback][async-lift]local:local/backpressure#inc-then-later-dec-backpressure")]
+unsafe extern "C" fn callback_inc_then_later_dec_backpressure(_: u32, _: u32, _: u32) -> u32 {
+    todo!()
+}
+
 #[unsafe(export_name = "local:local/yield#yield-times")]
 unsafe extern "C" fn export_yield_yield_times(times: u64) {
     unsafe {
@@ -165,9 +175,13 @@ unsafe extern "C" fn callback_yield_with_options_yield_times(
             } => {
                 assert_eq!(event0, EVENT_CANCELLED);
 
+                waitable_join(*waitable, 0);
                 let result = subtask_cancel(*waitable);
+                waitable_join(*waitable, *set);
 
                 assert_eq!(result, STATUS_RETURN_CANCELLED);
+
+                waitable_join(*waitable, 0);
 
                 if params.mode == MODE_TRAP_CANCEL_HOST_AFTER_RETURN_CANCELLED {
                     // This should trap, since `waitable` has already been
@@ -175,8 +189,6 @@ unsafe extern "C" fn callback_yield_with_options_yield_times(
                     subtask_cancel(*waitable);
                     unreachable!()
                 }
-
-                waitable_join(*waitable, 0);
 
                 if params.mode != MODE_LEAK_TASK_AFTER_CANCEL {
                     subtask_drop(*waitable);
@@ -231,13 +243,14 @@ unsafe extern "C" fn callback_yield_with_options_yield_times(
                 assert_eq!(event1, *waitable);
                 assert_eq!(event2, STATUS_RETURNED);
 
+                waitable_join(*waitable, 0);
+
                 if params.mode == MODE_TRAP_CANCEL_HOST_AFTER_RETURN {
                     // This should trap, since `waitable` has already returned:
                     subtask_cancel(*waitable);
                     unreachable!()
                 }
 
-                waitable_join(*waitable, 0);
                 subtask_drop(*waitable);
                 waitable_set_drop(*set);
 

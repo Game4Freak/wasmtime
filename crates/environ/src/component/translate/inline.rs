@@ -45,6 +45,7 @@
 //! side-effectful initializers are emitted to the `GlobalInitializer` list in the
 //! final `Component`.
 
+use crate::component::dfg::ExportItem;
 use crate::component::translate::*;
 use crate::{EntityType, Memory};
 use core::str::FromStr;
@@ -114,9 +115,15 @@ pub(super) fn run(
         if let TypeDef::Interface(_) = ty {
             continue;
         }
-        let index = inliner.result.import_types.push((name.0.to_string(), ty));
+        let index = inliner.result.import_types.push((
+            name.name.to_string(),
+            ComponentExtern {
+                ty,
+                data: ComponentExternData::new(name),
+            },
+        ));
         let path = ImportPath::root(index);
-        args.insert(name.0, ComponentItemDef::from_import(path, ty)?);
+        args.insert(name.name, ComponentItemDef::from_import(path, ty)?);
     }
 
     // This will run the inliner to completion after being seeded with the
@@ -132,7 +139,8 @@ pub(super) fn run(
 
     let mut export_map = Default::default();
     for (name, def) in exports {
-        inliner.record_export(name, def, types, &mut export_map)?;
+        let data = ComponentExternData::new(result.exports[name].1);
+        inliner.record_export(name, def, data, types, &mut export_map)?;
     }
     inliner.result.exports = export_map;
     inliner.result.num_future_tables = types.num_future_tables();
@@ -400,11 +408,36 @@ impl<'a> Inliner<'a> {
                 // parent frame, if any, as a new component instance or they're
                 // returned from this function for the root set of exports.
                 None => {
+                    let types_ref = frame.translation.types_ref();
                     let exports = frame
                         .translation
                         .exports
                         .iter()
-                        .map(|(name, item)| Ok((*name, frame.item(*item, types)?)))
+                        .map(|(name, (item, _))| {
+                            let mut def = frame.item(*item, types)?;
+                            // For the root component
+                            // (`frame.instance_ty.is_none()`) re-ascribe
+                            // exported instances with whatever type wasmparser
+                            // recorded for that instance. If the component
+                            // ascribed the type then it might be a subset of
+                            // the exports that the instance actually exports.
+                            //
+                            // Only instances are handled here. Other items can
+                            // be ascribed too, but that doesn't change what the
+                            // host sees: function and value types must match
+                            // exactly, and ascribed types and resources must
+                            // refer to existing ones. Ascriptions of modules
+                            // and components aren't reflected, but the host
+                            // can only inspect those, not instantiate them.
+                            if frame.instance_ty.is_none()
+                                && let ComponentEntityType::Instance(ty) =
+                                    types_ref.component_item_for_export(name).unwrap().ty
+                            {
+                                let ty = types.convert_instance(types_ref, ty)?;
+                                def = def.with_instance_type(ty);
+                            }
+                            Ok((*name, def))
+                        })
                         .collect::<Result<_>>()?;
                     let instance_ty = frame.instance_ty;
                     let (_, snapshot) = frames.pop().unwrap();
@@ -441,7 +474,7 @@ impl<'a> Inliner<'a> {
             // was provided as an import at the instantiation-site to what was
             // needed during the component's instantiation.
             Import(name, ty) => {
-                let arg = match frame.args.get(name.0) {
+                let arg = match frame.args.get(name.name) {
                     Some(arg) => arg,
 
                     // Not all arguments need to be provided for instantiation,
@@ -767,16 +800,6 @@ impl<'a> Inliner<'a> {
                 ));
                 frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
             }
-            ThreadYield { func, cancellable } => {
-                let index = self.result.trampolines.push((
-                    *func,
-                    dfg::Trampoline::ThreadYield {
-                        instance: frame.instance,
-                        cancellable: *cancellable,
-                    },
-                ));
-                frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
-            }
             SubtaskDrop { func } => {
                 let index = self.result.trampolines.push((
                     *func,
@@ -1094,10 +1117,12 @@ impl<'a> Inliner<'a> {
                     .push((*func, dfg::CoreDef::UnsafeIntrinsic(*func, intrinsic)));
             }
             ThreadIndex { func } => {
-                let index = self
-                    .result
-                    .trampolines
-                    .push((*func, dfg::Trampoline::ThreadIndex));
+                let index = self.result.trampolines.push((
+                    *func,
+                    dfg::Trampoline::ThreadIndex {
+                        instance: frame.instance,
+                    },
+                ));
                 frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
             }
             ThreadNewIndirect {
@@ -1123,51 +1148,65 @@ impl<'a> Inliner<'a> {
                 ));
                 frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
             }
-            ThreadSuspendToSuspended { func, cancellable } => {
+            ThreadResumeLater { func } => {
                 let index = self.result.trampolines.push((
                     *func,
-                    dfg::Trampoline::ThreadSuspendToSuspended {
+                    dfg::Trampoline::ThreadResumeLater {
                         instance: frame.instance,
-                        cancellable: *cancellable,
                     },
                 ));
                 frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
             }
-            ThreadSuspendTo { func, cancellable } => {
-                let index = self.result.trampolines.push((
-                    *func,
-                    dfg::Trampoline::ThreadSuspendTo {
-                        instance: frame.instance,
-                        cancellable: *cancellable,
-                    },
-                ));
-                frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
-            }
-            ThreadSuspend { func, cancellable } => {
+            ThreadSuspend { func } => {
                 let index = self.result.trampolines.push((
                     *func,
                     dfg::Trampoline::ThreadSuspend {
                         instance: frame.instance,
-                        cancellable: *cancellable,
                     },
                 ));
                 frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
             }
-            ThreadUnsuspend { func } => {
+            ThreadYield { func } => {
                 let index = self.result.trampolines.push((
                     *func,
-                    dfg::Trampoline::ThreadUnsuspend {
+                    dfg::Trampoline::ThreadYield {
                         instance: frame.instance,
                     },
                 ));
                 frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
             }
-            ThreadYieldToSuspended { func, cancellable } => {
+            ThreadSuspendThenResume { func } => {
                 let index = self.result.trampolines.push((
                     *func,
-                    dfg::Trampoline::ThreadYieldToSuspended {
+                    dfg::Trampoline::ThreadSuspendThenResume {
                         instance: frame.instance,
-                        cancellable: *cancellable,
+                    },
+                ));
+                frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
+            }
+            ThreadYieldThenResume { func } => {
+                let index = self.result.trampolines.push((
+                    *func,
+                    dfg::Trampoline::ThreadYieldThenResume {
+                        instance: frame.instance,
+                    },
+                ));
+                frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
+            }
+            ThreadSuspendThenPromote { func } => {
+                let index = self.result.trampolines.push((
+                    *func,
+                    dfg::Trampoline::ThreadSuspendThenPromote {
+                        instance: frame.instance,
+                    },
+                ));
+                frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
+            }
+            ThreadYieldThenPromote { func } => {
+                let index = self.result.trampolines.push((
+                    *func,
+                    dfg::Trampoline::ThreadYieldThenPromote {
+                        instance: frame.instance,
                     },
                 ));
                 frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
@@ -1398,7 +1437,8 @@ impl<'a> Inliner<'a> {
                     // item is then pushed in the relevant index space.
                     ComponentInstanceDef::Import(path, ty) => {
                         let path = path.push(*name);
-                        let def = ComponentItemDef::from_import(path, types[*ty].exports[*name])?;
+                        let def =
+                            ComponentItemDef::from_import(path, types[*ty].exports[*name].ty)?;
                         frame.push_item(def);
                     }
 
@@ -1531,7 +1571,7 @@ impl<'a> Inliner<'a> {
                 ExportItem::Name(_) => unreachable!(),
             },
             InstanceModule::Import(ty) => match &memory.item {
-                ExportItem::Name(name) => match types[*ty].exports[name] {
+                ExportItem::Name(name) => match types[*ty].exports[name.as_str()] {
                     EntityType::Memory(m) => m,
                     _ => unreachable!(),
                 },
@@ -1562,17 +1602,10 @@ impl<'a> Inliner<'a> {
         let post_return = options.post_return.map(|i| frame.funcs[i].1.clone());
         AdapterOptions {
             instance: frame.instance,
-            ancestors: frames
-                .iter()
-                .rev()
-                .skip(1)
-                .map(|(frame, _)| frame.instance)
-                .collect(),
             string_encoding: options.string_encoding,
             callback,
             post_return,
             async_: options.async_,
-            cancellable: options.cancellable,
             core_type: options.core_type,
             data_model,
         }
@@ -1602,7 +1635,6 @@ impl<'a> Inliner<'a> {
             callback,
             post_return,
             async_: options.async_,
-            cancellable: options.cancellable,
             core_type: options.core_type,
             data_model,
         })
@@ -1612,8 +1644,9 @@ impl<'a> Inliner<'a> {
         &mut self,
         name: &str,
         def: ComponentItemDef<'a>,
+        data: ComponentExternData,
         types: &'a ComponentTypesBuilder,
-        map: &mut IndexMap<String, dfg::Export>,
+        map: &mut IndexMap<String, (dfg::Export, ComponentExternData)>,
     ) -> Result<()> {
         let export = match def {
             // Exported modules are currently saved in a `PrimaryMap`, at
@@ -1672,9 +1705,15 @@ impl<'a> Inliner<'a> {
                     // module-exporting instances.
                     ComponentInstanceDef::Import(path, ty) => {
                         for (name, ty) in types[ty].exports.iter() {
-                            let path = path.push(name);
-                            let def = ComponentItemDef::from_import(path, *ty)?;
-                            self.record_export(name, def, types, &mut exports)?;
+                            let path = path.push(name.as_str());
+                            let def = ComponentItemDef::from_import(path, ty.ty)?;
+                            self.record_export(
+                                name,
+                                def,
+                                ty.data.try_clone()?,
+                                types,
+                                &mut exports,
+                            )?;
                         }
                         dfg::Export::Instance { ty, exports }
                     }
@@ -1682,9 +1721,19 @@ impl<'a> Inliner<'a> {
                     // An exported instance which is itself a bag of items is
                     // translated recursively here to our `exports` map which is
                     // the bag of items we're exporting.
+                    //
+                    // Note that `ty` may be a supertype of the items in `map`,
+                    // for example due to an export's type ascription, so `ty`
+                    // determines which items are exported and with which
+                    // attributes.
                     ComponentInstanceDef::Items(map, ty) => {
-                        for (name, def) in map {
-                            self.record_export(name, def, types, &mut exports)?;
+                        for (name, export) in types[ty].exports.iter() {
+                            let mut def = map[name.as_str()].clone();
+                            if let TypeDef::ComponentInstance(instance_ty) = export.ty {
+                                def = def.with_instance_type(instance_ty);
+                            }
+                            let data = export.data.try_clone()?;
+                            self.record_export(name, def, data, types, &mut exports)?;
                         }
                         dfg::Export::Instance { ty, exports }
                     }
@@ -1700,7 +1749,7 @@ impl<'a> Inliner<'a> {
             ComponentItemDef::Type(def) => dfg::Export::Type(def),
         };
 
-        map.insert(name.to_string(), export);
+        map.insert(name.to_string(), (export, data));
         Ok(())
     }
 }
@@ -1893,6 +1942,25 @@ impl<'a> ComponentItemDef<'a> {
         Ok(item)
     }
 
+    /// Returns this instance as seen through `ty`, a supertype of its own
+    /// type, which determines which of its exports are visible and what
+    /// attributes they have.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` isn't an instance.
+    fn with_instance_type(self, ty: TypeComponentInstanceIndex) -> ComponentItemDef<'a> {
+        match self {
+            ComponentItemDef::Instance(ComponentInstanceDef::Items(map, _)) => {
+                ComponentItemDef::Instance(ComponentInstanceDef::Items(map, ty))
+            }
+            ComponentItemDef::Instance(ComponentInstanceDef::Import(path, _)) => {
+                ComponentItemDef::Instance(ComponentInstanceDef::Import(path, ty))
+            }
+            _ => panic!("only instances have an instance type"),
+        }
+    }
+
     /// Walks the `path` within `self` to find a resource at that path.
     ///
     /// This method is used when resources are found within wasmparser's type
@@ -1922,7 +1990,7 @@ impl<'a> ComponentItemDef<'a> {
                 // in conjunction with a one-longer `path` to produce a new item
                 // definition.
                 ComponentInstanceDef::Import(path, ty) => {
-                    ComponentItemDef::from_import(path.push(element), types[ty].exports[element])
+                    ComponentItemDef::from_import(path.push(element), types[ty].exports[element].ty)
                         .unwrap()
                 }
                 ComponentInstanceDef::Intrinsics => {
@@ -1944,4 +2012,13 @@ impl<'a> ComponentItemDef<'a> {
 enum InstanceModule {
     Static(StaticModuleIndex),
     Import(TypeModuleIndex),
+}
+
+impl ComponentExternData {
+    fn new(data: wasmparser::ComponentExternName<'_>) -> Self {
+        ComponentExternData {
+            implements: data.implements.map(|s| s.to_string().into()),
+            external_id: data.external_id.map(|s| s.to_string().into()),
+        }
+    }
 }

@@ -2,7 +2,6 @@ mod bindings {
     wit_bindgen::generate!({
         path: "../misc/component-async-tests/wit",
         world: "closed-streams",
-        async: true,
     });
 
     use super::Component;
@@ -39,7 +38,7 @@ impl Guest for Component {
         expected: u8,
         _rx_ignored: FutureReader<u8>,
     ) {
-        wit_bindgen::spawn(async move {
+        wit_bindgen::spawn_local(async move {
             assert_eq!(rx.await, expected);
         });
     }

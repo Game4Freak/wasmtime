@@ -12,7 +12,7 @@ impl Wizer {
     /// updates module sections with whatever [`Wizer::rewrite`] returns.
     pub(crate) fn rewrite_component(
         &self,
-        component: &mut ComponentContext<'_>,
+        component: &ComponentContext<'_>,
         snapshot: &ComponentSnapshot,
     ) -> Vec<u8> {
         let mut encoder = wasm_encoder::Component::new();
@@ -23,7 +23,7 @@ impl Wizer {
         };
 
         let mut module_index = 0;
-        for section in component.sections.iter_mut() {
+        for section in component.sections.iter() {
             match section {
                 RawSection::Module(module) => {
                     let snapshot = snapshot
@@ -236,7 +236,7 @@ impl ReencodeComponent for Reencoder<'_> {
     ) -> Result<(), Error> {
         for export in section {
             let export = export?;
-            if !self.wizer.get_keep_init_func() && export.name.0 == self.wizer.get_init_func() {
+            if !self.wizer.get_keep_init_func() && export.name.name == self.wizer.get_init_func() {
                 self.removed_func = Some(self.funcs);
             } else {
                 if export.kind == wasmparser::ComponentExternalKind::Func {

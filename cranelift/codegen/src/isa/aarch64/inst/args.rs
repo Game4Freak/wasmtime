@@ -108,6 +108,16 @@ impl ExtendOp {
     pub fn bits(self) -> u8 {
         self as u8
     }
+
+    /// The width in bits of the value being extended.
+    pub fn from_bits(self) -> u8 {
+        match self {
+            Self::UXTB | Self::SXTB => 8,
+            Self::UXTH | Self::SXTH => 16,
+            Self::UXTW | Self::SXTW => 32,
+            Self::UXTX | Self::SXTX => 64,
+        }
+    }
 }
 
 //=============================================================================
@@ -711,6 +721,25 @@ impl APIKey {
         };
         0xd503201f | (crm << 8) | (op2 << 5)
     }
+}
+
+/// "Package" of the arguments for the instruction `AtomicCAS128` to avoid
+/// making the `Inst` enum massive.
+///
+/// `rd_lo`/`rd_hi` are really `rs`/`rs+1` in the encoded instruction (so
+/// `rd_lo == rs_lo` and `rd_hi == rs_hi`); they are separated here to have
+/// separate use and def vregs for regalloc.
+#[derive(Clone, Debug)]
+#[expect(missing_docs, reason = "self-describing fields")]
+pub struct AtomicCAS128Args {
+    pub rd_lo: Writable<Reg>,
+    pub rd_hi: Writable<Reg>,
+    pub rs_lo: Reg,
+    pub rs_hi: Reg,
+    pub rt_lo: Reg,
+    pub rt_hi: Reg,
+    pub rn: Reg,
+    pub flags: MemFlagsData,
 }
 
 pub use crate::isa::aarch64::lower::isle::generated_code::TestBitAndBranchKind;

@@ -98,6 +98,7 @@ fn memory_limit() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn memory_init() -> Result<()> {
     let mut pool = crate::small_pool_config();
     pool.max_memory_size(2 << 16).table_elements(0);
@@ -441,6 +442,7 @@ fn total_core_instances_limit() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn preserve_data_segments() -> Result<()> {
     let mut pool = crate::small_pool_config();
     pool.total_memories(2);
@@ -504,7 +506,7 @@ fn multi_memory_with_imported_memories() -> Result<()> {
 
     let mut store = Store::new(&engine, ());
 
-    let m1 = Memory::new(&mut store, MemoryType::new(0, None))?;
+    let m1 = Memory::new(&mut store, MemoryType::new(0, None)?)?;
     let instance = Instance::new(&mut store, &module, &[m1.into()])?;
 
     let m2 = instance.get_memory(&mut store, "m2").unwrap();
@@ -516,6 +518,7 @@ fn multi_memory_with_imported_memories() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn drop_externref_global_during_module_init() -> Result<()> {
     struct Limiter;
 
@@ -663,6 +666,14 @@ fn instance_too_large() -> Result<()> {
         }
     }
 
+    // A maximum near `usize::MAX` shouldn't overflow when rounded up.
+    let mut pool = crate::small_pool_config();
+    pool.max_core_instance_size(usize::MAX);
+    let mut config = Config::new();
+    config.allocation_strategy(pool);
+    let engine = Engine::new(&config)?;
+    Module::new(&engine, "(module)")?;
+
     Ok(())
 }
 
@@ -710,7 +721,13 @@ fn dynamic_memory_pooling_allocator() -> Result<()> {
             ) else {
                 // Ignore invalid configurations on 32-bit which can't run with
                 // signals-based-traps.
-                assert!(cfg!(target_pointer_width = "32") && signals_based_traps);
+                //
+                // Note that s390x in CI also skip this because it's not using
+                // signals-based-traps.
+                assert!(
+                    cfg!(target_arch = "s390x")
+                        || (cfg!(target_pointer_width = "32") && signals_based_traps)
+                );
                 continue;
             };
 
@@ -867,9 +884,9 @@ fn component_instance_size_limit() -> Result<()> {
     match wasmtime::component::Component::new(&engine, "(component)") {
         Ok(_) => panic!("should have hit limit"),
         Err(e) => {
-            e.assert_contains("instance allocation for this component requires 64 bytes");
+            e.assert_contains("instance allocation for this component requires 48 bytes");
             e.assert_contains("which exceeds the configured maximum of 1 bytes");
-            e.assert_contains("`VMComponentContext` used 64 bytes");
+            e.assert_contains("`VMComponentContext` used 48 bytes");
         }
     }
 
@@ -1248,6 +1265,7 @@ fn decommit_batching() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn tricky_empty_table_with_empty_virtual_memory_alloc() -> Result<()> {
     // Configure the pooling allocator to have no access to virtual memory, e.g.
     // no table elements but a single table. This should technically support a
@@ -1458,6 +1476,7 @@ fn pooling_reuse_resets() -> Result<()> {
 // asserts that the previous image is indeed not available any more as that
 // would otherwise mean data was leaked between modules.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn memory_reset_if_instantiation_fails() -> Result<()> {
     struct Limiter;
 
@@ -1542,6 +1561,99 @@ fn purge_module_with_mpk() -> Result<()> {
     // Drop the outer store here which will clean up the rest of the
     // instance/etc.
     drop(store);
+
+    Ok(())
+}
+
+/// Regression test for both #7942 and #13982: mapping a copy-on-write memory
+/// image into a slot must not drop the slot's MPK protection key.
+///
+/// A fresh `mmap` associates the pages it replaces with the default protection
+/// key 0, which every stripe is allowed to access. If the key is not
+/// re-applied afterwards, an instance in one stripe can read and write the
+/// linear memory of an instance in another stripe.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn mpk_protects_memory_images() -> Result<()> {
+    if !wasmtime::PoolingAllocationConfig::are_memory_protection_keys_available() {
+        println!("skipping test; mpk is not supported");
+        return Ok(());
+    }
+
+    let mut pool = wasmtime::PoolingAllocationConfig::new();
+    pool.memory_protection_keys(Enabled::Yes)
+        .max_memory_protection_keys(2)
+        .max_memory_size(1 << 20)
+        .total_memories(4)
+        .total_tables(4)
+        .total_core_instances(4);
+    let mut config = Config::new();
+    config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+    let engine = Engine::new(&config)?;
+
+    // The victim has a `(data ...)` segment, so it is instantiated from a
+    // copy-on-write memory image; that is the mapping which used to clobber
+    // the protection key.
+    let victim = Module::new(
+        &engine,
+        r#"(module (memory (export "m") 1) (data (i32.const 0) "SECRET"))"#,
+    )?;
+    let attacker = Module::new(
+        &engine,
+        r#"(module
+             (memory (export "m") 1)
+             (func (export "load") (param i32) (result i32) local.get 0 i32.load)
+             (func (export "store") (param i32 i32) local.get 0 local.get 1 i32.store))"#,
+    )?;
+
+    let mut attacker_store = Store::new(&engine, ());
+    let mut victim_store = Store::new(&engine, ());
+    let attacker_instance = Instance::new(&mut attacker_store, &attacker, &[])?;
+    let victim_instance = Instance::new(&mut victim_store, &victim, &[])?;
+
+    let attacker_mem = attacker_instance
+        .get_memory(&mut attacker_store, "m")
+        .unwrap();
+    let victim_mem = victim_instance.get_memory(&mut victim_store, "m").unwrap();
+
+    // Only meaningful if the two instances landed in different stripes and the
+    // victim is within reach of a 32-bit wasm address.
+    let attacker_base = attacker_mem.data_ptr(&attacker_store) as usize;
+    let victim_base = victim_mem.data_ptr(&victim_store) as usize;
+    let offset = match victim_base
+        .checked_sub(attacker_base)
+        .and_then(|offset| u32::try_from(offset).ok())
+    {
+        // Wasm addresses are unsigned, so this is a plain bit-cast.
+        Some(offset) => offset as i32,
+        None => {
+            println!("skipping test; victim memory is not addressable by the attacker");
+            return Ok(());
+        }
+    };
+
+    let load = attacker_instance.get_typed_func::<i32, i32>(&mut attacker_store, "load")?;
+    let store = attacker_instance.get_typed_func::<(i32, i32), ()>(&mut attacker_store, "store")?;
+
+    // The attacker can still use its own memory...
+    store.call(&mut attacker_store, (0, 0x12345678))?;
+    assert_eq!(load.call(&mut attacker_store, 0)?, 0x12345678);
+
+    // ...and the victim's image was still applied correctly...
+    assert_eq!(&victim_mem.data(&victim_store)[..6], b"SECRET");
+
+    // ...but it must not be able to touch the victim's memory.
+    assert!(
+        load.call(&mut attacker_store, offset).is_err(),
+        "attacker read across an MPK stripe boundary"
+    );
+    assert!(
+        store
+            .call(&mut attacker_store, (offset, 0x41414141))
+            .is_err(),
+        "attacker wrote across an MPK stripe boundary"
+    );
+    assert_eq!(&victim_mem.data(&victim_store)[..6], b"SECRET");
 
     Ok(())
 }

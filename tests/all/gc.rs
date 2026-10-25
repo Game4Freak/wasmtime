@@ -1,9 +1,12 @@
-use super::ref_types_module;
+use super::{async_functions::CountPending, gc_store, ref_types_module};
 use std::num::NonZeroU32;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::task::{Context, Poll};
 use wasmtime::*;
+use wasmtime_test_macros::wasmtime_test;
 
 struct SetFlagOnDrop(Arc<AtomicBool>);
 
@@ -77,6 +80,7 @@ fn smoke_test_gc_impl(use_epochs: bool) -> Result<()> {
 
     // Exiting the scope and unrooting `r` should have dropped the inner
     // `SetFlagOnDrop` value.
+    store.gc(None)?;
     assert!(inner_dropped.load(SeqCst));
 
     Ok(())
@@ -265,6 +269,7 @@ fn drop_externref_via_table_set() -> Result<()> {
     assert!(!bar_is_dropped.load(SeqCst));
 
     table_set.call(&mut store, &[Val::ExternRef(None)], &mut [])?;
+    store.gc(None)?;
     assert!(foo_is_dropped.load(SeqCst));
     assert!(bar_is_dropped.load(SeqCst));
 
@@ -338,7 +343,7 @@ fn table_drops_externref() -> Result<()> {
         let externref = ExternRef::new(&mut store, SetFlagOnDrop(flag.clone()))?;
         Table::new(
             &mut store,
-            TableType::new(RefType::EXTERNREF, 1, None),
+            TableType::new(RefType::EXTERNREF, 1, None)?,
             externref.into(),
         )?;
         drop(store);
@@ -371,6 +376,7 @@ fn table_drops_externref() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn global_init_no_leak() -> Result<()> {
     let (mut store, module) = ref_types_module(
         false,
@@ -839,7 +845,7 @@ fn table_fill_doesnt_leak() -> Result<()> {
         let x = ExternRef::new(&mut scope, SetFlagOnDrop(flag.clone()))?;
         let table = Table::new(
             &mut scope,
-            TableType::new(RefType::EXTERNREF, 10, Some(10)),
+            TableType::new(RefType::EXTERNREF, 10, Some(10))?,
             x.into(),
         )?;
         table.fill(&mut scope, 0, Ref::Extern(None), 10)?;
@@ -862,7 +868,7 @@ fn table_copy_doesnt_leak() -> Result<()> {
         let mut scope = RootScope::new(&mut store);
         let table = Table::new(
             &mut scope,
-            TableType::new(RefType::EXTERNREF, 10, Some(10)),
+            TableType::new(RefType::EXTERNREF, 10, Some(10))?,
             Ref::Extern(None),
         )?;
 
@@ -871,6 +877,34 @@ fn table_copy_doesnt_leak() -> Result<()> {
 
         Table::copy(&mut scope, &table, 0, &table, 5, 5)?;
     }
+
+    store.gc(None)?;
+    assert!(flag.load(SeqCst));
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn table_copy_without_root_scope_doesnt_leak() -> Result<()> {
+    let _ = env_logger::try_init();
+
+    let mut store = Store::<()>::default();
+    let flag = Arc::new(AtomicBool::new(false));
+
+    let table = Table::new(
+        &mut store,
+        TableType::new(RefType::EXTERNREF, 10, Some(10))?,
+        Ref::Extern(None),
+    )?;
+
+    {
+        let mut scope = RootScope::new(&mut store);
+        let x = ExternRef::new(&mut scope, SetFlagOnDrop(flag.clone()))?;
+        table.fill(&mut scope, 2, x.into(), 3)?;
+    }
+
+    Table::copy(&mut store, &table, 5, &table, 2, 3)?;
+    table.fill(&mut store, 0, Ref::Extern(None), 10)?;
 
     store.gc(None)?;
     assert!(flag.load(SeqCst));
@@ -889,7 +923,7 @@ fn table_set_doesnt_leak() -> Result<()> {
         let mut scope = RootScope::new(&mut store);
         let table = Table::new(
             &mut scope,
-            TableType::new(RefType::EXTERNREF, 10, Some(10)),
+            TableType::new(RefType::EXTERNREF, 10, Some(10))?,
             Ref::Extern(None),
         )?;
 
@@ -916,7 +950,7 @@ fn table_grow_doesnt_leak() -> Result<()> {
         let mut scope = RootScope::new(&mut store);
         let table = Table::new(
             &mut scope,
-            TableType::new(RefType::EXTERNREF, 10, Some(10)),
+            TableType::new(RefType::EXTERNREF, 10, Some(10))?,
             Ref::Extern(None),
         )?;
 
@@ -1155,6 +1189,7 @@ fn issue_9669() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn drc_transitive_drop_cons_list() -> Result<()> {
     let _ = env_logger::try_init();
 
@@ -1326,6 +1361,135 @@ fn drc_traces_the_correct_number_of_gc_refs_in_arrays() -> Result<()> {
     )?;
     let _instance = Instance::new(&mut store, &module, &[])?;
     store.gc(None)?;
+
+    Ok(())
+}
+
+// Regression test for a stack-map bug in `translate_per_element_copy` (used by
+// `array.copy` on arrays whose elements are GC references).
+//
+// The per-element loop derived raw `src_elem_addr` / `dst_elem_addr` pointers
+// once and used only those raw pointers inside the loop body. The source and
+// destination array gc-refs themselves were dead in CLIF inside the loop, so
+// they were absent from the stack maps at safe points there. Once the DRC
+// collector started firing `force_gc` from inside the read barrier (when the
+// over-approximated-stack-roots list grew past 1024 entries), a GC could run
+// mid-copy with neither array marked from any frame's stack map. Sweep could
+// then drop the arrays from OASR, freeing them and cascading dec-refs through
+// their elements, after which the rest of the copy read from freed memory.
+//
+// The fix passes the source and destination array gc-refs as block params
+// through the forward and backward iteration blocks so they stay live across
+// the per-element loop.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn drc_array_copy_keeps_arrays_alive_across_in_loop_gc() -> Result<()> {
+    let _ = env_logger::try_init();
+
+    let mut config = Config::new();
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
+    config.collector(Collector::DeferredReferenceCounting);
+    // Keep the GC heap small so allocations cycle back through the free
+    // list quickly. This dramatically increases the chance that any slot
+    // freed mid-copy will be reused before the test's verify pass reads
+    // from it, making the bug observable.
+    config.gc_heap_reservation(128 * 1024);
+    config.gc_heap_reservation_for_growth(0);
+
+    let engine = Engine::new(&config)?;
+    let mut store = Store::new(&engine, ());
+
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+                (import "wasmtime" "gc" (func $gc))
+                (type $box (struct (field i32)))
+                (type $arr (array (mut (ref null $box))))
+
+                ;; Put the `array.copy` in a helper function so the source
+                ;; and destination gc-refs are visibly dead in CLIF inside
+                ;; the per-element loop -- they are function parameters
+                ;; that are only used at the top of the function to compute
+                ;; the initial address.
+                (func $do_copy
+                    (param $src (ref null $arr))
+                    (param $dst (ref null $arr))
+                    (param $len i32)
+                    (array.copy $arr $arr
+                        (local.get $dst) (i32.const 0)
+                        (local.get $src) (i32.const 0)
+                        (local.get $len)))
+
+                (func (export "test") (result i32)
+                    (local $src (ref null $arr))
+                    (local $dst (ref null $arr))
+                    (local $i i32)
+                    (local $sum i32)
+
+                    ;; N=2048 > 1024 so the per-element read barrier
+                    ;; definitely fires `force_gc` during the copy.
+                    (local.set $src (array.new $arr (ref.null $box) (i32.const 2048)))
+                    (local.set $i (i32.const 0))
+                    (loop $fill
+                        (array.set $arr (local.get $src) (local.get $i)
+                            (struct.new $box (local.get $i)))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $fill (i32.lt_s (local.get $i) (i32.const 2048))))
+
+                    (local.set $dst (array.new $arr (ref.null $box) (i32.const 2048)))
+
+                    (call $gc)
+
+                    (call $do_copy (local.get $src) (local.get $dst) (i32.const 2048))
+
+                    ;; Drop the source local and force a GC so any
+                    ;; cascade-freed elements that should still be alive
+                    ;; via $dst would surface as either a trap (cast
+                    ;; failure / out-of-bounds) or wrong $dst contents.
+                    (local.set $src (ref.null $arr))
+                    (call $gc)
+
+                    ;; Heavily allocate to reuse any freed slots. Each
+                    ;; iteration allocates a $box with sentinel value -1;
+                    ;; if any element of $dst was a stale reference to a
+                    ;; cascade-freed $box, its slot gets reused here and
+                    ;; reading it back will see -1 rather than its
+                    ;; original index.
+                    (local.set $i (i32.const 0))
+                    (loop $churn
+                        (drop (struct.new $box (i32.const -1)))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $churn (i32.lt_s (local.get $i) (i32.const 4096))))
+
+                    (call $gc)
+
+                    (local.set $i (i32.const 0))
+                    (local.set $sum (i32.const 0))
+                    (loop $verify
+                        (local.set $sum
+                            (i32.add (local.get $sum)
+                                (struct.get $box 0
+                                    (array.get $arr (local.get $dst) (local.get $i)))))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $verify (i32.lt_s (local.get $i) (i32.const 2048))))
+
+                    (local.get $sum)))
+        "#,
+    )?;
+
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("wasmtime", "gc", |mut caller: Caller<_>| -> Result<()> {
+        caller.gc(None)?;
+        Ok(())
+    })?;
+    let instance = linker.instantiate(&mut store, &module)?;
+    let test = instance.get_typed_func::<(), i32>(&mut store, "test")?;
+    let result = test.call(&mut store, ())?;
+
+    // Sum of 0..2048 = 2048 * 2047 / 2.
+    assert_eq!(result, 2_096_128);
 
     Ok(())
 }
@@ -2083,6 +2247,56 @@ fn copying_collector_externref_survives_gc() -> Result<()> {
     Ok(())
 }
 
+/// A host function that calls, via `Func::call`, another host function that
+/// collects must not cause the Wasm frames beneath them to be traced twice.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn issue_14463_nested_host_call_gc_moves_object_once() -> Result<()> {
+    let _ = env_logger::try_init();
+    for collector in [Collector::Copying, Collector::DeferredReferenceCounting] {
+        let mut config = Config::new();
+        config.wasm_gc(true);
+        config.wasm_function_references(true);
+        config.collector(collector);
+
+        let engine = Engine::new(&config)?;
+
+        let module = Module::new(
+            &engine,
+            r#"
+                (module
+                    (type $s (struct (field i32)))
+                    (type $f (func))
+                    (table (export "t") 1 funcref)
+                    (global $g (mut (ref null $s)) (ref.null $s))
+                    (func (export "run") (result i32) (local $x (ref null $s))
+                        (local.set $x (struct.new $s (i32.const 7)))
+                        (global.set $g (local.get $x))
+                        (call_indirect (type $f) (i32.const 0))
+                        (ref.eq (local.get $x) (global.get $g))
+                    )
+                )
+            "#,
+        )?;
+
+        let mut store = Store::new(&engine, ());
+
+        let inner = Func::wrap(&mut store, |mut caller: Caller<'_, ()>| caller.gc(None));
+        let outer = Func::wrap(&mut store, move |mut caller: Caller<'_, ()>| {
+            inner.call(&mut caller, &[], &mut [])
+        });
+
+        let instance = Instance::new(&mut store, &module, &[])?;
+
+        let table = instance.get_table(&mut store, "t").unwrap();
+        table.set(&mut store, 0, Ref::Func(Some(outer)))?;
+
+        let run = instance.get_typed_func::<(), i32>(&mut store, "run")?;
+        assert_eq!(run.call(&mut store, ())?, 1, "collector = {collector:?}");
+    }
+    Ok(())
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn issue_13173_gc_heap_uses_gc_tunables_no_signals() -> Result<()> {
@@ -2307,5 +2521,1811 @@ fn copying_collector_gc_zeal_counter_stress() -> Result<()> {
         assert_eq!(result, 12345, "failed with gc_zeal_counter={counter}");
     }
 
+    Ok(())
+}
+
+#[test]
+fn anyref_from_eqref_rooted() -> Result<()> {
+    let mut store = gc_store()?;
+    let eq = EqRef::from_i31(&mut store, I31::wrapping_u32(7));
+    // From<Rooted<EqRef>> for Rooted<AnyRef>
+    let any: Rooted<AnyRef> = eq.into();
+    assert!(any.is_i31(&store)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_from_owned_eqref() -> Result<()> {
+    let mut store = gc_store()?;
+    let eq = EqRef::from_i31(&mut store, I31::wrapping_u32(3));
+    let owned: OwnedRooted<EqRef> = eq.to_owned_rooted(&mut store)?;
+    // From<OwnedRooted<EqRef>> for OwnedRooted<AnyRef>
+    let any_owned: OwnedRooted<AnyRef> = owned.into();
+    let any = any_owned.to_rooted(&mut store);
+    assert!(any.is_i31(&store)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_from_structref_rooted() -> Result<()> {
+    let mut store = gc_store()?;
+    let struct_ty = StructType::new(
+        store.engine(),
+        [FieldType::new(Mutability::Const, ValType::I32.into())],
+    )?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let s = StructRef::new(&mut store, &pre, &[Val::I32(42)])?;
+    // From<Rooted<StructRef>> for Rooted<AnyRef>
+    let any: Rooted<AnyRef> = s.into();
+    assert!(any.is_struct(&store)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_from_owned_structref() -> Result<()> {
+    let mut store = gc_store()?;
+    let struct_ty = StructType::new(
+        store.engine(),
+        [FieldType::new(Mutability::Const, ValType::I32.into())],
+    )?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let s = StructRef::new(&mut store, &pre, &[Val::I32(1)])?;
+    let owned = s.to_owned_rooted(&mut store)?;
+    // From<OwnedRooted<StructRef>> for OwnedRooted<AnyRef>
+    let any_owned: OwnedRooted<AnyRef> = owned.into();
+    let any = any_owned.to_rooted(&mut store);
+    assert!(any.is_struct(&store)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_from_arrayref_rooted() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 2)?;
+    // From<Rooted<ArrayRef>> for Rooted<AnyRef>
+    let any: Rooted<AnyRef> = a.into();
+    assert!(any.is_array(&store)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_from_owned_arrayref() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 1)?;
+    let owned = a.to_owned_rooted(&mut store)?;
+    // From<OwnedRooted<ArrayRef>> for OwnedRooted<AnyRef>
+    let any_owned: OwnedRooted<AnyRef> = owned.into();
+    let any = any_owned.to_rooted(&mut store);
+    assert!(any.is_array(&store)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_ty_struct() -> Result<()> {
+    let mut store = gc_store()?;
+    let struct_ty = StructType::new(
+        store.engine(),
+        [FieldType::new(Mutability::Const, ValType::I32.into())],
+    )?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let s = StructRef::new(&mut store, &pre, &[Val::I32(0)])?;
+    let any: Rooted<AnyRef> = s.into();
+    let ty = any.ty(&store)?;
+    assert!(matches!(ty, HeapType::ConcreteStruct(_)));
+    Ok(())
+}
+
+#[test]
+fn anyref_ty_extern_converted() -> Result<()> {
+    let mut store = gc_store()?;
+    // ExternRef converted to AnyRef has HeapType::Any
+    let ext = ExternRef::new(&mut store, 42u32)?;
+    let any = AnyRef::convert_extern(&mut store, ext)?;
+    let ty = any.ty(&store)?;
+    assert!(matches!(ty, HeapType::Any));
+    Ok(())
+}
+
+#[test]
+fn anyref_to_raw_struct() -> Result<()> {
+    let mut store = gc_store()?;
+    let struct_ty = StructType::new(
+        store.engine(),
+        [FieldType::new(Mutability::Const, ValType::I32.into())],
+    )?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let s = StructRef::new(&mut store, &pre, &[Val::I32(99)])?;
+    let any: Rooted<AnyRef> = s.into();
+    // to_raw on a non-i31 anyref exercises the else-branch in to_raw
+    let raw = any.to_raw(&mut store)?;
+    assert_ne!(raw, 0);
+    Ok(())
+}
+
+#[test]
+fn externref_data_some() -> Result<()> {
+    let mut store = gc_store()?;
+    let rooted = ExternRef::new(&mut store, 100u32)?;
+    let data = rooted.data(&store)?;
+    let val = data.unwrap().downcast_ref::<u32>().unwrap();
+    assert_eq!(*val, 100u32);
+    Ok(())
+}
+
+#[test]
+fn externref_data_mut_some() -> Result<()> {
+    let mut store = gc_store()?;
+    let rooted = ExternRef::new(&mut store, 1u32)?;
+    {
+        let data = rooted.data_mut(&mut store)?;
+        *data.unwrap().downcast_mut::<u32>().unwrap() = 999;
+    }
+    let val = rooted.data(&store)?.unwrap().downcast_ref::<u32>().unwrap();
+    assert_eq!(*val, 999u32);
+    Ok(())
+}
+
+#[test]
+fn externref_data_none_when_converted_from_anyref() -> Result<()> {
+    let mut store = gc_store()?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(5));
+    // ExternRef wrapping an anyref has no host data
+    let ext = ExternRef::convert_any(&mut store, any)?;
+    let data = ext.data(&store)?;
+    assert!(data.is_none());
+    Ok(())
+}
+
+#[test]
+fn externref_data_mut_none_when_converted_from_anyref() -> Result<()> {
+    let mut store = gc_store()?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(5));
+    let ext = ExternRef::convert_any(&mut store, any)?;
+    let data = ext.data_mut(&mut store)?;
+    assert!(data.is_none());
+    Ok(())
+}
+
+#[test]
+fn owned_rooted_clone() -> Result<()> {
+    let mut store = gc_store()?;
+    let ext = ExternRef::new(&mut store, 77u32)?;
+    let owned = ext.to_owned_rooted(&mut store)?;
+    let clone = owned.clone();
+    // Both owned and clone should refer to the same ExternRef
+    let r1 = owned.to_rooted(&mut store);
+    let r2 = clone.to_rooted(&mut store);
+    assert!(Rooted::ref_eq(&store, &r1, &r2)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_gc_is_eqref() -> Result<()> {
+    let mut store = gc_store()?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(3));
+    assert!(any.is_eqref(&store)?);
+    let struct_ty = StructType::new(store.engine(), [])?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let s = StructRef::new(&mut store, &pre, &[])?;
+    let any: Rooted<AnyRef> = s.into();
+    assert!(any.is_eqref(&store)?);
+    // extern-converted anyref is not eqref
+    let ext = ExternRef::new(&mut store, 42u32)?;
+    let any = AnyRef::convert_extern(&mut store, ext)?;
+    assert!(!any.is_eqref(&store)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_gc_as_eqref() -> Result<()> {
+    let mut store = gc_store()?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(99));
+    assert!(any.as_eqref(&mut store)?.is_some());
+    let ext = ExternRef::new(&mut store, 42u32)?;
+    let any = AnyRef::convert_extern(&mut store, ext)?;
+    assert!(any.as_eqref(&mut store)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn anyref_unwrap_eqref() -> Result<()> {
+    let mut store = gc_store()?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(5));
+    let _eq = any.unwrap_eqref(&mut store)?;
+    Ok(())
+}
+
+#[test]
+fn anyref_gc_is_i31() -> Result<()> {
+    let mut store = gc_store()?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(10));
+    assert!(any.is_i31(&store)?);
+    let struct_ty = StructType::new(store.engine(), [])?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let s = StructRef::new(&mut store, &pre, &[])?;
+    let any: Rooted<AnyRef> = s.into();
+    assert!(!any.is_i31(&store)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_gc_as_i31() -> Result<()> {
+    let mut store = gc_store()?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(55));
+    assert_eq!(any.as_i31(&store)?.unwrap().get_u32(), 55);
+    let struct_ty = StructType::new(store.engine(), [])?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let s = StructRef::new(&mut store, &pre, &[])?;
+    let any: Rooted<AnyRef> = s.into();
+    assert!(any.as_i31(&store)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn anyref_unwrap_i31() -> Result<()> {
+    let mut store = gc_store()?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(9));
+    let i31 = any.unwrap_i31(&store)?;
+    assert_eq!(i31.get_u32(), 9);
+    Ok(())
+}
+
+#[test]
+fn anyref_gc_is_struct() -> Result<()> {
+    let mut store = gc_store()?;
+    let struct_ty = StructType::new(store.engine(), [])?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let s = StructRef::new(&mut store, &pre, &[])?;
+    let any: Rooted<AnyRef> = s.into();
+    assert!(any.is_struct(&store)?);
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(0));
+    assert!(!any.is_struct(&store)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_gc_as_struct() -> Result<()> {
+    let mut store = gc_store()?;
+    let struct_ty = StructType::new(store.engine(), [])?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let s = StructRef::new(&mut store, &pre, &[])?;
+    let any: Rooted<AnyRef> = s.into();
+    assert!(any.as_struct(&store)?.is_some());
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(0));
+    assert!(any.as_struct(&store)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn anyref_unwrap_struct() -> Result<()> {
+    let mut store = gc_store()?;
+    let struct_ty = StructType::new(store.engine(), [])?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let s = StructRef::new(&mut store, &pre, &[])?;
+    let any: Rooted<AnyRef> = s.into();
+    let _s2 = any.unwrap_struct(&store)?;
+    Ok(())
+}
+
+#[test]
+fn anyref_gc_is_array() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 1)?;
+    let any: Rooted<AnyRef> = a.into();
+    assert!(any.is_array(&store)?);
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(0));
+    assert!(!any.is_array(&store)?);
+    Ok(())
+}
+
+#[test]
+fn anyref_gc_as_array() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 1)?;
+    let any: Rooted<AnyRef> = a.into();
+    assert!(any.as_array(&store)?.is_some());
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(0));
+    assert!(any.as_array(&store)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn anyref_unwrap_array() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 1)?;
+    let any: Rooted<AnyRef> = a.into();
+    let _a2 = any.unwrap_array(&store)?;
+    Ok(())
+}
+
+#[test]
+fn anyref_matches_ty_any_and_eq() -> Result<()> {
+    let mut store = gc_store()?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(1));
+    assert!(any.matches_ty(&store, &HeapType::Any)?);
+    assert!(any.matches_ty(&store, &HeapType::Eq)?);
+    assert!(!any.matches_ty(&store, &HeapType::Extern)?);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_returns_anyref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "get_any") (result anyref)
+            (ref.i31 (i32.const 42)))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<(), Option<Rooted<AnyRef>>>(&mut store, "get_any")?;
+    let result = f.call(&mut store, ())?;
+    let any = result.unwrap();
+    let i31 = any.as_i31(&store)?.unwrap();
+    assert_eq!(i31.get_u32(), 42);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_takes_anyref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "take_any") (param anyref) (result i32)
+            (ref.test i31ref (local.get 0)))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<Option<Rooted<AnyRef>>, i32>(&mut store, "take_any")?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(5));
+    let result = f.call(&mut store, Some(any))?;
+    assert_eq!(result, 1);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_returns_eqref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "get_eq") (result eqref)
+            (ref.i31 (i32.const 7)))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<(), Option<Rooted<EqRef>>>(&mut store, "get_eq")?;
+    let result = f.call(&mut store, ())?;
+    let eq = result.unwrap();
+    let i31 = eq.as_i31(&store)?.unwrap();
+    assert_eq!(i31.get_u32(), 7);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_takes_eqref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "take_eq") (param eqref) (result i32)
+            (ref.test i31ref (local.get 0)))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<Option<Rooted<EqRef>>, i32>(&mut store, "take_eq")?;
+    let any = EqRef::from_i31(&mut store, I31::wrapping_u32(3));
+    let result = f.call(&mut store, Some(any))?;
+    assert_eq!(result, 1);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_returns_externref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "get_ext") (result externref)
+            (ref.null extern))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<(), Option<Rooted<ExternRef>>>(&mut store, "get_ext")?;
+    let result = f.call(&mut store, ())?;
+    assert!(result.is_none());
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_takes_externref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "take_ext") (param externref) (result i32)
+            (ref.is_null (local.get 0)))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<Option<Rooted<ExternRef>>, i32>(&mut store, "take_ext")?;
+    let result = f.call(&mut store, None)?;
+    assert_eq!(result, 1);
+    Ok(())
+}
+
+#[test]
+fn anyref_ty_array() -> Result<()> {
+    let mut store = gc_store()?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 1)?;
+    let any: Rooted<AnyRef> = a.into();
+    let ty = any.ty(&store)?;
+    assert!(matches!(ty, HeapType::ConcreteArray(_)));
+    Ok(())
+}
+
+#[test]
+fn eqref_ty_i31() -> Result<()> {
+    let mut store = gc_store()?;
+    let eq = EqRef::from_i31(&mut store, I31::wrapping_u32(10));
+    let ty = eq.ty(&store)?;
+    assert!(matches!(ty, HeapType::I31));
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_nonnull_returns_anyref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "get") (result (ref any))
+            (ref.i31 (i32.const 11)))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<(), Rooted<AnyRef>>(&mut store, "get")?;
+    let any = f.call(&mut store, ())?;
+    assert!(any.is_i31(&store)?);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_nonnull_takes_anyref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "take") (param (ref any)) (result i32)
+            (ref.test i31ref (local.get 0)))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<Rooted<AnyRef>, i32>(&mut store, "take")?;
+    let any = AnyRef::from_i31(&mut store, I31::wrapping_u32(5));
+    let r = f.call(&mut store, any)?;
+    assert_eq!(r, 1);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_nonnull_returns_eqref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "get") (result (ref eq))
+            (ref.i31 (i32.const 22)))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<(), Rooted<EqRef>>(&mut store, "get")?;
+    let eq = f.call(&mut store, ())?;
+    assert!(eq.is_i31(&store)?);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_nonnull_takes_eqref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "take") (param (ref eq)) (result i32)
+            (ref.test i31ref (local.get 0)))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<Rooted<EqRef>, i32>(&mut store, "take")?;
+    let eq = EqRef::from_i31(&mut store, I31::wrapping_u32(3));
+    let r = f.call(&mut store, eq)?;
+    assert_eq!(r, 1);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_nonnull_returns_externref() -> Result<()> {
+    let mut store = gc_store()?;
+    // Use a WASM helper: store an externref in a table, return it
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (import "" "ext" (global (ref extern)))
+          (func (export "get") (result (ref extern))
+            (global.get 0))
+        )
+        "#,
+    )?;
+    let ext = ExternRef::new(&mut store, 99u32)?;
+    let global_ty = GlobalType::new(
+        ValType::Ref(RefType::new(false, HeapType::Extern)),
+        Mutability::Const,
+    );
+    let global = Global::new(&mut store, global_ty, Val::ExternRef(Some(ext)))?;
+    let instance = Instance::new(&mut store, &module, &[global.into()])?;
+    let f = instance.get_typed_func::<(), Rooted<ExternRef>>(&mut store, "get")?;
+    let ext2 = f.call(&mut store, ())?;
+    let data = ext2.data(&store)?.unwrap();
+    assert_eq!(*data.downcast_ref::<u32>().unwrap(), 99u32);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_func_nonnull_takes_externref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "take") (param (ref extern)) (result i32)
+            (i32.const 1))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<Rooted<ExternRef>, i32>(&mut store, "take")?;
+    let ext = ExternRef::new(&mut store, 1u32)?;
+    let r = f.call(&mut store, ext)?;
+    assert_eq!(r, 1);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn externref_null_data_is_none() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "get_null") (result externref)
+            (ref.null extern))
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<(), Option<Rooted<ExternRef>>>(&mut store, "get_null")?;
+    let result = f.call(&mut store, ())?;
+    assert!(result.is_none());
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_i31ref_roundtrip() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "nonnull") (param (ref i31)) (result (ref i31)) local.get 0)
+          (func (export "nullable") (param i31ref) (result i31ref) local.get 0)
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<I31, I31>(&mut store, "nonnull")?;
+    assert_eq!(f.call(&mut store, I31::wrapping_u32(77))?.get_u32(), 77);
+    let f2 = instance.get_typed_func::<Option<I31>, Option<I31>>(&mut store, "nullable")?;
+    assert_eq!(
+        f2.call(&mut store, Some(I31::wrapping_u32(33)))?
+            .unwrap()
+            .get_u32(),
+        33
+    );
+    assert!(f2.call(&mut store, None)?.is_none());
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_owned_anyref_roundtrip() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "nonnull") (param (ref any)) (result (ref any)) local.get 0)
+          (func (export "nullable") (param anyref) (result anyref) local.get 0)
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance
+        .get_typed_func::<OwnedRooted<AnyRef>, OwnedRooted<AnyRef>>(&mut store, "nonnull")?;
+    let owned = AnyRef::from_i31(&mut store, I31::wrapping_u32(7)).to_owned_rooted(&mut store)?;
+    let result = f.call(&mut store, owned)?;
+    assert!(result.to_rooted(&mut store).is_i31(&store)?);
+    let f2 = instance.get_typed_func::<Option<OwnedRooted<AnyRef>>, Option<OwnedRooted<AnyRef>>>(
+        &mut store, "nullable",
+    )?;
+    let owned2 = AnyRef::from_i31(&mut store, I31::wrapping_u32(3)).to_owned_rooted(&mut store)?;
+    assert!(f2.call(&mut store, Some(owned2))?.is_some());
+    assert!(f2.call(&mut store, None)?.is_none());
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_owned_eqref_roundtrip() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "nonnull") (param (ref eq)) (result (ref eq)) local.get 0)
+          (func (export "nullable") (param eqref) (result eqref) local.get 0)
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f =
+        instance.get_typed_func::<OwnedRooted<EqRef>, OwnedRooted<EqRef>>(&mut store, "nonnull")?;
+    let owned = EqRef::from_i31(&mut store, I31::wrapping_u32(5)).to_owned_rooted(&mut store)?;
+    let result = f.call(&mut store, owned)?;
+    assert!(result.to_rooted(&mut store).is_i31(&store)?);
+    let f2 = instance.get_typed_func::<Option<OwnedRooted<EqRef>>, Option<OwnedRooted<EqRef>>>(
+        &mut store, "nullable",
+    )?;
+    let owned2 = EqRef::from_i31(&mut store, I31::wrapping_u32(2)).to_owned_rooted(&mut store)?;
+    assert!(f2.call(&mut store, Some(owned2))?.is_some());
+    assert!(f2.call(&mut store, None)?.is_none());
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_owned_externref_roundtrip() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "nonnull") (param (ref extern)) (result (ref extern)) local.get 0)
+          (func (export "nullable") (param externref) (result externref) local.get 0)
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance
+        .get_typed_func::<OwnedRooted<ExternRef>, OwnedRooted<ExternRef>>(&mut store, "nonnull")?;
+    let owned = ExternRef::new(&mut store, 42u32)?.to_owned_rooted(&mut store)?;
+    let result = f.call(&mut store, owned)?;
+    let rooted = result.to_rooted(&mut store);
+    assert_eq!(
+        *rooted.data(&store)?.unwrap().downcast_ref::<u32>().unwrap(),
+        42u32
+    );
+    let f2 = instance
+        .get_typed_func::<Option<OwnedRooted<ExternRef>>, Option<OwnedRooted<ExternRef>>>(
+            &mut store, "nullable",
+        )?;
+    let owned2 = ExternRef::new(&mut store, 1u32)?.to_owned_rooted(&mut store)?;
+    assert!(f2.call(&mut store, Some(owned2))?.is_some());
+    assert!(f2.call(&mut store, None)?.is_none());
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_owned_structref_roundtrip() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "nonnull") (param (ref struct)) (result (ref struct)) local.get 0)
+          (func (export "nullable") (param structref) (result structref) local.get 0)
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let struct_ty = StructType::new(store.engine(), [])?;
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let f = instance
+        .get_typed_func::<OwnedRooted<StructRef>, OwnedRooted<StructRef>>(&mut store, "nonnull")?;
+    let owned = StructRef::new(&mut store, &pre, &[])?.to_owned_rooted(&mut store)?;
+    let result = f.call(&mut store, owned)?;
+    let _ = result.to_rooted(&mut store);
+    let f2 = instance
+        .get_typed_func::<Option<OwnedRooted<StructRef>>, Option<OwnedRooted<StructRef>>>(
+            &mut store, "nullable",
+        )?;
+    let owned2 = StructRef::new(&mut store, &pre, &[])?.to_owned_rooted(&mut store)?;
+    assert!(f2.call(&mut store, Some(owned2))?.is_some());
+    assert!(f2.call(&mut store, None)?.is_none());
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_owned_arrayref_roundtrip() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "nonnull") (param (ref array)) (result (ref array)) local.get 0)
+          (func (export "nullable") (param arrayref) (result arrayref) local.get 0)
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let array_ty = ArrayType::new(
+        store.engine(),
+        FieldType::new(Mutability::Const, ValType::I32.into()),
+    );
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let f = instance
+        .get_typed_func::<OwnedRooted<ArrayRef>, OwnedRooted<ArrayRef>>(&mut store, "nonnull")?;
+    let owned = ArrayRef::new(&mut store, &pre, &Val::I32(0), 3)?.to_owned_rooted(&mut store)?;
+    let result = f.call(&mut store, owned)?;
+    assert_eq!(result.to_rooted(&mut store).len(&store)?, 3);
+    let f2 = instance
+        .get_typed_func::<Option<OwnedRooted<ArrayRef>>, Option<OwnedRooted<ArrayRef>>>(
+            &mut store, "nullable",
+        )?;
+    let owned2 = ArrayRef::new(&mut store, &pre, &Val::I32(0), 1)?.to_owned_rooted(&mut store)?;
+    assert!(f2.call(&mut store, Some(owned2))?.is_some());
+    assert!(f2.call(&mut store, None)?.is_none());
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_option_noneref() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "roundtrip") (param (ref null none)) (result (ref null none))
+            local.get 0)
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<Option<NoneRef>, Option<NoneRef>>(&mut store, "roundtrip")?;
+    assert!(f.call(&mut store, None)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn array_i8_slice_roundtrip() -> Result<()> {
+    let mut store = gc_store()?;
+    let engine = store.engine().clone();
+
+    let array_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8));
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+
+    // Bytes 0x80 and 0xFF are `i8` -128 and -1, or `u8` 128 and 255.
+    let src: [u8; 5] = [0x80, 0xFF, 0x00, 0x01, 0x7F];
+    let array = ArrayRef::new_from_i8_slice(&mut store, &pre, &src)?;
+    assert_eq!(array.len(&store)?, 5);
+
+    // Round-trip the bytes back out.
+    let mut dst = [0u8; 5];
+    array.copy_to_i8_slice(&mut store, &mut dst)?;
+    assert_eq!(dst, src);
+
+    // `get` zero-extends, i.e. the `array.get_u` interpretation of the bytes.
+    assert_eq!(array.get(&mut store, 0)?.unwrap_i32(), 128);
+    assert_eq!(array.get(&mut store, 1)?.unwrap_i32(), 255);
+
+    // Same logical contents as building it element-by-element with `new_fixed`.
+    let fixed = ArrayRef::new_fixed(
+        &mut store,
+        &pre,
+        &src.iter().map(|&b| Val::I32(b.into())).collect::<Vec<_>>(),
+    )?;
+    for i in 0..src.len() as u32 {
+        assert_eq!(
+            array.get(&mut store, i)?.unwrap_i32(),
+            fixed.get(&mut store, i)?.unwrap_i32(),
+        );
+    }
+
+    // Empty slices work.
+    let empty = ArrayRef::new_from_i8_slice(&mut store, &pre, &[])?;
+    assert_eq!(empty.len(&store)?, 0);
+    empty.copy_to_i8_slice(&mut store, &mut [])?;
+
+    // A destination of the wrong length is an error.
+    assert!(array.copy_to_i8_slice(&mut store, &mut [0u8; 3]).is_err());
+
+    // The element type must actually be `i8`.
+    let i32_ty = ArrayType::new(
+        &engine,
+        FieldType::new(Mutability::Var, ValType::I32.into()),
+    );
+    let i32_pre = ArrayRefPre::new(&mut store, i32_ty);
+    assert!(ArrayRef::new_from_i8_slice(&mut store, &i32_pre, &[1, 2, 3]).is_err());
+    let i32_array = ArrayRef::new(&mut store, &i32_pre, &Val::I32(0), 3)?;
+    assert!(
+        i32_array
+            .copy_to_i8_slice(&mut store, &mut [0u8; 3])
+            .is_err()
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn typed_option_noextern() -> Result<()> {
+    let mut store = gc_store()?;
+    let module = Module::new(
+        store.engine(),
+        r#"
+        (module
+          (func (export "roundtrip") (param (ref null noextern)) (result (ref null noextern))
+            local.get 0)
+        )
+        "#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f =
+        instance.get_typed_func::<Option<NoExtern>, Option<NoExtern>>(&mut store, "roundtrip")?;
+    assert!(f.call(&mut store, None)?.is_none());
+    Ok(())
+}
+
+/// A test that performs a GC without actually compiling or running any Wasm
+/// functions so we can run this test under MIRI.
+#[test]
+// FIXME: need to fold this into other miri testing which precompiles
+#[cfg_attr(miri, ignore)]
+fn miri_gc_smoke_test() -> Result<()> {
+    for collector in [
+        Collector::Copying,
+        Collector::Null,
+        Collector::DeferredReferenceCounting,
+    ] {
+        eprintln!("===== Collector: {collector:?} =====");
+
+        let mut config = Config::new();
+        config.wasm_gc(true);
+        config.wasm_function_references(true);
+        config.wasm_exceptions(true);
+        config.collector(collector);
+
+        let engine = Engine::new(&config)?;
+
+        let struct_ty = StructType::new(
+            &engine,
+            [FieldType::new(Mutability::Const, StorageType::I8)],
+        )?;
+        let table_ty = TableType::new(RefType::ANYREF, 1, None)?;
+        let global_ty = GlobalType::new(RefType::ANYREF.into(), Mutability::Var);
+        let exn_ty = ExnType::new(&engine, [ValType::I32])?;
+        let func_ty = FuncType::new(&engine, Some(ValType::I32), None);
+        let tag_ty = TagType::new(func_ty);
+
+        let module = Module::new(
+            &engine,
+            r#"
+                (module
+                    (type $s (struct (field i8)))
+
+                    (global (export "g") (ref null $s) (struct.new $s (i32.const 1)))
+
+                    (table $t (export "t") 1 (ref null $s))
+                    (elem (table $t) (i32.const 0) (ref null $s) (struct.new $s (i32.const 2)))
+
+                    ;; Can't actually do anything with this without running Wasm,
+                    ;; but have it here anyways in case it trips anything in MIRI.
+                    (elem anyref (struct.new $s (i32.const 0xff)))
+                )
+            "#,
+        )?;
+
+        let mut store = Store::new(&engine, ());
+
+        let pre = StructRefPre::new(&mut store, struct_ty);
+        let instance = Instance::new(&mut store, &module, &[])?;
+
+        // Host table root.
+        let table = {
+            let mut store = RootScope::new(&mut store);
+            let table = Table::new(&mut store, table_ty, Ref::Any(None))?;
+            let s = StructRef::new(&mut store, &pre, &[Val::I32(3)])?;
+            table.set(&mut store, 0, s.into())?;
+            table
+        };
+
+        // Host global root.
+        let global = {
+            let mut store = RootScope::new(&mut store);
+            let s = StructRef::new(&mut store, &pre, &[Val::I32(4)])?;
+            Global::new(&mut store, global_ty, s.into())?
+        };
+
+        // Rooted<T> root.
+        let rooted = StructRef::new(&mut store, &pre, &[Val::I32(5)])?;
+
+        // OwnedRooted<T> root.
+        let owned_rooted = {
+            let mut store = RootScope::new(&mut store);
+            StructRef::new(&mut store, &pre, &[Val::I32(6)])?.to_owned_rooted(&mut store)?
+        };
+
+        // Pending exception root.
+        {
+            let mut store = RootScope::new(&mut store);
+            let pre = ExnRefPre::new(&mut store, exn_ty);
+            let tag = Tag::new(&mut store, &tag_ty)?;
+            let e = ExnRef::new(&mut store, &pre, &tag, &[Val::I32(7)])?;
+            let _ = store.as_context_mut().throw::<()>(e);
+        }
+
+        // Do a GC!
+        store.gc(None)?;
+
+        let assert_field_value = |store: &mut Store<_>, val: Val, field: i32| -> Result<()> {
+            let s = val.anyref().unwrap().unwrap().unwrap_struct(&store)?;
+            let f = s.field(store, 0)?;
+            assert_eq!(f.unwrap_i32(), field);
+            Ok(())
+        };
+
+        // Instance global.
+        {
+            let global = instance.get_global(&mut store, "g").unwrap();
+            let global_val = global.get(&mut store);
+            assert_field_value(&mut store, global_val, 1)?;
+        }
+
+        // Instance table.
+        {
+            let table = instance.get_table(&mut store, "t").unwrap();
+            let table_val = table.get(&mut store, 0).unwrap();
+            assert_field_value(&mut store, table_val.into(), 2)?;
+        }
+
+        // Host table.
+        let table_val = table.get(&mut store, 0).unwrap();
+        assert_field_value(&mut store, table_val.into(), 3)?;
+
+        // Host global.
+        let global_val = global.get(&mut store);
+        assert_field_value(&mut store, global_val, 4)?;
+
+        // Rooted<T>.
+        assert_field_value(&mut store, rooted.into(), 5)?;
+
+        // OwnedRooted<T>.
+        let owned_rooted = owned_rooted.to_rooted(&mut store);
+        assert_field_value(&mut store, owned_rooted.into(), 6)?;
+
+        // Pending exception.
+        let e = store.take_pending_exception().unwrap();
+        let e_val = e.field(&mut store, 0)?;
+        assert_eq!(e_val.unwrap_i32(), 7);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn array_i8_slice_async() -> Result<()> {
+    let _ = env_logger::try_init();
+
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+
+    let engine = Engine::new(&config)?;
+    let mut store = Store::new(&engine, ());
+
+    let array_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8));
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+
+    let src = [0x80, 0xFF, 0x00, 0x01, 0x7F];
+    let array = ArrayRef::new_from_i8_slice_async(&mut store, &pre, &src).await?;
+    assert_eq!(array.len(&store)?, 5);
+
+    let mut dst = [0u8; 5];
+    array.copy_to_i8_slice(&mut store, &mut dst)?;
+    assert_eq!(dst, src);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn copying_collector_async_gc_yields() -> Result<()> {
+    let _ = env_logger::try_init();
+
+    if crate::no_hog_memory() {
+        return Ok(());
+    }
+
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    config.collector(Collector::Copying);
+
+    let engine = Engine::new(&config)?;
+
+    const NUM_OBJECTS: usize = 100_000;
+    const OBJECTS_PER_INCREMENT: usize = 16_384;
+
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+                (type $node (struct (field i32) (field (ref null $node))))
+                (global $list (export "list") (mut (ref null $node)) (ref.null $node))
+
+                (func (export "build") (param $n i32)
+                    (local $i i32)
+                    (local.set $i (i32.const 0))
+                    (block $done
+                        (loop $loop
+                            (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+                            (global.set $list
+                                (struct.new $node
+                                    (local.get $i)
+                                    (global.get $list)
+                                )
+                            )
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br $loop)
+                        )
+                    )
+                )
+            )
+        "#,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let build = instance.get_typed_func::<i32, ()>(&mut store, "build")?;
+    build.call(&mut store, NUM_OBJECTS as i32)?;
+
+    let gc_future = store.gc_async(None);
+    let (result, pending_count) = CountPending::new(Box::pin(gc_future)).await;
+    result?;
+
+    let min_expected = NUM_OBJECTS / OBJECTS_PER_INCREMENT;
+    assert!(
+        pending_count >= min_expected,
+        "expected at least {min_expected} yields but got {pending_count}",
+    );
+
+    Ok(())
+}
+
+// Cancel the wrapped future once a host-triggered collection is observed to be
+// `skip` pending-polls underway (so we are past root processing / the semispace
+// flip and into the actual copying), simulating an async cancellation that
+// drops a `call_async` future while a GC is in progress.
+struct CancelDuringGc<F> {
+    future: F,
+    in_gc: Arc<AtomicUsize>,
+    skip: u32,
+    seen_in_gc: u32,
+}
+
+impl<F: Future> Future for CancelDuringGc<F> {
+    type Output = Option<F::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = unsafe { self.get_unchecked_mut() };
+        let future = unsafe { Pin::new_unchecked(&mut me.future) };
+        match future.poll(cx) {
+            Poll::Ready(val) => Poll::Ready(Some(val)),
+            Poll::Pending => {
+                if me.in_gc.load(SeqCst) != 0 {
+                    me.seen_in_gc += 1;
+                    if me.seen_in_gc >= me.skip {
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
+// Test that cancelling a Wasm-execution future mid-collection and then calling
+// into Wasm again doesn't trigger or observe any GC heap corruption.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn issue_13516_copying_collector_cancellation_during_gc() -> Result<()> {
+    let _ = env_logger::try_init();
+
+    if crate::no_hog_memory() {
+        return Ok(());
+    }
+
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    config.collector(Collector::Copying);
+
+    let engine = Engine::new(&config)?;
+    let mut store = Store::new(&engine, ());
+
+    // Build a linked list of `N` nodes rooted in a global so a collection has a
+    // non-trivial worklist to copy (giving a wide window in which to cancel),
+    // then trigger a host collection.
+    const N: i32 = 100_000;
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+                (import "" "gc" (func $gc))
+
+                (type $node (struct (field (ref null $node))))
+
+                (global $list (mut (ref null $node)) (ref.null $node))
+
+                (func (export "run") (param $n i32)
+                    (block $done
+                        (loop $loop
+                            (br_if $done (i32.eqz (local.get $n)))
+                            (global.set $list (struct.new $node (global.get $list)))
+                            (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+                            (br $loop)
+                        )
+                    )
+                    (call $gc)
+                )
+            )
+        "#,
+    )?;
+
+    // A host function that performs an async collection, flagging while it runs.
+    let in_gc = Arc::new(AtomicUsize::new(0));
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap_async("", "gc", {
+        let in_gc = in_gc.clone();
+        move |mut caller: Caller<'_, ()>, _: ()| {
+            let in_gc = in_gc.clone();
+            Box::new(async move {
+                in_gc.fetch_add(1, SeqCst);
+                let r = caller.gc_async(None).await;
+                in_gc.store(0, SeqCst);
+                r
+            })
+        }
+    })?;
+
+    let instance = linker.instantiate_async(&mut store, &module).await?;
+    let run = instance.get_typed_func::<i32, ()>(&mut store, "run")?;
+
+    // Drive a call that triggers a collection, then cancel it mid-collection.
+    let cancelled = CancelDuringGc {
+        future: run.call_async(&mut store, N),
+        in_gc: in_gc.clone(),
+        skip: 8,
+        seen_in_gc: 0,
+    }
+    .await
+    .is_none();
+    assert!(
+        cancelled,
+        "the collection should have been cancelled mid-flight"
+    );
+
+    // Reusing the store after a mid-collection cancellation must not corrupt the
+    // GC heap.
+    run.call_async(&mut store, N).await?;
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn pooling_gc_heap_failure_does_not_leak_memory_slot() -> Result<()> {
+    if crate::skip_pooling_allocator_tests() {
+        return Ok(());
+    }
+
+    const TOTAL_MEMORIES: u32 = 4;
+
+    let mut pool = crate::small_pool_config();
+    pool.total_memories(TOTAL_MEMORIES)
+        .total_gc_heaps(1)
+        .total_core_instances(TOTAL_MEMORIES + 2)
+        .total_tables(TOTAL_MEMORIES + 2)
+        .memory_protection_keys(Enabled::No);
+
+    let mut config = Config::new();
+    config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+    let engine = Engine::new(&config)?;
+
+    let gc_module = Module::new(
+        &engine,
+        r#"
+            (module
+                (type $s (struct))
+                (func (export "alloc")
+                    (drop (struct.new $s)))
+            )
+        "#,
+    )?;
+
+    // Hold the gc slot, then assert other attempts are failures
+    {
+        let mut held = Store::new(&engine, ());
+        Instance::new(&mut held, &gc_module, &[])?;
+
+        for _ in 0..10 {
+            let mut store = Store::new(&engine, ());
+            let err = Instance::new(&mut store, &gc_module, &[]).unwrap_err();
+            assert!(err.is::<PoolConcurrencyLimitError>(), "bad error: {err:?}");
+        }
+    }
+
+    // should be able to use all slots now...
+    let mut store = Store::new(&engine, ());
+    let mem_module = Module::new(&engine, r#"(module (memory 1 1))"#)?;
+    for _ in 0..TOTAL_MEMORIES {
+        Instance::new(&mut store, &mem_module, &[]).unwrap();
+    }
+
+    Ok(())
+}
+
+#[test]
+fn initial_size_larger_than_reservation() -> Result<()> {
+    // This shouldn't panic/corrupt/etc, it should just allocate a larger heap.
+    let mut config = Config::new();
+    config.gc_heap_initial_size(4096 * 20);
+    config.gc_heap_reservation(4096);
+    let engine = Engine::new(&config)?;
+
+    let mut store = Store::new(&engine, ());
+    ExternRef::new(&mut store, 1)?;
+
+    Ok(())
+}
+
+/// Under Winch, a frame holding the only reference to an `externref` across a
+/// collection must keep it alive. Runs under the barrier-free collectors that Winch supports.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn winch_externref_survives_gc_in_frame() -> Result<()> {
+    for collector in [Collector::Null, Collector::Copying] {
+        let mut config = Config::new();
+        config.gc_support(true);
+        config.strategy(Strategy::Winch);
+        config.collector(collector);
+        let Ok(engine) = Engine::new(&config) else {
+            return Ok(());
+        };
+        let module = Module::new(
+            &engine,
+            r#"
+            (module
+              (import "" "make" (func $make (result externref)))
+              (import "" "gc" (func $gc))
+              (func (export "hold") (result externref)
+                ;; the only reference to the object is on this frame's value
+                ;; stack while the collection runs
+                (call $make)
+                (call $gc)))
+            "#,
+        )?;
+        let mut store = Store::new(&engine, ());
+        let make = Func::wrap(
+            &mut store,
+            |mut cx: Caller<'_, ()>| -> Result<Option<Rooted<ExternRef>>> {
+                Ok(Some(ExternRef::new(&mut cx, 0xDECAFu32)?))
+            },
+        );
+        let gc = Func::wrap(&mut store, |mut cx: Caller<'_, ()>| {
+            let _ = cx.gc(None);
+        });
+        let instance = Instance::new(&mut store, &module, &[make.into(), gc.into()])?;
+        let hold = instance.get_typed_func::<(), Option<Rooted<ExternRef>>>(&mut store, "hold")?;
+        let out = hold.call(&mut store, ())?.expect("must not be null");
+        let got = out
+            .data(&store)?
+            .and_then(|d| d.downcast_ref::<u32>().copied());
+        assert_eq!(
+            got,
+            Some(0xDECAF),
+            "externref did not survive GC under {collector:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Typed null selects retain a valid reference representation across a GC call.
+#[wasmtime_test(
+    strategies(only(Winch)),
+    collectors(All),
+    wasm_features(reference_types)
+)]
+fn typed_select_null_across_gc(config: &mut Config) -> Result<()> {
+    let engine = Engine::new(config)?;
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+              (import "" "gc" (func $gc))
+              (func (export "select-null") (param i32) (result externref)
+                ref.null extern
+                ref.null extern
+                local.get 0
+                select (result externref)
+                call $gc))
+            "#,
+    )?;
+    let mut store = Store::new(&engine, 0usize);
+    let gc = Func::wrap(&mut store, |mut cx: Caller<'_, usize>| -> Result<()> {
+        cx.gc(None)?;
+        *cx.data_mut() += 1;
+        Ok(())
+    });
+    let instance = Instance::new(&mut store, &module, &[gc.into()])?;
+    let select =
+        instance.get_typed_func::<i32, Option<Rooted<ExternRef>>>(&mut store, "select-null")?;
+    for cond in [0, 1] {
+        assert!(select.call(&mut store, cond)?.is_none());
+    }
+    assert_eq!(*store.data(), 2, "GC calls did not run");
+    Ok(())
+}
+
+/// A typed select must keep a live externref in the call-site stack map even
+/// when its unselected operand is null.
+#[wasmtime_test(
+    strategies(only(Winch)),
+    collectors(All),
+    wasm_features(reference_types)
+)]
+fn typed_select_preserves_externref_across_gc(config: &mut Config) -> Result<()> {
+    let engine = Engine::new(config)?;
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+              (import "" "make" (func $make (result externref)))
+              (import "" "gc" (func $gc))
+
+              (func (export "control") (result externref)
+                call $make
+                call $gc)
+
+              (func (export "selected") (result externref)
+                call $make
+                ref.null extern
+                i32.const 1
+                select (result externref)
+                call $gc))
+            "#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let make = Func::wrap(
+        &mut store,
+        |mut cx: Caller<'_, ()>| -> Result<Option<Rooted<ExternRef>>> {
+            Ok(Some(ExternRef::new(&mut cx, 0xDECAFu32)?))
+        },
+    );
+    let gc = Func::wrap(&mut store, |mut cx: Caller<'_, ()>| cx.gc(None));
+    let instance = Instance::new(&mut store, &module, &[make.into(), gc.into()])?;
+    for export in ["control", "selected"] {
+        let func = instance.get_typed_func::<(), Option<Rooted<ExternRef>>>(&mut store, export)?;
+        let result = func.call(&mut store, ())?.expect("reference became null");
+        let data = result
+            .data(&store)?
+            .and_then(|value| value.downcast_ref::<u32>().copied());
+        assert_eq!(data, Some(0xDECAF), "{export}");
+    }
+    Ok(())
+}
+
+/// The write barrier's decrement chain releases an object once a global stops
+/// holding the last reference to it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn winch_drc_write_barrier_drops_old_global_value() -> Result<()> {
+    let mut config = Config::new();
+    config.gc_support(true);
+    config.strategy(Strategy::Winch);
+    config.collector(Collector::DeferredReferenceCounting);
+    let Ok(engine) = Engine::new(&config) else {
+        return Ok(());
+    };
+    let module = Module::new(
+        &engine,
+        r#"
+        (module
+          (global $g (mut externref) (ref.null extern))
+          (func (export "set") (param externref)
+            (global.set $g (local.get 0))))
+        "#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let set = instance.get_func(&mut store, "set").unwrap();
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    {
+        let mut scope = RootScope::new(&mut store);
+        let r = ExternRef::new(&mut scope, SetFlagOnDrop(dropped.clone()))?;
+        set.call(&mut scope, &[Val::ExternRef(Some(r))], &mut [])?;
+    }
+
+    // The global holds the only reference; nothing may be dropped yet.
+    store.gc(None)?;
+    assert!(!dropped.load(SeqCst));
+
+    // Overwriting the global decrements the count to zero and releases the
+    // old value.
+    set.call(&mut store, &[Val::ExternRef(None)], &mut [])?;
+    store.gc(None)?;
+    assert!(dropped.load(SeqCst));
+
+    Ok(())
+}
+
+/// The read barrier holds a count for references entering the stack, so
+/// overwriting their last long-lived home cannot free them out from under
+/// the frame that loaded them.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn winch_drc_read_barrier_keeps_loaded_ref_alive() -> Result<()> {
+    let mut config = Config::new();
+    config.gc_support(true);
+    config.strategy(Strategy::Winch);
+    config.collector(Collector::DeferredReferenceCounting);
+    let Ok(engine) = Engine::new(&config) else {
+        return Ok(());
+    };
+    let module = Module::new(
+        &engine,
+        r#"
+        (module
+          (import "" "gc" (func $gc))
+          (global $g (mut externref) (ref.null extern))
+          (func (export "set") (param externref)
+            (global.set $g (local.get 0)))
+          (func (export "swap") (result externref)
+            (local $tmp externref)
+            (local.set $tmp (global.get $g))
+            (global.set $g (ref.null extern))
+            (call $gc)
+            (local.get $tmp)))
+        "#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let gc = Func::wrap(&mut store, |mut cx: Caller<'_, ()>| {
+        let _ = cx.gc(None);
+    });
+    let instance = Instance::new(&mut store, &module, &[gc.into()])?;
+    let set = instance.get_func(&mut store, "set").unwrap();
+    let swap = instance.get_typed_func::<(), Option<Rooted<ExternRef>>>(&mut store, "swap")?;
+
+    {
+        let mut scope = RootScope::new(&mut store);
+        let r = ExternRef::new(&mut scope, 0xDECAFu32)?;
+        set.call(&mut scope, &[Val::ExternRef(Some(r))], &mut [])?;
+    }
+
+    // Settle the deferred unroot so the global truly holds the last count.
+    store.gc(None)?;
+
+    // `swap` loads the reference onto the stack, overwrites the global, and
+    // collects while the stack copy is live.
+    let out = swap.call(&mut store, ())?.expect("must not be null");
+    let got = out
+        .data(&store)?
+        .and_then(|d| d.downcast_ref::<u32>().copied());
+    assert_eq!(got, Some(0xDECAF));
+
+    Ok(())
+}
+
+/// An `externref` may wrap an unboxed i31 created through the host API. Such
+/// values do not have reference counts and must bypass both DRC barriers.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn winch_drc_i31_wrapped_as_externref_skips_global_barriers() -> Result<()> {
+    let mut config = Config::new();
+    config.gc_support(true);
+    config.strategy(Strategy::Winch);
+    config.collector(Collector::DeferredReferenceCounting);
+    let Ok(engine) = Engine::new(&config) else {
+        return Ok(());
+    };
+    let module = Module::new(
+        &engine,
+        r#"
+        (module
+          (global $g (mut externref) (ref.null extern))
+          (func (export "set") (param externref)
+            local.get 0
+            global.set $g)
+          (func (export "get") (result externref)
+            global.get $g))
+        "#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let set = instance.get_func(&mut store, "set").unwrap();
+    let get = instance.get_func(&mut store, "get").unwrap();
+
+    let anyref = AnyRef::from_i31(&mut store, I31::wrapping_u32(0x1234));
+    let externref = ExternRef::convert_any(&mut store, anyref)?;
+    set.call(&mut store, &[Val::ExternRef(Some(externref))], &mut [])?;
+
+    let mut results = [Val::null_extern_ref()];
+    get.call(&mut store, &[], &mut results)?;
+    let externref = results[0]
+        .unwrap_externref()
+        .expect("global.get returned null");
+    let anyref = AnyRef::convert_extern(&mut store, *externref)?;
+    assert_eq!(anyref.unwrap_i31(&store)?.get_u32(), 0x1234);
+
+    // Replacing the i31-backed externref exercises the old-value side of the
+    // write barrier as well.
+    set.call(&mut store, &[Val::null_extern_ref()], &mut [])?;
+    Ok(())
+}
+
+/// Growing the over-approximated-stack-roots list to its threshold forces a
+/// collection from the read barrier and preserves the reference whose load
+/// triggered that collection.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn winch_drc_read_barrier_forces_gc_at_threshold() -> Result<()> {
+    let mut config = Config::new();
+    config.gc_support(true);
+    config.strategy(Strategy::Winch);
+    config.collector(Collector::DeferredReferenceCounting);
+    let Ok(engine) = Engine::new(&config) else {
+        return Ok(());
+    };
+
+    let num_refs = wasmtime_environ::DRC_MIN_OVER_APPROX_STACK_ROOTS_GC_THRESHOLD as usize;
+    let mut wat = "(module\n".to_string();
+    for i in 0..num_refs {
+        wat.push_str(&format!(
+            r#"(global $g{i} (export "g{i}") (mut externref) (ref.null extern))
+"#,
+        ));
+    }
+    wat.push_str("(func (export \"drain\")\n");
+    for i in 0..num_refs {
+        wat.push_str(&format!(
+            "(drop (global.get $g{i}))\n(global.set $g{i} (ref.null extern))\n"
+        ));
+    }
+    wat.push_str("))");
+
+    let module = Module::new(&engine, &wat)?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let dropped = Arc::new(AtomicUsize::new(0));
+
+    {
+        let mut scope = RootScope::new(&mut store);
+        for i in 0..num_refs {
+            let gc_ref = ExternRef::new(&mut scope, CountDrops(dropped.clone()))?;
+            let global = instance
+                .get_global(&mut scope, &format!("g{i}"))
+                .expect("global must be exported");
+            global.set(&mut scope, Val::ExternRef(Some(gc_ref)))?;
+        }
+    }
+
+    // Settle the host roots. Each global is now the only long-lived home for
+    // its reference.
+    store.gc(None)?;
+    assert_eq!(dropped.load(SeqCst), 0);
+
+    let drain = instance.get_typed_func::<(), ()>(&mut store, "drain")?;
+    drain.call(&mut store, ())?;
+
+    // The final global.get reaches the threshold and forces a collection.
+    // The preceding references are no longer on the stack or in globals, but
+    // the triggering reference is still live in the global.get result slot.
+    assert_eq!(dropped.load(SeqCst), num_refs - 1);
+
+    // The triggering reference becomes collectible after `drain` returns.
+    store.gc(None)?;
+    assert_eq!(dropped.load(SeqCst), num_refs);
+
+    Ok(())
+}
+
+/// Reference values crossing the ABI boundary in every position: stack-passed
+/// externref params and multi-value externref results (more than fit in registers)
+#[test]
+#[cfg_attr(miri, ignore)]
+fn winch_ref_params_and_results_across_gc() -> Result<()> {
+    for (nparams, nresults) in [(12, 12), (2, 12), (12, 3), (12, 1)] {
+        let params = "externref ".repeat(nparams);
+        let results = "externref ".repeat(nresults);
+        let gets: String = (0..nresults)
+            .map(|i| format!("(local.get {})", i % nparams))
+            .collect();
+        let wat = format!(
+            r#"(module
+              (import "" "gc" (func $gc))
+              (func (export "hold") (param {params}) (result {results})
+                (call $gc)
+                {gets}))"#
+        );
+        for collector in [Collector::Null, Collector::Copying] {
+            let mut config = Config::new();
+            config.gc_support(true);
+            config.strategy(Strategy::Winch);
+            config.collector(collector);
+            let Ok(engine) = Engine::new(&config) else {
+                return Ok(());
+            };
+            let module = Module::new(&engine, &wat)?;
+            let mut store = Store::new(&engine, ());
+            let gc = Func::wrap(&mut store, |mut cx: Caller<'_, ()>| {
+                let _ = cx.gc(None);
+            });
+            let instance = Instance::new(&mut store, &module, &[gc.into()])?;
+            let hold = instance.get_func(&mut store, "hold").unwrap();
+            let args: Vec<Val> = (0..nparams as u32)
+                .map(|i| Ok(Val::ExternRef(Some(ExternRef::new(&mut store, i)?))))
+                .collect::<Result<_>>()?;
+            let mut outs = vec![Val::null_extern_ref(); nresults];
+            hold.call(&mut store, &args, &mut outs)?;
+            for (i, v) in outs.iter().enumerate() {
+                let id = v
+                    .unwrap_externref()
+                    .expect("result became null")
+                    .data(&store)?
+                    .and_then(|d| d.downcast_ref::<u32>().copied());
+                assert_eq!(
+                    id,
+                    Some((i % nparams) as u32),
+                    "result {i} corrupted under {collector:?} ({nparams}p/{nresults}r)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn table_fill_null_barriers_ok() -> Result<()> {
+    for collector in [Collector::Copying, Collector::DeferredReferenceCounting] {
+        eprintln!("collector: {collector:?}");
+        let engine = Engine::new(Config::new().collector(collector).table_lazy_init(false))?;
+        let module = Module::new(
+            &engine,
+            r#"
+                (module
+                    (table $t (export "t") 1 (ref null extern))
+                    (func (export "fill") (param i32) (param i32)
+                        (table.fill $t (local.get 0) (ref.null extern) (local.get 1)))
+                )
+            "#,
+        )?;
+
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[])?;
+        let fill = instance.get_typed_func::<(u32, u32), ()>(&mut store, "fill")?;
+        let table = instance.get_table(&mut store, "t").unwrap();
+
+        let flag = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut scope = RootScope::new(&mut store);
+            let r = ExternRef::new(&mut scope, SetFlagOnDrop(flag.clone()))?;
+            table.set(&mut scope, 0, r.into())?;
+        }
+
+        assert!(!flag.load(SeqCst));
+        store.gc(None)?;
+        assert!(!flag.load(SeqCst));
+
+        fill.call(&mut store, (0, 1))?;
+        store.gc(None)?;
+        assert!(flag.load(SeqCst));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn manually_grow_gc_heap() -> Result<()> {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    assert_eq!(store.gc_heap_capacity(), 0);
+    store.gc_heap_grow(1)?;
+    assert_eq!(store.gc_heap_capacity(), 1 << 16);
+    store.gc_heap_grow(1)?;
+    assert_eq!(store.gc_heap_capacity(), 2 << 16);
+    store.gc_heap_grow_async(1).await?;
+    assert_eq!(store.gc_heap_capacity(), 4 << 16);
     Ok(())
 }

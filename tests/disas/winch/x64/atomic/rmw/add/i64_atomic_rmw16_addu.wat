@@ -1,5 +1,6 @@
 ;;! target = "x86_64"
 ;;! test = "winch"
+;;! flags = "-W threads"
 
 (module
   (memory 1 1 shared)
@@ -19,8 +20,8 @@
 ;;       movq    %rsi, (%rsp)
 ;;       movl    $0x2a, %eax
 ;;       movl    $0, %ecx
-;;       andw    $1, %cx
-;;       cmpw    $0, %cx
+;;       andl    $1, %ecx
+;;       cmpl    $0, %ecx
 ;;       jne     0x6d
 ;;   48: movl    $0, %ecx
 ;;       movq    0x30(%r14), %r11

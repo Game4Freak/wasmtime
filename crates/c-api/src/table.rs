@@ -73,7 +73,8 @@ pub unsafe extern "C" fn wasm_table_get(
     index: wasm_table_size_t,
 ) -> Option<Box<wasm_ref_t>> {
     let table = t.table();
-    let r = table.get(t.ext.store.context_mut(), u64::from(index))?;
+    let mut store = RootScope::new(t.ext.store.context_mut());
+    let r = table.get(&mut store, u64::from(index))?;
     wasm_ref_t::new(r)
 }
 
@@ -163,7 +164,7 @@ pub extern "C" fn wasmtime_table_get(
 
     match table.get(&mut store, index) {
         Some(r) => {
-            crate::initialize(ret, wasmtime_val_t::from_val(&mut store, r.into()));
+            ret.write(wasmtime_val_t::from_val(&mut store, r.into()));
             true
         }
         None => false,

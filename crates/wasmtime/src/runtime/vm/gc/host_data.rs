@@ -13,6 +13,7 @@
 //! less catastrophic than doing an indirect call to an attacker-controlled
 //! function pointer.
 
+use crate::bail_bug;
 use crate::prelude::*;
 use core::any::Any;
 use wasmtime_core::{
@@ -27,9 +28,30 @@ pub struct ExternRefHostDataTable {
 }
 
 /// ID into the `externref` host data table.
+///
+/// Not every bit pattern is a valid ID, so this must never be a field of a
+/// type reinterpreted from GC heap bytes; use `into_raw` and `from_raw`
+/// instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(transparent)]
 pub struct ExternRefHostDataId(Id);
+
+impl ExternRefHostDataId {
+    /// Get the raw `u32` to store in the GC heap for this ID.
+    ///
+    /// Biased by one so that zero is never a valid encoding.
+    pub fn into_raw(self) -> u32 {
+        self.0.into_raw() + 1
+    }
+
+    /// Resolve a raw ID loaded from the GC heap, if it is well-formed.
+    ///
+    /// A well-formed ID is not necessarily a live one; lookups are still
+    /// checked.
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        let id = raw.checked_sub(1)?;
+        Some(ExternRefHostDataId(Id::try_from_raw(id)?))
+    }
+}
 
 fn deref_box<T: ?Sized>(b: &Box<T>) -> &T {
     &**b
@@ -50,21 +72,29 @@ impl ExternRefHostDataTable {
     }
 
     /// Deallocate an `externref` host data value.
-    pub fn dealloc(&mut self, id: ExternRefHostDataId) -> Box<dyn Any + Send + Sync> {
+    pub fn dealloc(&mut self, id: ExternRefHostDataId) -> Result<Box<dyn Any + Send + Sync>> {
+        // Verify this exists before deleting it
+        self.get(id)?;
         log::trace!("deallocated externref host data: {id:?}");
-        self.slab.dealloc(id.0)
+        Ok(self.slab.dealloc(id.0))
     }
 
     /// Get a shared borrow of the host data associated with the given ID.
-    pub fn get(&self, id: ExternRefHostDataId) -> &(dyn Any + Send + Sync) {
-        let data: &Box<dyn Any + Send + Sync> = self.slab.get(id.0).unwrap();
-        deref_box(data)
+    pub fn get(&self, id: ExternRefHostDataId) -> Result<&(dyn Any + Send + Sync)> {
+        let data: &Box<dyn Any + Send + Sync> = match self.slab.get(id.0) {
+            Some(data) => data,
+            None => bail_bug!("invalid `ExternRefHostDataId`"),
+        };
+        Ok(deref_box(data))
     }
 
     /// Get a mutable borrow of the host data associated with the given ID.
-    pub fn get_mut(&mut self, id: ExternRefHostDataId) -> &mut (dyn Any + Send + Sync) {
-        let data: &mut Box<dyn Any + Send + Sync> = self.slab.get_mut(id.0).unwrap();
-        deref_box_mut(data)
+    pub fn get_mut(&mut self, id: ExternRefHostDataId) -> Result<&mut (dyn Any + Send + Sync)> {
+        let data: &mut Box<dyn Any + Send + Sync> = match self.slab.get_mut(id.0) {
+            Some(data) => data,
+            None => bail_bug!("invalid `ExternRefHostDataId`"),
+        };
+        Ok(deref_box_mut(data))
     }
 }
 
@@ -78,9 +108,12 @@ mod tests {
 
         let x = 42_u32;
         let id = table.alloc(Box::new(x));
-        assert!(table.get(id).is::<u32>());
-        assert_eq!(*table.get(id).downcast_ref::<u32>().unwrap(), 42);
-        assert!(table.get_mut(id).is::<u32>());
-        assert_eq!(*table.get_mut(id).downcast_ref::<u32>().unwrap(), 42);
+        assert!(table.get(id).unwrap().is::<u32>());
+        assert_eq!(*table.get(id).unwrap().downcast_ref::<u32>().unwrap(), 42);
+        assert!(table.get_mut(id).unwrap().is::<u32>());
+        assert_eq!(
+            *table.get_mut(id).unwrap().downcast_ref::<u32>().unwrap(),
+            42
+        );
     }
 }

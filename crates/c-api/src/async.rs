@@ -140,7 +140,9 @@ async fn invoke_c_async_callback<'a>(
         &mut trap,
         &mut continuation,
     );
-    continuation.await;
+    if trap.is_none() {
+        continuation.await;
+    }
 
     if let Some(trap) = trap {
         return Err(trap.error);
@@ -236,7 +238,7 @@ async fn do_func_call_async(
     match result {
         Ok(()) => {
             for (slot, val) in results.iter_mut().zip(wt_results.iter()) {
-                crate::initialize(slot, wasmtime_val_t::from_val(&mut store, *val));
+                slot.write(wasmtime_val_t::from_val(&mut store, *val));
             }
             params.truncate(0);
             store.as_context_mut().data_mut().wasm_val_storage = params;
@@ -288,9 +290,9 @@ pub unsafe extern "C" fn wasmtime_linker_define_async_func(
     finalizer: Option<extern "C" fn(*mut std::ffi::c_void)>,
 ) -> Option<Box<wasmtime_error_t>> {
     let ty = ty.ty().ty(linker.linker.engine());
+    let cb = c_async_callback_to_rust_fn(callback, data, finalizer);
     let module = to_str!(module, module_len);
     let name = to_str!(name, name_len);
-    let cb = c_async_callback_to_rust_fn(callback, data, finalizer);
 
     handle_result(
         linker.linker.func_new_async(module, name, ty, cb),

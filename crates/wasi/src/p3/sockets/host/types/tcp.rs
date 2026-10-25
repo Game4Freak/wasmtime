@@ -1,27 +1,23 @@
-use super::is_addr_allowed;
 use crate::p3::DEFAULT_BUFFER_CAPACITY;
 use crate::p3::bindings::sockets::types::{
     Duration, ErrorCode, HostTcpSocket, HostTcpSocketWithStore, IpAddressFamily, IpSocketAddress,
     TcpSocket,
 };
 use crate::p3::sockets::{SocketError, SocketResult, WasiSockets};
-use crate::sockets::{NonInheritedOptions, SocketAddrUse, SocketAddressFamily, WasiSocketsCtxView};
+use crate::sockets::{TcpListenStream, TcpReceiveStream, TcpSendStream, WasiSocketsCtxView};
 use bytes::BytesMut;
-use core::iter;
-use core::pin::Pin;
-use core::task::{Context, Poll};
-use io_lifetimes::AsSocketlike as _;
-use std::io::Cursor;
-use std::net::{Shutdown, SocketAddr};
-use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+use std::iter;
+use std::marker::Unpin;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 use wasmtime::component::{
     Access, Accessor, Destination, FutureReader, Resource, ResourceTable, Source, StreamConsumer,
     StreamProducer, StreamReader, StreamResult,
 };
 use wasmtime::error::Context as _;
-use wasmtime::{AsContextMut as _, StoreContextMut};
+use wasmtime::{AsContextMut, StoreContextMut};
 
 fn get_socket<'a>(
     table: &'a ResourceTable,
@@ -43,46 +39,43 @@ fn get_socket_mut<'a>(
         .map_err(SocketError::trap)
 }
 
-struct ListenStreamProducer<T> {
-    listener: Arc<TcpListener>,
-    family: SocketAddressFamily,
-    options: NonInheritedOptions,
-    getter: for<'a> fn(&'a mut T) -> WasiSocketsCtxView<'a>,
+struct ListenStreamProducer<F> {
+    listener: TcpListenStream,
+    getter: F,
 }
 
-impl<D> StreamProducer<D> for ListenStreamProducer<D>
+impl<D, F> StreamProducer<D> for ListenStreamProducer<F>
 where
     D: 'static,
+    F: FnMut(&mut D) -> WasiSocketsCtxView<'_> + Send + Unpin + 'static,
 {
     type Item = Resource<TcpSocket>;
     type Buffer = Option<Self::Item>;
 
     fn poll_produce<'a>(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut store: StoreContextMut<'a, D>,
         mut dst: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
-        // If the destination buffer is empty then this is a request on
-        // behalf of the guest to wait for this socket to be ready to accept
-        // without actually accepting something. The `TcpListener` in Tokio does
-        // not have this capability so we're forced to lie here and say instead
-        // "yes we're ready to accept" as a fallback.
-        //
-        // See WebAssembly/component-model#561 for some more information.
-        if dst.remaining(&mut store) == Some(0) {
-            return Poll::Ready(Ok(StreamResult::Completed));
+        // If the destination buffer is empty then this is a readiness check.
+        if dst.remaining(&mut store)? == Some(0) {
+            return match self.listener.poll_ready(cx) {
+                Poll::Ready(()) => Poll::Ready(Ok(StreamResult::Completed)),
+                Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+                Poll::Pending => Poll::Pending,
+            };
         }
-        let res = match self.listener.poll_accept(cx) {
-            Poll::Ready(res) => res.map(|(stream, _)| stream),
+
+        let socket = match self.listener.poll_accept(cx) {
+            Poll::Ready(socket) => socket,
             Poll::Pending if finish => return Poll::Ready(Ok(StreamResult::Cancelled)),
             Poll::Pending => return Poll::Pending,
         };
-        let socket = TcpSocket::new_accept(res, &self.options, self.family)
-            .unwrap_or_else(|err| TcpSocket::new_error(err, self.family));
-        let WasiSocketsCtxView { table, .. } = (self.getter)(store.data_mut());
-        let socket = table
+        let ctx = (self.getter)(store.data_mut());
+        let socket = ctx
+            .table
             .push(socket)
             .context("failed to push socket resource to table")?;
         dst.set_buffer(Some(socket));
@@ -90,10 +83,7 @@ where
     }
 }
 
-struct ReceiveStreamProducer {
-    stream: Arc<TcpStream>,
-    result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
-}
+struct ReceiveStreamProducer(Option<(TcpReceiveStream, oneshot::Sender<Result<(), ErrorCode>>)>);
 
 impl Drop for ReceiveStreamProducer {
     fn drop(&mut self) {
@@ -103,11 +93,7 @@ impl Drop for ReceiveStreamProducer {
 
 impl ReceiveStreamProducer {
     fn close(&mut self, res: Result<(), ErrorCode>) {
-        if let Some(tx) = self.result.take() {
-            _ = self
-                .stream
-                .as_socketlike_view::<std::net::TcpStream>()
-                .shutdown(Shutdown::Read);
+        if let Some((_, tx)) = self.0.take() {
             _ = tx.send(res);
         }
     }
@@ -115,7 +101,7 @@ impl ReceiveStreamProducer {
 
 impl<D> StreamProducer<D> for ReceiveStreamProducer {
     type Item = u8;
-    type Buffer = Cursor<BytesMut>;
+    type Buffer = BytesMut;
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
@@ -124,50 +110,41 @@ impl<D> StreamProducer<D> for ReceiveStreamProducer {
         dst: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
-        let res = 'result: {
-            // 0-length reads are an indication that we should wait for
-            // readiness here, so use `poll_read_ready`.
-            if dst.remaining(store.as_context_mut()) == Some(0) {
-                return match self.stream.poll_read_ready(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(StreamResult::Completed)),
-                    Poll::Ready(Err(err)) => break 'result Err(err.into()),
-                    Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
-                    Poll::Pending => Poll::Pending,
-                };
-            }
-
-            let mut dst = dst.as_direct(store, DEFAULT_BUFFER_CAPACITY);
-            let buf = dst.remaining();
-            loop {
-                match self.stream.try_read(buf) {
-                    Ok(0) => break 'result Ok(()),
-                    Ok(n) => {
-                        dst.mark_written(n);
-                        return Poll::Ready(Ok(StreamResult::Completed));
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        match self.stream.poll_read_ready(cx) {
-                            Poll::Ready(Ok(())) => continue,
-                            Poll::Ready(Err(err)) => break 'result Err(err.into()),
-                            Poll::Pending if finish => {
-                                return Poll::Ready(Ok(StreamResult::Cancelled));
-                            }
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-                    Err(err) => break 'result Err(err.into()),
-                }
-            }
+        let Some((stream, _)) = self.0.as_mut() else {
+            return Poll::Ready(Ok(StreamResult::Dropped));
         };
-        self.close(res);
-        Poll::Ready(Ok(StreamResult::Dropped))
+
+        // 0-length read is a readiness check.
+        if dst.remaining(store.as_context_mut())? == Some(0) {
+            return match stream.poll_ready(cx) {
+                Poll::Ready(()) => Poll::Ready(Ok(StreamResult::Completed)),
+                Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+                Poll::Pending => Poll::Pending,
+            };
+        }
+
+        let mut dst = dst.as_direct(store, DEFAULT_BUFFER_CAPACITY);
+        let buf = dst.remaining()?;
+        match stream.poll_read(cx, buf) {
+            Poll::Ready(Ok(0)) => {
+                self.close(Ok(()));
+                Poll::Ready(Ok(StreamResult::Dropped))
+            }
+            Poll::Ready(Ok(n)) => {
+                dst.mark_written(n);
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+            Poll::Ready(Err(err)) => {
+                self.close(Err(err.into()));
+                Poll::Ready(Ok(StreamResult::Dropped))
+            }
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
-struct SendStreamConsumer {
-    stream: Arc<TcpStream>,
-    result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
-}
+struct SendStreamConsumer(Option<(TcpSendStream, oneshot::Sender<Result<(), ErrorCode>>)>);
 
 impl Drop for SendStreamConsumer {
     fn drop(&mut self) {
@@ -177,11 +154,7 @@ impl Drop for SendStreamConsumer {
 
 impl SendStreamConsumer {
     fn close(&mut self, res: Result<(), ErrorCode>) {
-        if let Some(tx) = self.result.take() {
-            _ = self
-                .stream
-                .as_socketlike_view::<std::net::TcpStream>()
-                .shutdown(Shutdown::Write);
+        if let Some((_, tx)) = self.0.take() {
             _ = tx.send(res);
         }
     }
@@ -197,149 +170,157 @@ impl<D> StreamConsumer<D> for SendStreamConsumer {
         src: Source<Self::Item>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
-        let mut src = src.as_direct(store);
-        let res = 'result: {
-            // A 0-length write is a request to wait for readiness so use
-            // `poll_write_ready` to wait for the underlying object to be ready.
-            if src.remaining().is_empty() {
-                return match self.stream.poll_write_ready(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(StreamResult::Completed)),
-                    Poll::Ready(Err(err)) => break 'result Err(err.into()),
-                    Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
-                    Poll::Pending => Poll::Pending,
-                };
-            }
-            loop {
-                match self.stream.try_write(src.remaining()) {
-                    Ok(n) => {
-                        debug_assert!(n > 0);
-                        src.mark_read(n);
-                        return Poll::Ready(Ok(StreamResult::Completed));
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        match self.stream.poll_write_ready(cx) {
-                            Poll::Ready(Ok(())) => continue,
-                            Poll::Ready(Err(err)) => break 'result Err(err.into()),
-                            Poll::Pending if finish => {
-                                return Poll::Ready(Ok(StreamResult::Cancelled));
-                            }
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-                    Err(err) => {
-                        break 'result Err(match err.kind() {
-                            // ECONNABORTED is the closest thing to EPIPE on Windows.
-                            std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::ConnectionAborted => ErrorCode::ConnectionBroken,
-                            _ => err.into(),
-                        });
-                    }
-                }
-            }
+        let Some((stream, _)) = self.0.as_mut() else {
+            return Poll::Ready(Ok(StreamResult::Dropped));
         };
-        self.close(res);
-        Poll::Ready(Ok(StreamResult::Dropped))
+
+        let mut src = src.as_direct(store);
+
+        // A 0-length write is a readiness check.
+        if src.remaining()?.is_empty() {
+            return match stream.poll_ready(cx) {
+                Poll::Ready(()) => Poll::Ready(Ok(StreamResult::Completed)),
+                Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+                Poll::Pending => Poll::Pending,
+            };
+        }
+
+        match stream.poll_write(cx, src.remaining()?) {
+            Poll::Ready(Ok(n)) => {
+                debug_assert!(n > 0);
+                src.mark_read(n);
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+            Poll::Ready(Err(err)) => {
+                self.close(Err(err.into()));
+                Poll::Ready(Ok(StreamResult::Dropped))
+            }
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
-impl HostTcpSocketWithStore for WasiSockets {
-    async fn connect<T>(
+fn send(
+    mut store: impl AsContextMut,
+    stream: Result<TcpSendStream, crate::sockets::ErrorCode>,
+    mut data: StreamReader<u8>,
+) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
+    let mut store = store.as_context_mut();
+    match stream {
+        Ok(stream) => {
+            let (result_tx, result_rx) = oneshot::channel();
+            data.pipe(&mut store, SendStreamConsumer(Some((stream, result_tx))))?;
+            FutureReader::new(&mut store, result_rx)
+        }
+        Err(err) => {
+            data.close(&mut store)?;
+            FutureReader::new(
+                &mut store,
+                async move { wasmtime::error::Ok(Err(err.into())) },
+            )
+        }
+    }
+}
+
+fn receive(
+    mut store: impl AsContextMut,
+    stream: Result<TcpReceiveStream, crate::sockets::ErrorCode>,
+) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
+    let mut store = store.as_context_mut();
+    match stream {
+        Ok(stream) => {
+            let (result_tx, result_rx) = oneshot::channel();
+            Ok((
+                StreamReader::new(&mut store, ReceiveStreamProducer(Some((stream, result_tx))))?,
+                FutureReader::new(&mut store, result_rx)?,
+            ))
+        }
+        Err(err) => Ok((
+            StreamReader::new(&mut store, iter::empty())?,
+            FutureReader::new(
+                &mut store,
+                async move { wasmtime::error::Ok(Err(err.into())) },
+            )?,
+        )),
+    }
+}
+
+async fn listen<S>(
+    mut store: S,
+    socket: &Resource<TcpSocket>,
+    mut getter: impl FnMut(&mut S::Data) -> WasiSocketsCtxView<'_> + Send + Unpin + 'static,
+) -> SocketResult<StreamReader<Resource<TcpSocket>>>
+where
+    S: AsContextMut,
+{
+    let mut store = store.as_context_mut();
+    let socket = get_socket_mut(getter(store.data_mut()).table, socket)?;
+    let listener = socket.listen().await?;
+    let ret = StreamReader::new(&mut store, ListenStreamProducer { listener, getter })
+        .map_err(SocketError::trap)?;
+    Ok(ret)
+}
+
+impl WasiSocketsCtxView<'_> {
+    fn start_connect(
+        &mut self,
+        socket: &Resource<TcpSocket>,
+        remote_address: IpSocketAddress,
+    ) -> SocketResult<()> {
+        let remote_address = SocketAddr::from(remote_address);
+        let socket = get_socket_mut(self.table, &socket)?;
+        let socket = socket.start_connect(remote_address)?;
+        Ok(socket)
+    }
+
+    fn poll_finish_connect(
+        &mut self,
+        cx: &mut Context<'_>,
+        socket: &Resource<TcpSocket>,
+    ) -> Poll<SocketResult<()>> {
+        get_socket_mut(self.table, &socket)?
+            .poll_finish_connect(cx)
+            .map_err(SocketError::from)
+    }
+}
+
+impl<T: Send> HostTcpSocketWithStore<T> for WasiSockets {
+    async fn connect(
         store: &Accessor<T, Self>,
         socket: Resource<TcpSocket>,
         remote_address: IpSocketAddress,
     ) -> SocketResult<()> {
-        let remote_address = SocketAddr::from(remote_address);
-        if !is_addr_allowed(store, remote_address, SocketAddrUse::TcpConnect).await {
-            return Err(ErrorCode::AccessDenied.into());
-        }
-        let sock = store.with(|mut store| {
-            let socket = get_socket_mut(store.get().table, &socket)?;
-            let socket = socket.start_connect(&remote_address)?;
-            SocketResult::Ok(socket)
-        })?;
-
-        // FIXME: handle possible cancellation of the outer `connect`
-        // https://github.com/bytecodealliance/wasmtime/pull/11291#discussion_r2223917986
-        let res = sock.connect(remote_address).await;
-        store.with(|mut store| {
-            let socket = get_socket_mut(store.get().table, &socket)?;
-            socket.finish_connect(res)?;
-            Ok(())
-        })
+        store.with(|mut s| s.get().start_connect(&socket, remote_address))?;
+        std::future::poll_fn(|cx| store.with(|mut s| s.get().poll_finish_connect(cx, &socket)))
+            .await
     }
 
-    fn listen<T: 'static>(
-        mut store: Access<'_, T, Self>,
-        socket: Resource<TcpSocket>,
+    async fn listen(
+        store: Access<'_, T, Self>,
+        socket_resource: Resource<TcpSocket>,
     ) -> SocketResult<StreamReader<Resource<TcpSocket>>> {
         let getter = store.getter();
-        let socket = get_socket_mut(store.get().table, &socket)?;
-        socket.listen_p3()?;
-        let listener = socket.tcp_listener_arc().unwrap().clone();
-        let family = socket.address_family();
-        let options = socket.non_inherited_options().clone();
-        let ret = StreamReader::new(
-            &mut store,
-            ListenStreamProducer {
-                listener,
-                family,
-                options,
-                getter,
-            },
-        )
-        .map_err(SocketError::trap)?;
-        Ok(ret)
+        listen(store, &socket_resource, getter).await
     }
 
-    fn send<T: 'static>(
+    fn send(
         mut store: Access<'_, T, Self>,
         socket: Resource<TcpSocket>,
-        mut data: StreamReader<u8>,
+        data: StreamReader<u8>,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
         let socket = get_socket_mut(store.get().table, &socket)?;
-        match socket.take_send_stream() {
-            Ok(stream) => {
-                let (result_tx, result_rx) = oneshot::channel();
-                data.pipe(
-                    &mut store,
-                    SendStreamConsumer {
-                        stream,
-                        result: Some(result_tx),
-                    },
-                )?;
-                FutureReader::new(&mut store, result_rx)
-            }
-            Err(err) => {
-                data.close(&mut store)?;
-                FutureReader::new(&mut store, async { wasmtime::error::Ok(Err(err.into())) })
-            }
-        }
+        let stream = socket.take_send_stream();
+        send(&mut store, stream, data)
     }
 
-    fn receive<T: 'static>(
+    fn receive(
         mut store: Access<T, Self>,
         socket: Resource<TcpSocket>,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
         let socket = get_socket_mut(store.get().table, &socket)?;
-        match socket.take_receive_stream() {
-            Ok(stream) => {
-                let (result_tx, result_rx) = oneshot::channel();
-                Ok((
-                    StreamReader::new(
-                        &mut store,
-                        ReceiveStreamProducer {
-                            stream,
-                            result: Some(result_tx),
-                        },
-                    )?,
-                    FutureReader::new(&mut store, result_rx)?,
-                ))
-            }
-            Err(err) => Ok((
-                StreamReader::new(&mut store, iter::empty())?,
-                FutureReader::new(&mut store, async { wasmtime::error::Ok(Err(err.into())) })?,
-            )),
-        }
+        let stream = socket.take_receive_stream();
+        receive(&mut store, stream)
     }
 }
 
@@ -350,12 +331,8 @@ impl HostTcpSocket for WasiSocketsCtxView<'_> {
         local_address: IpSocketAddress,
     ) -> SocketResult<()> {
         let local_address = SocketAddr::from(local_address);
-        if !(self.ctx.socket_addr_check)(local_address, SocketAddrUse::TcpBind).await {
-            return Err(ErrorCode::AccessDenied.into());
-        }
         let socket = get_socket_mut(self.table, &socket)?;
-        socket.start_bind(local_address)?;
-        socket.finish_bind()?;
+        socket.bind(local_address).await?;
         Ok(())
     }
 
@@ -371,12 +348,12 @@ impl HostTcpSocket for WasiSocketsCtxView<'_> {
     }
 
     fn get_local_address(&mut self, socket: Resource<TcpSocket>) -> SocketResult<IpSocketAddress> {
-        let sock = get_socket(self.table, &socket)?;
+        let sock = get_socket_mut(self.table, &socket)?;
         Ok(sock.local_address()?.into())
     }
 
     fn get_remote_address(&mut self, socket: Resource<TcpSocket>) -> SocketResult<IpSocketAddress> {
-        let sock = get_socket(self.table, &socket)?;
+        let sock = get_socket_mut(self.table, &socket)?;
         Ok(sock.remote_address()?.into())
     }
 
@@ -509,5 +486,252 @@ impl HostTcpSocket for WasiSocketsCtxView<'_> {
             .delete(sock)
             .context("failed to delete socket resource from table")?;
         Ok(())
+    }
+}
+
+mod named {
+    use crate::p3::bindings::named_imports::wasi::sockets::types::{
+        HostTcpSocket, HostTcpSocketWithStore,
+    };
+    use crate::p3::bindings::sockets::types::{
+        Duration, ErrorCode, IpAddressFamily, IpSocketAddress, TcpSocket,
+    };
+    use crate::p3::sockets::SocketResult;
+    use crate::sockets::{WasiSocketsNamed, WasiSocketsNamedView};
+    use crate::{NamedId, WasiCtxNamedView};
+    use wasmtime::component::{Access, Accessor, FutureReader, Resource, StreamReader};
+
+    impl<T, U> HostTcpSocketWithStore<U> for WasiSocketsNamed<T>
+    where
+        T: WasiSocketsNamedView,
+        U: Send,
+    {
+        async fn connect(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            remote_address: IpSocketAddress,
+        ) -> SocketResult<()> {
+            store.with(|mut s| s.get().0.sockets(id).start_connect(&socket, remote_address))?;
+            std::future::poll_fn(|cx| {
+                store.with(|mut s| s.get().0.sockets(id).poll_finish_connect(cx, &socket))
+            })
+            .await
+        }
+
+        async fn listen(
+            store: Access<'_, U, Self>,
+            id: NamedId,
+            socket_resource: Resource<TcpSocket>,
+        ) -> SocketResult<StreamReader<Resource<TcpSocket>>> {
+            let getter = store.getter();
+            super::listen(store, &socket_resource, move |data| {
+                getter(data).0.sockets(id)
+            })
+            .await
+        }
+
+        fn send(
+            mut store: Access<'_, U, Self>,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            data: StreamReader<u8>,
+        ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
+            let socket = super::get_socket_mut(store.get().0.sockets(id).table, &socket)?;
+            let stream = socket.take_send_stream();
+            super::send(&mut store, stream, data)
+        }
+
+        fn receive(
+            mut store: Access<U, Self>,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
+            let socket = super::get_socket_mut(store.get().0.sockets(id).table, &socket)?;
+            let stream = socket.take_receive_stream();
+            super::receive(&mut store, stream)
+        }
+    }
+
+    impl<T> HostTcpSocket for WasiCtxNamedView<'_, T>
+    where
+        T: WasiSocketsNamedView,
+    {
+        async fn bind(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            local_address: IpSocketAddress,
+        ) -> SocketResult<()> {
+            super::HostTcpSocket::bind(&mut self.0.sockets(id), socket, local_address).await
+        }
+
+        fn create(
+            &mut self,
+            id: NamedId,
+            address_family: IpAddressFamily,
+        ) -> SocketResult<Resource<TcpSocket>> {
+            super::HostTcpSocket::create(&mut self.0.sockets(id), address_family)
+        }
+
+        fn get_local_address(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> SocketResult<IpSocketAddress> {
+            super::HostTcpSocket::get_local_address(&mut self.0.sockets(id), socket)
+        }
+
+        fn get_remote_address(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> SocketResult<IpSocketAddress> {
+            super::HostTcpSocket::get_remote_address(&mut self.0.sockets(id), socket)
+        }
+
+        fn get_is_listening(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> wasmtime::Result<bool> {
+            super::HostTcpSocket::get_is_listening(&mut self.0.sockets(id), socket)
+        }
+
+        fn get_address_family(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> wasmtime::Result<IpAddressFamily> {
+            super::HostTcpSocket::get_address_family(&mut self.0.sockets(id), socket)
+        }
+
+        fn set_listen_backlog_size(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            value: u64,
+        ) -> SocketResult<()> {
+            super::HostTcpSocket::set_listen_backlog_size(&mut self.0.sockets(id), socket, value)
+        }
+
+        fn get_keep_alive_enabled(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> SocketResult<bool> {
+            super::HostTcpSocket::get_keep_alive_enabled(&mut self.0.sockets(id), socket)
+        }
+
+        fn set_keep_alive_enabled(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            value: bool,
+        ) -> SocketResult<()> {
+            super::HostTcpSocket::set_keep_alive_enabled(&mut self.0.sockets(id), socket, value)
+        }
+
+        fn get_keep_alive_idle_time(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> SocketResult<Duration> {
+            super::HostTcpSocket::get_keep_alive_idle_time(&mut self.0.sockets(id), socket)
+        }
+
+        fn set_keep_alive_idle_time(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            value: Duration,
+        ) -> SocketResult<()> {
+            super::HostTcpSocket::set_keep_alive_idle_time(&mut self.0.sockets(id), socket, value)
+        }
+
+        fn get_keep_alive_interval(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> SocketResult<Duration> {
+            super::HostTcpSocket::get_keep_alive_interval(&mut self.0.sockets(id), socket)
+        }
+
+        fn set_keep_alive_interval(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            value: Duration,
+        ) -> SocketResult<()> {
+            super::HostTcpSocket::set_keep_alive_interval(&mut self.0.sockets(id), socket, value)
+        }
+
+        fn get_keep_alive_count(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> SocketResult<u32> {
+            super::HostTcpSocket::get_keep_alive_count(&mut self.0.sockets(id), socket)
+        }
+
+        fn set_keep_alive_count(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            value: u32,
+        ) -> SocketResult<()> {
+            super::HostTcpSocket::set_keep_alive_count(&mut self.0.sockets(id), socket, value)
+        }
+
+        fn get_hop_limit(&mut self, id: NamedId, socket: Resource<TcpSocket>) -> SocketResult<u8> {
+            super::HostTcpSocket::get_hop_limit(&mut self.0.sockets(id), socket)
+        }
+
+        fn set_hop_limit(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            value: u8,
+        ) -> SocketResult<()> {
+            super::HostTcpSocket::set_hop_limit(&mut self.0.sockets(id), socket, value)
+        }
+
+        fn get_receive_buffer_size(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> SocketResult<u64> {
+            super::HostTcpSocket::get_receive_buffer_size(&mut self.0.sockets(id), socket)
+        }
+
+        fn set_receive_buffer_size(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            value: u64,
+        ) -> SocketResult<()> {
+            super::HostTcpSocket::set_receive_buffer_size(&mut self.0.sockets(id), socket, value)
+        }
+
+        fn get_send_buffer_size(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+        ) -> SocketResult<u64> {
+            super::HostTcpSocket::get_send_buffer_size(&mut self.0.sockets(id), socket)
+        }
+
+        fn set_send_buffer_size(
+            &mut self,
+            id: NamedId,
+            socket: Resource<TcpSocket>,
+            value: u64,
+        ) -> SocketResult<()> {
+            super::HostTcpSocket::set_send_buffer_size(&mut self.0.sockets(id), socket, value)
+        }
+
+        fn drop(&mut self, id: NamedId, sock: Resource<TcpSocket>) -> wasmtime::Result<()> {
+            super::HostTcpSocket::drop(&mut self.0.sockets(id), sock)
+        }
     }
 }

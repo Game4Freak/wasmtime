@@ -11,9 +11,7 @@ use super::{MergeableLoadSize, is_int_or_ref_ty, is_mergeable_load, lower_to_amo
 use crate::ir::condcodes::{FloatCC, IntCC};
 use crate::ir::immediates::*;
 use crate::ir::types::*;
-use crate::ir::{
-    BlockCall, Inst, InstructionData, LibCall, MemFlags, Opcode, TrapCode, Value, ValueList,
-};
+use crate::ir::{BlockCall, Inst, InstructionData, LibCall, Opcode, TrapCode, Value, ValueList};
 use crate::isa::x64::X64Backend;
 use crate::isa::x64::inst::{ReturnCallInfo, args::*, regs};
 use crate::isa::x64::lower::{InsnInput, emit_vm_call};
@@ -495,6 +493,11 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
+    fn use_apx(&mut self) -> bool {
+        self.backend.x64_flags.has_apx()
+    }
+
+    #[inline]
     fn has_lzcnt(&mut self) -> bool {
         self.backend.x64_flags.has_lzcnt()
     }
@@ -517,6 +520,14 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     #[inline]
     fn use_fma(&mut self) -> bool {
         self.backend.x64_flags.has_avx() && self.backend.x64_flags.has_fma()
+    }
+
+    fn use_avx_vnni(&mut self) -> bool {
+        self.backend.x64_flags.has_avx() && self.backend.x64_flags.has_avx_vnni()
+    }
+
+    fn use_avx512vnni(&mut self) -> bool {
+        self.backend.x64_flags.has_avx512vl() && self.backend.x64_flags.has_avx512vnni()
     }
 
     #[inline]
@@ -1498,6 +1509,24 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
+    fn shuffle_lhs_only(&mut self, mask: &VecMask) -> Option<VecMask> {
+        if mask.iter().all(|&b| b < 16) {
+            Some(mask.clone())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn shuffle_rhs_only(&mut self, mask: &VecMask) -> Option<VecMask> {
+        if mask.iter().all(|&b| (16..32).contains(&b)) {
+            Some(mask.clone())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     fn perm_from_mask_with_zeros(
         &mut self,
         mask: &VecMask,
@@ -1666,7 +1695,7 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     fn palignr_imm_from_immediate(&mut self, imm: Immediate) -> Option<u8> {
         let bytes = self.lower_ctx.get_immediate_data(imm).as_slice();
 
-        if bytes.windows(2).all(|a| a[0] + 1 == a[1]) {
+        if bytes.array_windows().all(|[a, b]| *a + 1 == *b) {
             Some(bytes[0])
         } else {
             None

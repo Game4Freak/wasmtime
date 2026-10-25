@@ -18,20 +18,21 @@
 //! their imports and then generating a core wasm module to implement all of
 //! that.
 
-use crate::component::dfg::CoreDef;
+use crate::component::dfg::{AdapterId, ComponentDfg, CoreDef};
 use crate::component::{
-    Adapter, AdapterOptions as AdapterOptionsDfg, CanonicalAbiInfo, ComponentTypesBuilder,
-    FlatType, InterfaceType, RuntimeComponentInstanceIndex, StringEncoding, Transcode,
-    TypeFuncIndex,
+    AdapterOptions as AdapterOptionsDfg, CanonicalAbiInfo, ComponentTypesBuilder, FlatType,
+    InterfaceType, RuntimeComponentInstanceIndex, StringEncoding, Transcode, TypeFuncIndex,
+    TypeResourceTableIndex, UnsafeIntrinsic,
 };
 use crate::fact::transcode::Transcoder;
 use crate::prelude::*;
 use crate::{
     EntityRef, FuncIndex, GlobalIndex, IndexType, Memory, MemoryIndex, ModuleInternedTypeIndex,
-    PrimaryMap, Tunables,
+    PrimaryMap, Trap, Tunables, WasmValType,
 };
 use std::collections::HashMap;
 use wasm_encoder::*;
+use wasmparser::WasmFeatures;
 
 mod core_types;
 mod signature;
@@ -61,6 +62,12 @@ pub struct Module<'a> {
     /// Type information from the creator of this `Module`
     types: &'a ComponentTypesBuilder,
 
+    /// The component being adapted.
+    component: &'a ComponentDfg,
+
+    /// The Wasm features enabled for validation of this module.
+    features: WasmFeatures,
+
     /// Core wasm type section that's incrementally built
     core_types: core_types::CoreTypes,
 
@@ -80,9 +87,10 @@ pub struct Module<'a> {
     /// Cached versions of imported trampolines for working with resources.
     imported_resource_transfer_own: Option<FuncIndex>,
     imported_resource_transfer_borrow: Option<FuncIndex>,
+    imported_resource_transfer_borrow_to_owner: Option<FuncIndex>,
 
     // Cached versions of imported trampolines for working with the async ABI.
-    imported_async_start_calls: HashMap<(Option<FuncIndex>, Option<FuncIndex>), FuncIndex>,
+    imported_start_calls: HashMap<(Option<FuncIndex>, Option<FuncIndex>, Vec<ValType>), FuncIndex>,
 
     // Cached versions of imported trampolines for working with `stream`s,
     // `future`s, and `error-context`s.
@@ -93,7 +101,11 @@ pub struct Module<'a> {
     imported_enter_sync_call: Option<FuncIndex>,
     imported_exit_sync_call: Option<FuncIndex>,
 
-    imported_trap: Option<FuncIndex>,
+    /// Cached versions of unsafe intrinsics and where they were imported.
+    imported_unsafe_intrinsics: HashMap<UnsafeIntrinsic, FuncIndex>,
+
+    /// Cached versions of the imported `trap` intrinsic, one per trap code.
+    imported_traps: HashMap<Trap, FuncIndex>,
 
     // Current status of index spaces from the imports generated so far.
     imported_funcs: PrimaryMap<FuncIndex, Option<CoreDef>>,
@@ -105,8 +117,6 @@ pub struct Module<'a> {
     helper_worklist: Vec<(FunctionId, Helper)>,
 
     exports: Vec<(u32, String)>,
-
-    task_may_block: Option<GlobalIndex>,
 }
 
 struct AdapterData {
@@ -119,6 +129,12 @@ struct AdapterData {
     /// The core wasm function that this adapter will be calling (the original
     /// function that was `canon lift`'d)
     callee: FuncIndex,
+    /// Whether nothing this adapter can reach is able to observe or mutate the
+    /// thread state that `enter-sync-call`/`exit-sync-call` maintain, meaning
+    /// that pair can be omitted entirely.
+    ///
+    /// See `crates/environ/src/component/thread_transparency.rs` for details.
+    thread_transparent: bool,
 }
 
 /// Configuration options which apply at the "global adapter" level.
@@ -129,9 +145,6 @@ struct AdapterOptions {
     /// The Wasmtime-assigned component instance index where the options were
     /// originally specified.
     instance: RuntimeComponentInstanceIndex,
-    /// The ancestors (i.e. chain of instantiating instances) of the instance
-    /// specified in the `instance` field.
-    ancestors: Vec<RuntimeComponentInstanceIndex>,
     /// The ascribed type of this adapter.
     ty: TypeFuncIndex,
     /// The global that represents the instance flags for where this adapter
@@ -259,10 +272,17 @@ enum HelperLocation {
 
 impl<'a> Module<'a> {
     /// Creates an empty module.
-    pub fn new(types: &'a ComponentTypesBuilder, tunables: &'a Tunables) -> Module<'a> {
+    pub fn new(
+        types: &'a ComponentTypesBuilder,
+        component: &'a ComponentDfg,
+        tunables: &'a Tunables,
+        features: WasmFeatures,
+    ) -> Module<'a> {
         Module {
             tunables,
             types,
+            component,
+            features,
             core_types: Default::default(),
             core_imports: Default::default(),
             imported: Default::default(),
@@ -276,23 +296,28 @@ impl<'a> Module<'a> {
             helper_worklist: Vec::new(),
             imported_resource_transfer_own: None,
             imported_resource_transfer_borrow: None,
-            imported_async_start_calls: HashMap::new(),
+            imported_resource_transfer_borrow_to_owner: None,
+            imported_start_calls: HashMap::new(),
             imported_future_transfer: None,
             imported_stream_transfer: None,
             imported_error_context_transfer: None,
             imported_enter_sync_call: None,
             imported_exit_sync_call: None,
-            imported_trap: None,
+            imported_unsafe_intrinsics: HashMap::new(),
+            imported_traps: HashMap::new(),
             exports: Vec::new(),
-            task_may_block: None,
         }
     }
 
     /// Registers a new adapter within this adapter module.
     ///
     /// The `name` provided is the export name of the adapter from the final
-    /// module, and `adapter` contains all metadata necessary for compilation.
-    pub fn adapt(&mut self, name: &str, adapter: &Adapter) {
+    /// module, and `adapter` indexes into this module's component for all the
+    /// metadata necessary for compilation.
+    pub fn adapt(&mut self, name: &str, adapter: AdapterId) {
+        let thread_transparent = self.component.transparent_adapters.contains(adapter);
+        let adapter = &self.component.adapters[adapter];
+
         // Import any items required by the various canonical options
         // (memories, reallocs, etc)
         let mut lift = self.import_options(adapter.lift_ty, &adapter.lift_options);
@@ -327,6 +352,7 @@ impl<'a> Module<'a> {
                 lift,
                 lower,
                 callee,
+                thread_transparent,
             },
         );
 
@@ -338,16 +364,13 @@ impl<'a> Module<'a> {
     fn import_options(&mut self, ty: TypeFuncIndex, options: &AdapterOptionsDfg) -> AdapterOptions {
         let AdapterOptionsDfg {
             instance,
-            ancestors,
             string_encoding,
             post_return: _, // handled above
             callback,
             async_,
             core_type,
             data_model,
-            cancellable,
         } = options;
-        assert!(!cancellable);
 
         let flags = self.import_global(
             "flags",
@@ -415,7 +438,6 @@ impl<'a> Module<'a> {
 
         AdapterOptions {
             instance: *instance,
-            ancestors: ancestors.clone(),
             ty,
             flags,
             post_return: None,
@@ -475,25 +497,6 @@ impl<'a> Module<'a> {
         self.imported.insert(def.clone(), idx.index());
         self.imports.push(Import::CoreDef(def));
         idx
-    }
-
-    fn import_task_may_block(&mut self) -> GlobalIndex {
-        if let Some(task_may_block) = self.task_may_block {
-            task_may_block
-        } else {
-            let task_may_block = self.import_global(
-                "instance",
-                "task_may_block",
-                GlobalType {
-                    val_type: ValType::I32,
-                    mutable: true,
-                    shared: false,
-                },
-                CoreDef::TaskMayBlock,
-            );
-            self.task_may_block = Some(task_may_block);
-            task_may_block
-        }
     }
 
     fn import_transcoder(&mut self, transcoder: transcode::Transcoder) -> FuncIndex {
@@ -598,59 +601,31 @@ impl<'a> Module<'a> {
         self.imported_funcs.push(None)
     }
 
-    /// Import a host built-in function to start a subtask for a sync-lowered
-    /// import call to an async-lifted export.
+    /// Import a host built-in function to start a subtask previously set up
+    /// with `prepare-call`.
     ///
-    /// This call with block until the subtask has produced result(s) via the
-    /// `task.return` intrinsic.
+    /// For async-lowered imports `results` will be `[i32]`, and for
+    /// sync-lowered imports it'll be the function's normal return type.
     ///
-    /// Note that this could potentially be combined with the `sync-prepare`
-    /// built-in into a single built-in function that does both jobs.  However,
+    /// Note that this could potentially be combined with the `prepare-call`
+    /// built-in into a single built-in function that does both jobs. However,
     /// we've kept them separate to allow a future optimization where the caller
-    /// calls the callee directly rather than using `sync-start` to have the host
-    /// do it.
-    fn import_sync_start_call(
-        &mut self,
-        suffix: &str,
-        callback: Option<FuncIndex>,
-        results: &[ValType],
-    ) -> FuncIndex {
-        let ty = self
-            .core_types
-            .function(&[ValType::FUNCREF, ValType::I32], results);
-        self.core_imports.import(
-            "sync",
-            &format!("[start-call]{suffix}"),
-            EntityType::Function(ty),
-        );
-        let import = Import::SyncStartCall {
-            callback: callback
-                .map(|callback| self.imported_funcs.get(callback).unwrap().clone().unwrap()),
-        };
-        self.imports.push(import);
-        self.imported_funcs.push(None)
-    }
-
-    /// Import a host built-in function to start a subtask for an async-lowered
-    /// import call to an async- or sync-lifted export.
-    ///
-    /// Note that this could potentially be combined with the `async-prepare`
-    /// built-in into a single built-in function that does both jobs.  However,
-    /// we've kept them separate to allow a future optimization where the caller
-    /// calls the callee directly rather than using `async-start` to have the
+    /// calls the callee directly rather than using `start-call` to have the
     /// host do it.
-    fn import_async_start_call(
+    fn import_start_call(
         &mut self,
         suffix: &str,
         callback: Option<FuncIndex>,
         post_return: Option<FuncIndex>,
+        results: &[ValType],
     ) -> FuncIndex {
+        let key = (callback, post_return, results.to_vec());
         self.import_simple_get_and_set(
             "async",
             &format!("[start-call]{suffix}"),
             &[ValType::FUNCREF, ValType::I32, ValType::I32, ValType::I32],
-            &[ValType::I32],
-            Import::AsyncStartCall {
+            results,
+            Import::StartCall {
                 callback: callback
                     .map(|callback| self.imported_funcs.get(callback).unwrap().clone().unwrap()),
                 post_return: post_return.map(|post_return| {
@@ -661,18 +636,8 @@ impl<'a> Module<'a> {
                         .unwrap()
                 }),
             },
-            |me| {
-                me.imported_async_start_calls
-                    .get(&(callback, post_return))
-                    .copied()
-            },
-            |me, v| {
-                assert!(
-                    me.imported_async_start_calls
-                        .insert((callback, post_return), v)
-                        .is_none()
-                )
-            },
+            |me| me.imported_start_calls.get(&key).copied(),
+            |me, v| assert!(me.imported_start_calls.insert(key.clone(), v).is_none()),
         )
     }
 
@@ -731,11 +696,29 @@ impl<'a> Module<'a> {
         )
     }
 
+    /// Returns whether a borrow lowered into the resource table `ty` has its
+    /// resource owned by `ty`'s own instance.
+    fn resource_owned_by_own_instance(&self, ty: TypeResourceTableIndex) -> bool {
+        self.types
+            .resource_owned_by_own_instance(ty, |idx| self.component.defined_resource_instance(idx))
+    }
+
+    fn import_resource_transfer_borrow_to_owner(&mut self) -> FuncIndex {
+        self.import_simple(
+            "resource",
+            "transfer-borrow-to-owner",
+            &[ValType::I32, ValType::I32],
+            &[ValType::I32],
+            Import::ResourceTransferBorrowToOwner,
+            |me| &mut me.imported_resource_transfer_borrow_to_owner,
+        )
+    }
+
     fn import_enter_sync_call(&mut self) -> FuncIndex {
         self.import_simple(
             "async",
             "enter-sync-call",
-            &[ValType::I32; 3],
+            &[ValType::I32; 2],
             &[],
             Import::EnterSyncCall,
             |me| &mut me.imported_enter_sync_call,
@@ -753,14 +736,63 @@ impl<'a> Module<'a> {
         )
     }
 
-    fn import_trap(&mut self) -> FuncIndex {
-        self.import_simple(
+    /// Imports the `context.get` intrinsic for the `slot`th context slot.
+    fn import_context_get(&mut self, slot: usize) -> FuncIndex {
+        let intrinsic = match slot {
+            0 => UnsafeIntrinsic::ContextGetI32_0,
+            1 => UnsafeIntrinsic::ContextGetI32_1,
+            _ => unreachable!(),
+        };
+        self.import_unsafe_intrinsic(intrinsic, &format!("get{slot}"))
+    }
+
+    /// Imports the `context.set` intrinsic for the `slot`th context slot.
+    fn import_context_set(&mut self, slot: usize) -> FuncIndex {
+        let intrinsic = match slot {
+            0 => UnsafeIntrinsic::ContextSetI32_0,
+            1 => UnsafeIntrinsic::ContextSetI32_1,
+            _ => unreachable!(),
+        };
+        self.import_unsafe_intrinsic(intrinsic, &format!("set{slot}"))
+    }
+
+    fn import_unsafe_intrinsic(&mut self, intrinsic: UnsafeIntrinsic, name: &str) -> FuncIndex {
+        let map = |ty: &WasmValType| match ty {
+            crate::WasmValType::I32 => ValType::I32,
+            crate::WasmValType::I64 => ValType::I64,
+            crate::WasmValType::F32 => ValType::F32,
+            crate::WasmValType::F64 => ValType::F64,
+            crate::WasmValType::V128 => ValType::V128,
+            crate::WasmValType::Ref(_) => unreachable!(),
+        };
+        let params = intrinsic.core_params().iter().map(map).collect::<Vec<_>>();
+        let results = intrinsic.core_results().iter().map(map).collect::<Vec<_>>();
+
+        self.import_simple_get_and_set(
+            "context",
+            name,
+            &params,
+            &results,
+            Import::UnsafeIntrinsic(intrinsic),
+            |me| me.imported_unsafe_intrinsics.get(&intrinsic).copied(),
+            |me, idx| {
+                me.imported_unsafe_intrinsics.insert(intrinsic, idx);
+            },
+        )
+    }
+
+    fn import_trap(&mut self, trap: Trap) -> FuncIndex {
+        let name = format!("trap{}", trap as u8);
+        self.import_simple_get_and_set(
             "runtime",
-            "trap",
-            &[ValType::I32],
+            &name,
             &[],
-            Import::Trap,
-            |me| &mut me.imported_trap,
+            &[],
+            Import::Trap(trap),
+            |me| me.imported_traps.get(&trap).copied(),
+            |me, idx| {
+                me.imported_traps.insert(trap, idx);
+            },
         )
     }
 
@@ -870,6 +902,9 @@ pub enum Import {
     ResourceTransferOwn,
     /// Transfers a borrowed resource from one table to another.
     ResourceTransferBorrow,
+    /// Lifts a borrowed resource for a destination which owns the resource and
+    /// therefore receives its representation rather than a handle.
+    ResourceTransferBorrowToOwner,
     /// An intrinsic used by FACT-generated modules to begin a call involving
     /// an async-lowered import and/or an async-lifted export.
     PrepareCall {
@@ -878,15 +913,9 @@ pub enum Import {
         /// specified in the lifted export.
         memory: Option<CoreDef>,
     },
-    /// An intrinsic used by FACT-generated modules to complete a call involving
-    /// a sync-lowered import and async-lifted export.
-    SyncStartCall {
-        /// The callee's callback function, if any.
-        callback: Option<CoreDef>,
-    },
-    /// An intrinsic used by FACT-generated modules to complete a call involving
-    /// an async-lowered import function.
-    AsyncStartCall {
+    /// An intrinsic used by FACT-generated modules to start a call previously
+    /// set up with `PrepareCall`.
+    StartCall {
         /// The callee's callback function, if any.
         callback: Option<CoreDef>,
 
@@ -903,7 +932,7 @@ pub enum Import {
     /// ownership of an `error-context`.
     ErrorContextTransfer,
     /// An intrinsic for trapping the instance with a specific trap code.
-    Trap,
+    Trap(Trap),
     /// An intrinsic used by FACT-generated modules to check whether an instance
     /// may be entered for a sync-to-sync call and push a task onto the stack if
     /// so.
@@ -911,6 +940,8 @@ pub enum Import {
     /// An intrinsic used by FACT-generated modules to pop the task previously
     /// pushed by `EnterSyncCall`.
     ExitSyncCall,
+    /// An unsafe intrinsic, such as reading/writing `context.{get,set}` slots.
+    UnsafeIntrinsic(UnsafeIntrinsic),
 }
 
 impl Options {

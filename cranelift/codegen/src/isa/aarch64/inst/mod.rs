@@ -2,7 +2,7 @@
 
 use crate::binemit::{Addend, CodeOffset, Reloc};
 use crate::ir::types::{F16, F32, F64, F128, I8, I8X16, I16, I32, I64, I128};
-use crate::ir::{MemFlags, Type, types};
+use crate::ir::{MemFlagsData, Type, types};
 use crate::isa::{CallConv, FunctionAlignment};
 use crate::machinst::*;
 use crate::{CodegenError, CodegenResult, settings};
@@ -16,7 +16,7 @@ use core::slice;
 use smallvec::{SmallVec, smallvec};
 
 pub(crate) mod regs;
-pub(crate) use self::regs::*;
+pub use self::regs::*;
 pub mod imms;
 pub use self::imms::*;
 pub mod args;
@@ -34,10 +34,10 @@ mod emit_tests;
 // Instructions (top level): definition
 
 pub use crate::isa::aarch64::lower::isle::generated_code::{
-    ALUOp, ALUOp3, AMode, APIKey, AtomicRMWLoopOp, AtomicRMWOp, BitOp, BranchTargetType, FPUOp1,
-    FPUOp2, FPUOp3, FpuRoundMode, FpuToIntOp, IntToFpuOp, MInst as Inst, MoveWideOp, VecALUModOp,
-    VecALUOp, VecExtendOp, VecLanesOp, VecMisc2, VecPairOp, VecRRLongOp, VecRRNarrowOp,
-    VecRRPairLongOp, VecRRRLongModOp, VecRRRLongOp, VecShiftImmModOp, VecShiftImmOp,
+    ALUOp, ALUOp3, AMode, APIKey, AtomicRMWLoopOp, AtomicRMWOp, BfmOp, BitOp, BranchTargetType,
+    FPUOp1, FPUOp2, FPUOp3, FpuRoundMode, FpuToIntOp, IntToFpuOp, MInst as Inst, MoveWideOp,
+    VecALUModOp, VecALUOp, VecExtendOp, VecLanesOp, VecMisc2, VecPairOp, VecRRLongOp,
+    VecRRNarrowOp, VecRRPairLongOp, VecRRRLongModOp, VecRRRLongOp, VecShiftImmModOp, VecShiftImmOp,
 };
 
 /// A floating-point unit (FPU) operation with two args, a register and an immediate.
@@ -58,6 +58,16 @@ pub enum FPUOpRIMod {
     Sli32(FPULeftShiftImm),
     /// Shift left and insert. Rd |= Rn << #imm
     Sli64(FPULeftShiftImm),
+}
+
+impl BfmOp {
+    /// Get the assembly mnemonic for this opcode.
+    pub fn op_str(&self) -> &'static str {
+        match self {
+            BfmOp::UBfm => "ubfm",
+            BfmOp::SBfm => "sbfm",
+        }
+    }
 }
 
 impl BitOp {
@@ -206,7 +216,7 @@ impl Inst {
     }
 
     /// Generic constructor for a load (zero-extending where appropriate).
-    pub fn gen_load(into_reg: Writable<Reg>, mem: AMode, ty: Type, flags: MemFlags) -> Inst {
+    pub fn gen_load(into_reg: Writable<Reg>, mem: AMode, ty: Type, flags: MemFlagsData) -> Inst {
         match ty {
             I8 => Inst::ULoad8 {
                 rd: into_reg,
@@ -248,7 +258,7 @@ impl Inst {
     }
 
     /// Generic constructor for a store.
-    pub fn gen_store(mem: AMode, from_reg: Reg, ty: Type, flags: MemFlags) -> Inst {
+    pub fn gen_store(mem: AMode, from_reg: Reg, ty: Type, flags: MemFlagsData) -> Inst {
         match ty {
             I8 => Inst::Store8 {
                 rd: from_reg,
@@ -286,6 +296,36 @@ impl Inst {
                     unimplemented!("gen_store({})", ty);
                 }
             }
+        }
+    }
+
+    /// Zero- or sign-extend `from_reg` as described by `op` into a `to`-sized result.
+    pub fn gen_extend(to_reg: Writable<Reg>, from_reg: Reg, op: ExtendOp, to: OperandSize) -> Inst {
+        assert!(op.from_bits() < to.bits());
+
+        let bfm = |size, bfm_op| Inst::BitfieldMove {
+            size,
+            bfm_op,
+            rd: to_reg,
+            rn: from_reg,
+            immr: UImm6::maybe_from_u8(0).unwrap(),
+            imms: UImm6::maybe_from_u8(op.from_bits() - 1).unwrap(),
+        };
+
+        match op {
+            // A 32-bit move zeroes the upper half of the destination.
+            ExtendOp::UXTW => Inst::Mov {
+                size: OperandSize::Size32,
+                rd: to_reg,
+                rm: from_reg,
+            },
+            // 32-bit UBFM already zeroes the upper half, so it's equivalent to the
+            // 64-bit form; using it preserves the encoding emitted previously.
+            ExtendOp::UXTB | ExtendOp::UXTH => bfm(OperandSize::Size32, BfmOp::UBfm),
+            // SBFM must run at the destination width to sign-fill it.
+            ExtendOp::SXTB | ExtendOp::SXTH | ExtendOp::SXTW => bfm(to, BfmOp::SBfm),
+            // These cases are excluded by the assertion above.
+            ExtendOp::UXTX | ExtendOp::SXTX => unreachable!(),
         }
     }
 
@@ -477,6 +517,29 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
                 collector.reg_fixed_def(scratch2, xreg(28));
             }
         }
+        Inst::AtomicRMW128Loop {
+            op,
+            addr,
+            operand_lo,
+            operand_hi,
+            oldval_lo,
+            oldval_hi,
+            scratch1,
+            scratch2,
+            scratch3,
+            ..
+        } => {
+            collector.reg_fixed_use(addr, xreg(25));
+            collector.reg_fixed_use(operand_lo, xreg(26));
+            collector.reg_fixed_use(operand_hi, xreg(22));
+            collector.reg_fixed_def(oldval_lo, xreg(27));
+            collector.reg_fixed_def(oldval_hi, xreg(23));
+            collector.reg_fixed_def(scratch1, xreg(24));
+            if *op != AtomicRMWLoopOp::Xchg {
+                collector.reg_fixed_def(scratch2, xreg(28));
+                collector.reg_fixed_def(scratch3, xreg(21));
+            }
+        }
         Inst::AtomicRMW { rs, rt, rn, .. } => {
             collector.reg_use(rs);
             collector.reg_def(rt);
@@ -487,6 +550,27 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_use(rs);
             collector.reg_use(rt);
             collector.reg_use(rn);
+        }
+        Inst::AtomicCAS128 { args } => {
+            let AtomicCAS128Args {
+                rd_lo,
+                rd_hi,
+                rs_lo,
+                rs_hi,
+                rt_lo,
+                rt_hi,
+                rn,
+                flags: _,
+            } = &mut **args;
+            // `casp` requires two consecutive even-aligned register pairs,
+            // which regalloc2 cannot express, so pin everything down.
+            collector.reg_fixed_use(rs_lo, xreg(24));
+            collector.reg_fixed_use(rs_hi, xreg(25));
+            collector.reg_fixed_def(rd_lo, xreg(24));
+            collector.reg_fixed_def(rd_hi, xreg(25));
+            collector.reg_fixed_use(rt_lo, xreg(26));
+            collector.reg_fixed_use(rt_hi, xreg(27));
+            collector.reg_fixed_use(rn, xreg(28));
         }
         Inst::AtomicCASLoop {
             addr,
@@ -502,13 +586,59 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_fixed_def(oldval, xreg(27));
             collector.reg_fixed_def(scratch, xreg(24));
         }
+        Inst::AtomicCAS128Loop {
+            addr,
+            expected_lo,
+            expected_hi,
+            replacement_lo,
+            replacement_hi,
+            oldval_lo,
+            oldval_hi,
+            scratch,
+            ..
+        } => {
+            collector.reg_fixed_use(addr, xreg(25));
+            collector.reg_fixed_use(expected_lo, xreg(26));
+            collector.reg_fixed_use(expected_hi, xreg(23));
+            collector.reg_fixed_use(replacement_lo, xreg(28));
+            collector.reg_fixed_use(replacement_hi, xreg(22));
+            collector.reg_fixed_def(oldval_lo, xreg(27));
+            collector.reg_fixed_def(oldval_hi, xreg(21));
+            collector.reg_fixed_def(scratch, xreg(24));
+        }
         Inst::LoadAcquire { rt, rn, .. } => {
             collector.reg_use(rn);
             collector.reg_def(rt);
         }
+        Inst::LoadAcquire128 {
+            rt1,
+            rt2,
+            rn,
+            scratch,
+            ..
+        } => {
+            collector.reg_use(rn);
+            // These registers are written to in a retry loop so their register
+            // assignment can't reuse `rn`, thus they are early-defs.
+            collector.reg_early_def(rt1);
+            collector.reg_early_def(rt2);
+            collector.reg_early_def(scratch);
+        }
         Inst::StoreRelease { rt, rn, .. } => {
             collector.reg_use(rn);
             collector.reg_use(rt);
+        }
+        Inst::StoreRelease128 {
+            rt1,
+            rt2,
+            rn,
+            scratch,
+            ..
+        } => {
+            collector.reg_use(rn);
+            collector.reg_use(rt1);
+            collector.reg_use(rt2);
+            collector.reg_early_def(scratch);
         }
         Inst::Fence {} | Inst::Csdb {} => {}
         Inst::FpuMove32 { rd, rn } => {
@@ -787,8 +917,15 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
         Inst::MovFromNZCV { rd } => {
             collector.reg_def(rd);
         }
-        Inst::Extend { rd, rn, .. } => {
+        Inst::BitfieldMove { rd, rn, .. } => {
+            // The UBFM and SBFM instructions overwrite all bits in `rd`,
+            // unlike BFM which is represented as `BitfieldMoveMod` instead.
             collector.reg_def(rd);
+            collector.reg_use(rn);
+        }
+        Inst::BitfieldMoveMod { rd, ri, rn, .. } => {
+            collector.reg_reuse_def(rd, 1); // `rd` == `ri`.
+            collector.reg_use(ri);
             collector.reg_use(rn);
         }
         Inst::Args { args } => {
@@ -925,6 +1062,32 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
         Inst::StackProbeLoop { start, end, .. } => {
             collector.reg_early_def(start);
             collector.reg_use(end);
+        }
+        Inst::InterruptPoll {
+            dst,
+            load_ptr,
+            context,
+            trap_code: _,
+            next_load_ptr,
+        } => {
+            // `load_ptr` is an input param. It is pinned to x10 so an update of
+            // `next_load_ptr` updates this as well. x10 is chosen because it is
+            // a caller-saved scratch reg with no special role.
+            collector.reg_fixed_use(load_ptr, regs::xreg(10));
+            // Demand `context` (the vmctx) go into x0.
+            collector.reg_fixed_use(context, regs::xreg(0));
+            // Reserve x9 as scratch space. x9 is caller saved and has no
+            // special role.
+            //
+            // Define it, so we can use it as the destination of the dead load
+            // rather than consuming another arbitrary reg.
+            collector.reg_fixed_def(dst, regs::xreg(9));
+            // `next_load_ptr` is pinned so embedders know where to write to
+            // fill it. It takes on the value of `load_ptr` unless a signal
+            // handler invoked at the load overwrites it. We constrain
+            // `next_load_ptr` and `load_ptr` to the same register so this
+            // dataflow happens without a move.
+            collector.reg_fixed_def(next_load_ptr, regs::xreg(10));
         }
     }
 }
@@ -1116,16 +1279,10 @@ impl MachInst for Inst {
         vec![vec![0x1f, 0x20, 0x03, 0xd5]]
     }
 
-    fn rc_for_type(ty: Type) -> CodegenResult<(&'static [RegClass], &'static [Type])> {
-        match ty {
-            I8 => Ok((&[RegClass::Int], &[I8])),
-            I16 => Ok((&[RegClass::Int], &[I16])),
-            I32 => Ok((&[RegClass::Int], &[I32])),
-            I64 => Ok((&[RegClass::Int], &[I64])),
-            F16 => Ok((&[RegClass::Float], &[F16])),
-            F32 => Ok((&[RegClass::Float], &[F32])),
-            F64 => Ok((&[RegClass::Float], &[F64])),
-            F128 => Ok((&[RegClass::Float], &[F128])),
+    fn rc_for_type(ty: &Type) -> CodegenResult<(&[RegClass], &[Type])> {
+        match *ty {
+            I8 | I16 | I32 | I64 => Ok((&[RegClass::Int], slice::from_ref(ty))),
+            F16 | F32 | F64 | F128 => Ok((&[RegClass::Float], slice::from_ref(ty))),
             I128 => Ok((&[RegClass::Int, RegClass::Int], &[I64, I64])),
             _ if ty.is_vector() && ty.bits() <= 128 => {
                 let types = &[types::I8X2, types::I8X4, types::I8X8, types::I8X16];
@@ -1166,8 +1323,17 @@ impl MachInst for Inst {
         44
     }
 
-    fn ref_type_regclass(_: &settings::Flags) -> RegClass {
-        RegClass::Int
+    fn worst_case_island_growth() -> CodeOffset {
+        // A single `Inst` may add to the buffer's pending-island state:
+        //
+        // - Up to three 8-byte constants (the saturating int-to-float sequence
+        //   noted above); count alignment padding into each.
+        // - Up to one deferred trap (TrapIf and similar), 4 bytes.
+        // - Up to one fixup per emitted instruction word, each contributing at
+        //   most `worst_case_veneer_size()` (= 20) bytes of veneer.
+        //
+        // We pick a conservative bound that comfortably covers these.
+        128
     }
 
     fn gen_block_start(
@@ -1220,7 +1386,11 @@ fn pretty_print_try_call(info: &TryCallInfo) -> String {
 }
 
 impl Inst {
-    fn print_with_state(&self, state: &mut EmitState) -> String {
+    #[expect(
+        missing_docs,
+        reason = "exposed for cranelift-isle/veri pretty-printing"
+    )]
+    pub fn print_with_state(&self, state: &mut EmitState) -> String {
         fn op_name(alu_op: ALUOp) -> &'static str {
             match alu_op {
                 ALUOp::Add => "add",
@@ -1604,6 +1774,43 @@ impl Inst {
                     scratch2,
                 )
             }
+            &Inst::AtomicRMW128Loop {
+                op,
+                addr,
+                operand_lo,
+                operand_hi,
+                oldval_lo,
+                oldval_hi,
+                scratch1,
+                scratch2,
+                scratch3,
+                ..
+            } => {
+                let op = match op {
+                    AtomicRMWLoopOp::Add => "add",
+                    AtomicRMWLoopOp::Sub => "sub",
+                    AtomicRMWLoopOp::Eor => "eor",
+                    AtomicRMWLoopOp::Orr => "orr",
+                    AtomicRMWLoopOp::And => "and",
+                    AtomicRMWLoopOp::Nand => "nand",
+                    AtomicRMWLoopOp::Smin => "smin",
+                    AtomicRMWLoopOp::Smax => "smax",
+                    AtomicRMWLoopOp::Umin => "umin",
+                    AtomicRMWLoopOp::Umax => "umax",
+                    AtomicRMWLoopOp::Xchg => "xchg",
+                };
+                let addr = pretty_print_ireg(addr, OperandSize::Size64);
+                let operand_lo = pretty_print_ireg(operand_lo, OperandSize::Size64);
+                let operand_hi = pretty_print_ireg(operand_hi, OperandSize::Size64);
+                let oldval_lo = pretty_print_ireg(oldval_lo.to_reg(), OperandSize::Size64);
+                let oldval_hi = pretty_print_ireg(oldval_hi.to_reg(), OperandSize::Size64);
+                let scratch1 = pretty_print_ireg(scratch1.to_reg(), OperandSize::Size64);
+                let scratch2 = pretty_print_ireg(scratch2.to_reg(), OperandSize::Size64);
+                let scratch3 = pretty_print_ireg(scratch3.to_reg(), OperandSize::Size64);
+                format!(
+                    "atomic_rmw_128_loop_{op} addr={addr} operand_lo={operand_lo} operand_hi={operand_hi} oldval_lo={oldval_lo} oldval_hi={oldval_hi} scratch1={scratch1} scratch2={scratch2} scratch3={scratch3}",
+                )
+            }
             &Inst::AtomicCAS {
                 rd, rs, rt, rn, ty, ..
             } => {
@@ -1620,6 +1827,28 @@ impl Inst {
                 let rn = pretty_print_ireg(rn, OperandSize::Size64);
 
                 format!("{op} {rd}, {rs}, {rt}, [{rn}]")
+            }
+            Inst::AtomicCAS128 { args } => {
+                let &AtomicCAS128Args {
+                    rd_lo,
+                    rd_hi,
+                    rs_lo,
+                    rs_hi,
+                    rt_lo,
+                    rt_hi,
+                    rn,
+                    flags: _,
+                } = &**args;
+                let size = OperandSize::Size64;
+                let rd_lo = pretty_print_ireg(rd_lo.to_reg(), size);
+                let rd_hi = pretty_print_ireg(rd_hi.to_reg(), size);
+                let rs_lo = pretty_print_ireg(rs_lo, size);
+                let rs_hi = pretty_print_ireg(rs_hi, size);
+                let rt_lo = pretty_print_ireg(rt_lo, size);
+                let rt_hi = pretty_print_ireg(rt_hi, size);
+                let rn = pretty_print_ireg(rn, size);
+
+                format!("caspal {rd_lo}, {rd_hi}, {rs_lo}, {rs_hi}, {rt_lo}, {rt_hi}, [{rn}]")
             }
             &Inst::AtomicCASLoop {
                 ty,
@@ -1645,6 +1874,29 @@ impl Inst {
                     scratch,
                 )
             }
+            &Inst::AtomicCAS128Loop {
+                addr,
+                expected_lo,
+                expected_hi,
+                replacement_lo,
+                replacement_hi,
+                oldval_lo,
+                oldval_hi,
+                scratch,
+                ..
+            } => {
+                let addr = pretty_print_ireg(addr, OperandSize::Size64);
+                let expected_lo = pretty_print_ireg(expected_lo, OperandSize::Size64);
+                let expected_hi = pretty_print_ireg(expected_hi, OperandSize::Size64);
+                let replacement_lo = pretty_print_ireg(replacement_lo, OperandSize::Size64);
+                let replacement_hi = pretty_print_ireg(replacement_hi, OperandSize::Size64);
+                let oldval_lo = pretty_print_ireg(oldval_lo.to_reg(), OperandSize::Size64);
+                let oldval_hi = pretty_print_ireg(oldval_hi.to_reg(), OperandSize::Size64);
+                let scratch = pretty_print_ireg(scratch.to_reg(), OperandSize::Size64);
+                format!(
+                    "atomic_cas_128_loop addr={addr}, expected_lo={expected_lo}, expected_hi={expected_hi}, replacement_lo={replacement_lo}, replacement_hi={replacement_hi}, oldval_lo={oldval_lo}, oldval_hi={oldval_hi}, scratch={scratch}",
+                )
+            }
             &Inst::LoadAcquire {
                 access_ty, rt, rn, ..
             } => {
@@ -1660,6 +1912,19 @@ impl Inst {
                 let rt = pretty_print_ireg(rt.to_reg(), size);
                 format!("{op} {rt}, [{rn}]")
             }
+            &Inst::LoadAcquire128 {
+                rt1,
+                rt2,
+                rn,
+                scratch,
+                ..
+            } => {
+                let rt1 = pretty_print_ireg(rt1.to_reg(), OperandSize::Size64);
+                let rt2 = pretty_print_ireg(rt2.to_reg(), OperandSize::Size64);
+                let rn = pretty_print_ireg(rn, OperandSize::Size64);
+                let scratch = pretty_print_ireg(scratch.to_reg(), OperandSize::Size64);
+                format!("load_acquire_128 {rt1}, {rt2}, [{rn}], scratch={scratch}")
+            }
             &Inst::StoreRelease {
                 access_ty, rt, rn, ..
             } => {
@@ -1674,6 +1939,19 @@ impl Inst {
                 let rn = pretty_print_ireg(rn, OperandSize::Size64);
                 let rt = pretty_print_ireg(rt, size);
                 format!("{op} {rt}, [{rn}]")
+            }
+            &Inst::StoreRelease128 {
+                rt1,
+                rt2,
+                rn,
+                scratch,
+                ..
+            } => {
+                let rt1 = pretty_print_ireg(rt1, OperandSize::Size64);
+                let rt2 = pretty_print_ireg(rt2, OperandSize::Size64);
+                let rn = pretty_print_ireg(rn, OperandSize::Size64);
+                let scratch = pretty_print_ireg(scratch.to_reg(), OperandSize::Size64);
+                format!("store_release_128 {rt1}, {rt2}, [{rn}], scratch={scratch}")
             }
             &Inst::Fence {} => {
                 format!("dmb ish")
@@ -1716,11 +1994,11 @@ impl Inst {
                     FPUOp1::Abs => "fabs",
                     FPUOp1::Neg => "fneg",
                     FPUOp1::Sqrt => "fsqrt",
-                    FPUOp1::Cvt32To64 | FPUOp1::Cvt64To32 => "fcvt",
+                    FPUOp1::Cvt16To32 | FPUOp1::Cvt32To64 | FPUOp1::Cvt64To32 => "fcvt",
                 };
                 let dst_size = match fpu_op {
                     FPUOp1::Cvt32To64 => ScalarSize::Size64,
-                    FPUOp1::Cvt64To32 => ScalarSize::Size32,
+                    FPUOp1::Cvt16To32 | FPUOp1::Cvt64To32 => ScalarSize::Size32,
                     _ => size,
                 };
                 let rd = pretty_print_vreg_scalar(rd.to_reg(), dst_size);
@@ -2274,6 +2552,10 @@ impl Inst {
                     VecALUModOp::Bsl => ("bsl", VectorSize::Size8x16),
                     VecALUModOp::Fmla => ("fmla", size),
                     VecALUModOp::Fmls => ("fmls", size),
+                    // Note: the real operand arrangement is .4s, .16b, .16b;
+                    // this debug print renders all lanes as .4s.
+                    VecALUModOp::Sdot => ("sdot", VectorSize::Size32x4),
+                    VecALUModOp::Usdot => ("usdot", VectorSize::Size32x4),
                 };
                 let rd = pretty_print_vreg_vector(rd.to_reg(), size);
                 let ri = pretty_print_vreg_vector(ri, size);
@@ -2525,63 +2807,66 @@ impl Inst {
                 let rd = pretty_print_reg(rd.to_reg());
                 format!("mrs {rd}, nzcv")
             }
-            &Inst::Extend {
+            // Special case when `immr == 0` so that zero- and sign-extending
+            // operations use the appropriate aliases, preserving the behavior
+            // of the old `Inst::Extend` instruction.
+            &Inst::BitfieldMove {
+                size,
+                bfm_op,
                 rd,
                 rn,
-                signed: false,
-                from_bits: 1,
-                ..
+                immr: UImm6 { imm: 0 },
+                imms,
             } => {
-                let rd = pretty_print_ireg(rd.to_reg(), OperandSize::Size32);
-                let rn = pretty_print_ireg(rn, OperandSize::Size32);
-                format!("and {rd}, {rn}, #1")
-            }
-            &Inst::Extend {
-                rd,
-                rn,
-                signed: false,
-                from_bits: 32,
-                to_bits: 64,
-            } => {
-                // The case of a zero extension from 32 to 64 bits, is implemented
-                // with a "mov" to a 32-bit (W-reg) dest, because this zeroes
-                // the top 32 bits.
-                let rd = pretty_print_ireg(rd.to_reg(), OperandSize::Size32);
-                let rn = pretty_print_ireg(rn, OperandSize::Size32);
-                format!("mov {rd}, {rn}")
-            }
-            &Inst::Extend {
-                rd,
-                rn,
-                signed,
-                from_bits,
-                to_bits,
-            } => {
-                assert!(from_bits <= to_bits);
-                let op = match (signed, from_bits) {
-                    (false, 8) => "uxtb",
-                    (true, 8) => "sxtb",
-                    (false, 16) => "uxth",
-                    (true, 16) => "sxth",
-                    (true, 32) => "sxtw",
-                    (true, _) => "sbfx",
-                    (false, _) => "ubfx",
+                let from_bits = imms.value() + 1;
+                let op = match (bfm_op, size, from_bits) {
+                    (BfmOp::UBfm, OperandSize::Size32, 8) => "uxtb",
+                    (BfmOp::UBfm, OperandSize::Size32, 16) => "uxth",
+                    (BfmOp::SBfm, _, 8) => "sxtb",
+                    (BfmOp::SBfm, _, 16) => "sxth",
+                    (BfmOp::SBfm, OperandSize::Size64, 32) => "sxtw",
+                    (BfmOp::UBfm, _, _) => "ubfx",
+                    (BfmOp::SBfm, _, _) => "sbfx",
                 };
                 if op == "sbfx" || op == "ubfx" {
-                    let dest_size = OperandSize::from_bits(to_bits);
-                    let rd = pretty_print_ireg(rd.to_reg(), dest_size);
-                    let rn = pretty_print_ireg(rn, dest_size);
+                    let rd = pretty_print_ireg(rd.to_reg(), size);
+                    let rn = pretty_print_ireg(rn, size);
                     format!("{op} {rd}, {rn}, #0, #{from_bits}")
                 } else {
-                    let dest_size = if signed {
-                        OperandSize::from_bits(to_bits)
-                    } else {
-                        OperandSize::Size32
-                    };
-                    let rd = pretty_print_ireg(rd.to_reg(), dest_size);
-                    let rn = pretty_print_ireg(rn, OperandSize::from_bits(from_bits));
+                    let rd = pretty_print_ireg(rd.to_reg(), size);
+                    let rn = pretty_print_ireg(rn, OperandSize::Size32);
                     format!("{op} {rd}, {rn}")
                 }
+            }
+            &Inst::BitfieldMove {
+                size,
+                bfm_op,
+                rd,
+                rn,
+                immr,
+                imms,
+            } => {
+                let op = bfm_op.op_str();
+                let rd = pretty_print_ireg(rd.to_reg(), size);
+                let rn = pretty_print_ireg(rn, size);
+                let immr = immr.pretty_print(0);
+                let imms = imms.pretty_print(0);
+                format!("{op} {rd}, {rn}, {immr}, {imms}")
+            }
+            &Inst::BitfieldMoveMod {
+                size,
+                rd,
+                ri,
+                rn,
+                immr,
+                imms,
+            } => {
+                let rd = pretty_print_ireg(rd.to_reg(), size);
+                let ri = pretty_print_ireg(ri, size);
+                let rn = pretty_print_ireg(rn, size);
+                let immr = immr.pretty_print(0);
+                let imms = imms.pretty_print(0);
+                format!("bfm {rd}, {ri}, {rn}, {immr}, {imms}")
             }
             &Inst::Call { ref info } => {
                 let try_call = info
@@ -2745,29 +3030,17 @@ impl Inst {
                 let rtmp1 = pretty_print_reg(rtmp1.to_reg());
                 let rtmp2 = pretty_print_reg(rtmp2.to_reg());
                 let default_target = BranchTarget::Label(default).pretty_print(0);
+                let num_targets = targets.len();
                 format!(
-                    concat!(
-                        "b.hs {} ; ",
-                        "csel {}, xzr, {}, hs ; ",
-                        "csdb ; ",
-                        "adr {}, pc+16 ; ",
-                        "ldrsw {}, [{}, {}, uxtw #2] ; ",
-                        "add {}, {}, {} ; ",
-                        "br {} ; ",
-                        "jt_entries {:?}"
-                    ),
-                    default_target,
-                    rtmp2,
-                    ridx,
-                    rtmp1,
-                    rtmp2,
-                    rtmp1,
-                    rtmp2,
-                    rtmp1,
-                    rtmp1,
-                    rtmp2,
-                    rtmp1,
-                    targets
+                    "mov {rtmp2}, #{num_targets} ; \
+                     csel {rtmp2}, {ridx}, {rtmp2}, lo ; \
+                     csdb ; \
+                     adr {rtmp1}, pc+16 ; \
+                     ldrsw {rtmp2}, [{rtmp1}, {rtmp2}, uxtw #2] ; \
+                     add {rtmp1}, {rtmp1}, {rtmp2} ; \
+                     br {rtmp1} ; \
+                     jt_entries {targets:?} ; \
+                     default {default_target}"
                 )
             }
             &Inst::LoadExtNameGot { rd, ref name } => {
@@ -2909,6 +3182,21 @@ impl Inst {
                 let step = step.pretty_print(0);
                 format!("stack_probe_loop {start}, {end}, {step}")
             }
+            &Inst::InterruptPoll {
+                dst,
+                load_ptr,
+                context,
+                trap_code,
+                next_load_ptr,
+            } => {
+                let dst = pretty_print_reg(dst.to_reg());
+                let load_ptr = pretty_print_reg(load_ptr);
+                let context = pretty_print_reg(context);
+                let next_load_ptr = pretty_print_reg(next_load_ptr.to_reg());
+                format!(
+                    "{next_load_ptr} = interrupt_poll load_ptr={load_ptr}, context={context}, scratch={dst} #trap={trap_code}"
+                )
+            }
         }
     }
 }
@@ -2976,8 +3264,8 @@ impl MachInstLabelUse for LabelUse {
     /// Perform the patch.
     fn patch(self, buffer: &mut [u8], use_offset: CodeOffset, label_offset: CodeOffset) {
         let pc_rel = (label_offset as i64) - (use_offset as i64);
-        debug_assert!(pc_rel <= self.max_pos_range() as i64);
-        debug_assert!(pc_rel >= -(self.max_neg_range() as i64));
+        assert!(pc_rel <= self.max_pos_range() as i64);
+        assert!(pc_rel >= -(self.max_neg_range() as i64));
         let pc_rel = pc_rel as u32;
         let insn_word = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
         let mask = match self {
@@ -3098,19 +3386,10 @@ impl MachInstLabelUse for LabelUse {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inst_size_test() {
-        // This test will help with unintentionally growing the size
-        // of the Inst enum.
-        let expected = if cfg!(target_pointer_width = "32") && !cfg!(target_arch = "arm") {
-            28
-        } else {
-            32
-        };
-        assert_eq!(expected, core::mem::size_of::<Inst>());
-    }
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn inst_size_test() {
+    // This test will help with unintentionally growing the size
+    // of the Inst enum.
+    assert_eq!(48, core::mem::size_of::<Inst>());
 }

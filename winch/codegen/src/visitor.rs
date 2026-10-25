@@ -6,8 +6,8 @@
 
 use crate::abi::RetArea;
 use crate::codegen::{
-    Callee, CodeGen, CodeGenError, ConditionalBranch, ControlStackFrame, Emission, FnCall,
-    UnconditionalBranch, control_index,
+    Callee, CatchInfo, CodeGen, CodeGenError, ConditionalBranch, ControlStackFrame, Emission,
+    FnCall, TryTableInfo, TypeConverter, UnconditionalBranch, control_index,
 };
 use crate::masm::{
     AtomicWaitKind, DivKind, Extend, ExtractLaneKind, FloatCmpKind, IntCmpKind, LoadKind,
@@ -19,17 +19,18 @@ use crate::masm::{
 };
 use crate::reg::{Reg, writable};
 use crate::stack::{TypedReg, Val};
-use crate::{Result, bail, ensure, format_err};
+use crate::{Result, bail, format_err};
+use cranelift_codegen::ir::ExceptionTag;
 use regalloc2::RegClass;
 use smallvec::{SmallVec, smallvec};
 use wasmparser::{
-    BlockType, BrTable, HeapType, Ieee32, Ieee64, MemArg, V128, ValType, VisitOperator,
+    BlockType, BrTable, HeapType, Ieee32, Ieee64, MemArg, TryTable, V128, ValType, VisitOperator,
     VisitSimdOperator,
 };
 use wasmtime_cranelift::TRAP_INDIRECT_CALL_TO_NULL;
 use wasmtime_environ::{
-    FUNCREF_INIT_BIT, FuncIndex, GlobalIndex, IndexType, MemoryIndex, TableIndex, TypeIndex,
-    WasmHeapType, WasmValType,
+    DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex, TypeConvert,
+    TypeIndex, WasmCompositeInnerType, WasmHeapType, WasmValType,
 };
 
 /// A macro to define unsupported WebAssembly operators.
@@ -190,12 +191,16 @@ macro_rules! def_unsupported {
     (emit LocalGet $($rest:tt)*) => {};
     (emit LocalSet $($rest:tt)*) => {};
     (emit Call $($rest:tt)*) => {};
+    (emit ReturnCall $($rest:tt)*) => {};
     (emit End $($rest:tt)*) => {};
     (emit Nop $($rest:tt)*) => {};
     (emit If $($rest:tt)*) => {};
     (emit Else $($rest:tt)*) => {};
     (emit Block $($rest:tt)*) => {};
     (emit Loop $($rest:tt)*) => {};
+    (emit TryTable $($rest:tt)*) => {};
+    (emit Throw $($rest:tt)*) => {};
+    (emit ThrowRef $($rest:tt)*) => {};
     (emit Br $($rest:tt)*) => {};
     (emit BrIf $($rest:tt)*) => {};
     (emit Return $($rest:tt)*) => {};
@@ -211,6 +216,7 @@ macro_rules! def_unsupported {
     (emit Drop $($rest:tt)*) => {};
     (emit BrTable $($rest:tt)*) => {};
     (emit CallIndirect $($rest:tt)*) => {};
+    (emit ReturnCallIndirect $($rest:tt)*) => {};
     (emit TableInit $($rest:tt)*) => {};
     (emit TableCopy $($rest:tt)*) => {};
     (emit TableGet $($rest:tt)*) => {};
@@ -1508,7 +1514,11 @@ where
             self.handle_unreachable_end()
         } else {
             let mut control = self.pop_control_frame()?;
-            control.emit_end(self.masm, &mut self.context)
+            if let Some(info) = control.take_try_table_info() {
+                self.emit_try_table_end(control, info)
+            } else {
+                control.emit_end(self.masm, &mut self.context)
+            }
         }
     }
 
@@ -1663,7 +1673,11 @@ where
         match slot.ty {
             I32 | I64 | F32 | F64 | V128 => context.stack.push(Val::local(index, slot.ty)),
             Ref(rt) => match rt.heap_type {
-                WasmHeapType::Func => context.stack.push(Val::local(index, slot.ty)),
+                WasmHeapType::Func
+                | WasmHeapType::Extern
+                | WasmHeapType::Exn
+                | WasmHeapType::ConcreteExn(_)
+                | WasmHeapType::NoExn => context.stack.push(Val::local(index, slot.ty)),
                 _ => bail!(CodeGenError::unsupported_wasm_type()),
             },
         }
@@ -1683,8 +1697,21 @@ where
         Ok(())
     }
 
+    fn visit_return_call(&mut self, index: u32) -> Self::Output {
+        let callee = self.env.callee_from_index(FuncIndex::from_u32(index));
+        FnCall::emit_return::<M>(
+            &mut self.env,
+            self.masm,
+            &mut self.context,
+            self.sig.params_stack_size(),
+            callee,
+        )?;
+        self.context.reachable = false;
+        Ok(())
+    }
+
     fn visit_call_indirect(&mut self, type_index: u32, table_index: u32) -> Self::Output {
-        // Spill now because `emit_lazy_init_funcref` and the `FnCall::emit`
+        // Spill now because `emit_table_get` and the `FnCall::emit`
         // invocations will both trigger spills since they both call functions.
         // However, the machine instructions for the spill emitted by
         // `emit_lazy_funcref` will be jumped over if the funcref was previously
@@ -1695,10 +1722,10 @@ where
         let type_index = TypeIndex::from_u32(type_index);
         let table_index = TableIndex::from_u32(table_index);
 
-        self.emit_lazy_init_funcref(table_index)?;
+        self.emit_table_get(table_index)?;
 
         // Perform the indirect call.
-        // This code assumes that [`Self::emit_lazy_init_funcref`] will
+        // This code assumes that [`Self::emit_table_get`] will
         // push the funcref to the value stack.
         let funcref_ptr = self
             .context
@@ -1715,92 +1742,54 @@ where
         Ok(())
     }
 
-    fn visit_table_init(&mut self, elem: u32, table: u32) -> Self::Output {
-        let at = self.context.stack.ensure_index_at(3)?;
+    fn visit_return_call_indirect(&mut self, type_index: u32, table_index: u32) -> Self::Output {
+        // As with a normal indirect call, spill before table lookup because
+        // lazy funcref initialization can itself make a call.
+        self.context.spill(self.masm)?;
 
-        self.context
+        let type_index = TypeIndex::from_u32(type_index);
+        let table_index = TableIndex::from_u32(table_index);
+
+        self.emit_table_get(table_index)?;
+
+        let funcref_ptr = self
+            .context
             .stack
-            .insert_many(at, &[table.try_into()?, elem.try_into()?]);
+            .peek()
+            .map(|v| v.unwrap_reg())
+            .ok_or_else(|| CodeGenError::missing_values_in_stack())?;
+        self.masm
+            .trapz(funcref_ptr.into(), TRAP_INDIRECT_CALL_TO_NULL)?;
+        self.emit_typecheck_funcref(funcref_ptr.into(), type_index)?;
 
-        let builtin = self.env.builtins.table_init::<M::ABI>()?;
-        FnCall::emit::<M>(
+        let callee = self.env.funcref(type_index);
+        FnCall::emit_return::<M>(
             &mut self.env,
             self.masm,
             &mut self.context,
-            Callee::Builtin(builtin.clone()),
+            self.sig.params_stack_size(),
+            callee,
         )?;
-        self.context.pop_and_free(self.masm)
+        self.context.reachable = false;
+        Ok(())
+    }
+
+    fn visit_table_init(&mut self, elem: u32, table: u32) -> Self::Output {
+        self.emit_table_init(ElemIndex::from_u32(elem), TableIndex::from_u32(table))
     }
 
     fn visit_table_copy(&mut self, dst: u32, src: u32) -> Self::Output {
-        let at = self.context.stack.ensure_index_at(3)?;
-        self.context
-            .stack
-            .insert_many(at, &[dst.try_into()?, src.try_into()?]);
-
-        let builtin = self.env.builtins.table_copy::<M::ABI>()?;
-        FnCall::emit::<M>(
-            &mut self.env,
-            self.masm,
-            &mut self.context,
-            Callee::Builtin(builtin),
-        )?;
-        self.context.pop_and_free(self.masm)
+        self.emit_table_copy(TableIndex::from_u32(dst), TableIndex::from_u32(src))
     }
 
     fn visit_table_get(&mut self, table: u32) -> Self::Output {
         let table_index = TableIndex::from_u32(table);
-        let table = self.env.table(table_index);
-        let heap_type = table.ref_type.heap_type;
-
-        match heap_type {
-            WasmHeapType::Func => self.emit_lazy_init_funcref(table_index),
-            _ => Err(format_err!(CodeGenError::unsupported_wasm_type())),
-        }
+        self.emit_table_get(table_index)
     }
 
     fn visit_table_grow(&mut self, table: u32) -> Self::Output {
         let table_index = TableIndex::from_u32(table);
-        let ptr_type = self.env.ptr_type();
-        let (heap_type, idx_type) = {
-            let table_ty = self.env.table(table_index);
-            (table_ty.ref_type.heap_type, table_ty.idx_type)
-        };
-        let builtin = match heap_type {
-            WasmHeapType::Func => self.env.builtins.table_grow_func_ref::<M::ABI>()?,
-            _ => bail!(CodeGenError::unsupported_wasm_type()),
-        };
-
-        let len = self.context.stack.len();
-        // table.grow` requires at least 2 elements on the value stack.
-        let at = self.context.stack.ensure_index_at(2)?;
-
-        // The table_grow builtin expects the parameters in a different
-        // order.
-        // The value stack at this point should contain:
-        // [ init_value | delta ] (stack top)
-        // but the builtin function expects the init value as the last
-        // argument.
-        self.context.stack.inner_mut().swap(len - 1, len - 2);
-
-        let builtin = self.prepare_builtin_defined_table_arg(table_index, at, builtin)?;
-
-        FnCall::emit::<M>(&mut self.env, self.masm, &mut self.context, builtin)?;
-
-        // Similar to the memory.grow builtin, `table.grow` returns a
-        // pointer, however, we need to ensure that the returned index
-        // is representative of the address space for tables.
-        match (ptr_type, idx_type) {
-            (WasmValType::I64, IndexType::I64) => Ok(()),
-            (WasmValType::I64, IndexType::I32) => {
-                let top: Reg = self.context.pop_to_reg(self.masm, None)?.into();
-                self.masm.wrap(writable!(top), top)?;
-                self.context.stack.push(TypedReg::i32(top).into());
-                Ok(())
-            }
-
-            _ => Err(format_err!(CodeGenError::unsupported_32_bit_platform())),
-        }
+        self.emit_table_grow(table_index)
     }
 
     fn visit_table_size(&mut self, table: u32) -> Self::Output {
@@ -1811,119 +1800,32 @@ where
 
     fn visit_table_fill(&mut self, table: u32) -> Self::Output {
         let table_index = TableIndex::from_u32(table);
-        let table_ty = self.env.table(table_index);
-
-        ensure!(
-            table_ty.ref_type.heap_type == WasmHeapType::Func,
-            CodeGenError::unsupported_wasm_type()
-        );
-
-        let builtin = self.env.builtins.table_fill_func_ref::<M::ABI>()?;
-
-        let at = self.context.stack.ensure_index_at(3)?;
-
-        let callee = self.prepare_builtin_defined_table_arg(table_index, at, builtin)?;
-        FnCall::emit::<M>(&mut self.env, self.masm, &mut self.context, callee)?;
-
-        self.context.pop_and_free(self.masm)
+        self.emit_table_fill(table_index)
     }
 
     fn visit_table_set(&mut self, table: u32) -> Self::Output {
-        let ptr_type = self.env.ptr_type();
         let table_index = TableIndex::from_u32(table);
-        let table_data = self.env.resolve_table_data(table_index);
-        let table = self.env.table(table_index);
-        match table.ref_type.heap_type {
-            WasmHeapType::Func => {
-                ensure!(
-                    self.tunables.table_lazy_init,
-                    CodeGenError::unsupported_table_eager_init()
-                );
-                let value = self.context.pop_to_reg(self.masm, None)?;
-                let index = self.context.pop_to_reg(self.masm, None)?;
-                let base = self.context.any_gpr(self.masm)?;
-                let elem_addr =
-                    self.emit_compute_table_elem_addr(index.into(), base, &table_data)?;
-                // Set the initialized bit.
-                self.masm.or(
-                    writable!(value.into()),
-                    value.into(),
-                    RegImm::i64(FUNCREF_INIT_BIT as i64),
-                    ptr_type.try_into()?,
-                )?;
-
-                self.masm.store_ptr(value.into(), elem_addr)?;
-
-                self.context.free_reg(value);
-                self.context.free_reg(index);
-                self.context.free_reg(base);
-                Ok(())
-            }
-            _ => Err(format_err!(CodeGenError::unsupported_wasm_type())),
-        }
+        self.emit_table_set(table_index)
     }
 
     fn visit_elem_drop(&mut self, index: u32) -> Self::Output {
-        let elem_drop = self.env.builtins.elem_drop::<M::ABI>()?;
-        self.context.stack.extend([index.try_into()?]);
-        FnCall::emit::<M>(
-            &mut self.env,
-            self.masm,
-            &mut self.context,
-            Callee::Builtin(elem_drop),
-        )?;
-        self.context.pop_and_free(self.masm)
+        let index = ElemIndex::from_u32(index);
+        self.emit_elem_drop(index)
     }
 
     fn visit_memory_init(&mut self, data_index: u32, mem: u32) -> Self::Output {
-        let at = self.context.stack.ensure_index_at(3)?;
-        self.context
-            .stack
-            .insert_many(at, &[mem.try_into()?, data_index.try_into()?]);
-        let builtin = self.env.builtins.memory_init::<M::ABI>()?;
-        FnCall::emit::<M>(
-            &mut self.env,
-            self.masm,
-            &mut self.context,
-            Callee::Builtin(builtin),
-        )?;
-        self.context.pop_and_free(self.masm)
+        self.emit_memory_init(DataIndex::from_u32(data_index), MemoryIndex::from_u32(mem))
     }
 
     fn visit_memory_copy(&mut self, dst_mem: u32, src_mem: u32) -> Self::Output {
-        // At this point, the stack is expected to contain:
-        //     [ dst_offset, src_offset, len ]
-        // The following code inserts the missing params, so that stack contains:
-        //     [ vmctx, dst_mem, dst_offset, src_mem, src_offset, len ]
-        // Which is the order expected by the builtin function.
-        let _ = self.context.stack.ensure_index_at(3)?;
-        let at = self.context.stack.ensure_index_at(2)?;
-        self.context.stack.insert_many(at, &[src_mem.try_into()?]);
-
-        // One element was inserted above, so instead of 3, we use 4.
-        let at = self.context.stack.ensure_index_at(4)?;
-        self.context.stack.insert_many(at, &[dst_mem.try_into()?]);
-
-        let builtin = self.env.builtins.memory_copy::<M::ABI>()?;
-
-        FnCall::emit::<M>(
-            &mut self.env,
-            self.masm,
-            &mut self.context,
-            Callee::Builtin(builtin),
-        )?;
-        self.context.pop_and_free(self.masm)
+        self.emit_memory_copy(
+            MemoryIndex::from_u32(dst_mem),
+            MemoryIndex::from_u32(src_mem),
+        )
     }
 
     fn visit_memory_fill(&mut self, mem: u32) -> Self::Output {
-        let at = self.context.stack.ensure_index_at(3)?;
-        let mem = MemoryIndex::from_u32(mem);
-
-        let builtin = self.env.builtins.memory_fill::<M::ABI>()?;
-        let builtin = self.prepare_builtin_defined_memory_arg(mem, at, builtin)?;
-
-        FnCall::emit::<M>(&mut self.env, self.masm, &mut self.context, builtin)?;
-        self.context.pop_and_free(self.masm)
+        self.emit_memory_fill(MemoryIndex::from_u32(mem))
     }
 
     fn visit_memory_size(&mut self, mem: u32) -> Self::Output {
@@ -1961,16 +1863,7 @@ where
     }
 
     fn visit_data_drop(&mut self, data_index: u32) -> Self::Output {
-        self.context.stack.extend([data_index.try_into()?]);
-
-        let builtin = self.env.builtins.data_drop::<M::ABI>()?;
-        FnCall::emit::<M>(
-            &mut self.env,
-            self.masm,
-            &mut self.context,
-            Callee::Builtin(builtin),
-        )?;
-        self.context.pop_and_free(self.masm)
+        self.emit_data_drop(DataIndex::from_u32(data_index))
     }
 
     fn visit_nop(&mut self) -> Self::Output {
@@ -2009,12 +1902,116 @@ where
         Ok(())
     }
 
+    // Record the handlers that apply to calls within this `try_table`. Their
+    // landing pads are emitted when the control frame ends.
+    fn visit_try_table(&mut self, try_table: TryTable) -> Self::Output {
+        // When this `try_table` is unreachable at entry, its handlers cannot run.
+        // Use a plain block to match its `end`, without registering catches.
+        // Unreachable blocks do not record the machine-stack state needed to
+        // emit landing pads.
+        if !self.context.reachable {
+            return self.visit_block(try_table.ty);
+        }
+
+        let checkpoint = self.context.exception_handlers.take_checkpoint();
+        let mut catches = Vec::with_capacity(try_table.catches.len());
+
+        for catch in try_table.catches.iter().rev() {
+            let (is_ref, tag, target_depth) = match catch {
+                wasmparser::Catch::One { tag, label } => {
+                    (false, Some(TagIndex::from_u32(*tag)), *label)
+                }
+                wasmparser::Catch::OneRef { tag, label } => {
+                    (true, Some(TagIndex::from_u32(*tag)), *label)
+                }
+                wasmparser::Catch::All { label } => (false, None, *label),
+                wasmparser::Catch::AllRef { label } => (true, None, *label),
+            };
+
+            let landing_pad = self.masm.get_label()?;
+
+            let target = control_index(target_depth, self.control_frames.len())?;
+            self.control_frames[target].set_as_target();
+
+            let exception_tag = tag.map(|tag| ExceptionTag::from_u32(tag.as_u32()));
+            self.context
+                .exception_handlers
+                .add_handler(exception_tag, landing_pad);
+
+            catches.push(CatchInfo {
+                is_ref,
+                tag,
+                target_depth,
+                landing_pad,
+            });
+        }
+        let info = TryTableInfo {
+            checkpoint,
+            catches,
+        };
+        self.control_frames.push(ControlStackFrame::try_table(
+            self.env.resolve_block_sig(try_table.ty)?,
+            info,
+            self.masm,
+            &mut self.context,
+        )?);
+
+        Ok(())
+    }
+
+    fn visit_throw(&mut self, tag_index: u32) -> Self::Output {
+        let tag_index = TagIndex::from_u32(tag_index);
+        let interned = self.env.translation.module.tags[tag_index]
+            .exception
+            .unwrap_module_type_index();
+        let types = self.env.types;
+        let exn_ty = match &types[interned].composite_type.inner {
+            WasmCompositeInnerType::Exn(exn_ty) => exn_ty,
+            _ => return Err(format_err!(CodeGenError::unsupported_wasm_type())),
+        };
+        let layouts = self.require_gc_codegen_config().layouts();
+
+        let layout = layouts
+            .exn_layout(exn_ty)
+            .map_err(|_| format_err!(CodeGenError::unsupported_wasm_type()))?;
+
+        let (gc_ref, object_addr) =
+            self.emit_exception_alloc(tag_index, interned, &layout, layouts)?;
+        let gc_ref =
+            self.emit_store_exception_payload_fields(exn_ty, &layout, gc_ref, object_addr)?;
+        self.context.stack.push(gc_ref.into());
+        self.visit_throw_ref()
+    }
+
+    // The exception reference is on top of the value stack. Forward it to the
+    // runtime, then mark the remaining Wasm code unreachable because throwing
+    // does not return to this function.
+    fn visit_throw_ref(&mut self) -> Self::Output {
+        let throw_ref = self.env.builtins.throw_ref::<M::ABI>()?;
+        FnCall::emit::<M>(
+            &mut self.env,
+            self.masm,
+            &mut self.context,
+            Callee::Builtin(throw_ref),
+        )?;
+        self.context.reachable = false;
+        let outermost = &mut self.control_frames[0];
+        outermost.set_as_target();
+        Ok(())
+    }
+
     fn visit_loop(&mut self, blockty: BlockType) -> Self::Output {
         self.control_frames.push(ControlStackFrame::r#loop(
             self.env.resolve_block_sig(blockty)?,
             self.masm,
             &mut self.context,
         )?);
+
+        // Unreachable loops still need a control frame, but must not emit
+        // runtime-limit checks against a potentially unwound stack frame.
+        if !self.context.reachable {
+            return Ok(());
+        }
 
         self.maybe_emit_epoch_check()?;
         self.maybe_emit_fuel_check()
@@ -2230,11 +2227,15 @@ where
         let index = GlobalIndex::from_u32(global_index);
         let (ty, base, offset) = self.emit_get_global_addr(index)?;
         let addr = self.masm.address_at_reg(base, offset)?;
-        let dst = self.context.reg_for_type(ty, self.masm)?;
-        self.masm.load(addr, writable!(dst), ty.try_into()?)?;
-        self.context.stack.push(Val::reg(dst, ty));
-
+        let gc_ref = self.context.reg_for_type(ty, self.masm)?;
+        self.masm.load(addr, writable!(gc_ref), ty.try_into()?)?;
         self.context.free_reg(base);
+
+        if self.gc_barrier_needed(&ty) {
+            self.emit_drc_read_barrier(ty, gc_ref)?;
+        } else {
+            self.context.stack.push(Val::reg(gc_ref, ty));
+        }
 
         Ok(())
     }
@@ -2244,11 +2245,15 @@ where
         let (ty, base, offset) = self.emit_get_global_addr(index)?;
         let addr = self.masm.address_at_reg(base, offset)?;
 
-        let typed_reg = self.context.pop_to_reg(self.masm, None)?;
-        self.masm
-            .store(typed_reg.reg.into(), addr, ty.try_into()?)?;
-        self.context.free_reg(typed_reg.reg);
-        self.context.free_reg(base);
+        if self.gc_barrier_needed(&ty) {
+            self.emit_drc_write_barrier(ty, base, addr)?;
+        } else {
+            let typed_reg = self.context.pop_to_reg(self.masm, None)?;
+            self.masm
+                .store(typed_reg.reg.into(), addr, ty.try_into()?)?;
+            self.context.free_reg(typed_reg.reg);
+            self.context.free_reg(base);
+        }
 
         Ok(())
     }
@@ -2262,38 +2267,30 @@ where
     }
 
     fn visit_select(&mut self) -> Self::Output {
-        let cond = self.context.pop_to_reg(self.masm, None)?;
-        let val2 = self.context.pop_to_reg(self.masm, None)?;
-        let val1 = self.context.pop_to_reg(self.masm, None)?;
-        self.masm.cmp(cond.reg, RegImm::i32(0), OperandSize::S32)?;
-        // Conditionally move val1 to val2 if the comparison is
-        // not zero.
-        self.masm.cmov(
-            writable!(val2.into()),
-            val1.into(),
-            IntCmpKind::Ne,
-            val1.ty.try_into()?,
-        )?;
-        self.context.stack.push(val2.into());
-        self.context.free_reg(val1.reg);
-        self.context.free_reg(cond);
-
-        Ok(())
+        self.emit_select(None)
     }
 
-    fn visit_typed_select(&mut self, _ty: ValType) -> Self::Output {
-        self.visit_select()
+    fn visit_typed_select(&mut self, ty: ValType) -> Self::Output {
+        let ty = TypeConverter::new(self.env.translation, self.env.types).convert_valtype(ty)?;
+        self.emit_select(Some(ty))
     }
 
     fn visit_ref_null(&mut self, hty: HeapType) -> Self::Output {
-        match hty {
-            HeapType::FUNC => {
+        match self.env.convert_heap_type(hty)? {
+            WasmHeapType::Func => {
                 let ptr_type = self.env.ptr_type();
                 match ptr_type {
                     WasmValType::I64 => self.context.stack.push(Val::i64(0)),
                     WasmValType::I32 => self.context.stack.push(Val::i32(0)),
                     _ => bail!(CodeGenError::unsupported_wasm_type()),
                 }
+                Ok(())
+            }
+            WasmHeapType::Extern
+            | WasmHeapType::Exn
+            | WasmHeapType::ConcreteExn(_)
+            | WasmHeapType::NoExn => {
+                self.context.stack.push(Val::i32(0));
                 Ok(())
             }
             _ => Err(format_err!(CodeGenError::unsupported_wasm_type())),
@@ -4786,7 +4783,10 @@ impl TryFrom<WasmValType> for OperandSize {
                     // to be updated in such a way that the calculation of the
                     // OperandSize will depend on the target's  pointer size.
                     WasmHeapType::Func => OperandSize::S64,
-                    WasmHeapType::Extern => OperandSize::S64,
+                    WasmHeapType::Extern
+                    | WasmHeapType::Exn
+                    | WasmHeapType::ConcreteExn(_)
+                    | WasmHeapType::NoExn => OperandSize::S32,
                     _ => bail!(CodeGenError::unsupported_wasm_type()),
                 }
             }

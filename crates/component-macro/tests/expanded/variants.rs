@@ -173,7 +173,7 @@ const _: () = {
             host_getter: fn(&mut T) -> D::Data<'_>,
         ) -> wasmtime::Result<()>
         where
-            D: foo::foo::variants::HostWithStore,
+            D: foo::foo::variants::HostWithStore<T>,
             for<'a> D::Data<'a>: foo::foo::variants::Host,
             T: 'static,
         {
@@ -201,8 +201,11 @@ pub mod foo {
                 #[component(name = "a")]
                 A,
             }
-            impl core::fmt::Debug for E1 {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for E1 {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     match self {
                         E1::A => f.debug_tuple("E1::A").finish(),
                     }
@@ -217,15 +220,21 @@ pub mod foo {
             #[derive(wasmtime::component::Lower)]
             #[component(record)]
             #[derive(Clone, Copy)]
-            pub struct Empty {}
-            impl core::fmt::Debug for Empty {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                    f.debug_struct("Empty").finish()
+            pub struct Empty {
+                #[component(name = "a")]
+                pub a: u32,
+            }
+            impl ::core::fmt::Debug for Empty {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    f.debug_struct("Empty").field("a", &self.a).finish()
                 }
             }
             const _: () = {
-                assert!(0 == < Empty as wasmtime::component::ComponentType >::SIZE32);
-                assert!(1 == < Empty as wasmtime::component::ComponentType >::ALIGN32);
+                assert!(4 == < Empty as wasmtime::component::ComponentType >::SIZE32);
+                assert!(4 == < Empty as wasmtime::component::ComponentType >::ALIGN32);
             };
             #[derive(wasmtime::component::ComponentType)]
             #[derive(wasmtime::component::Lift)]
@@ -246,8 +255,11 @@ pub mod foo {
                 #[component(name = "g")]
                 G(u32),
             }
-            impl core::fmt::Debug for V1 {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for V1 {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     match self {
                         V1::A => f.debug_tuple("V1::A").finish(),
                         V1::C(e) => f.debug_tuple("V1::C").field(e).finish(),
@@ -273,8 +285,11 @@ pub mod foo {
                 #[component(name = "b")]
                 B(f32),
             }
-            impl core::fmt::Debug for Casts1 {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for Casts1 {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     match self {
                         Casts1::A(e) => f.debug_tuple("Casts1::A").field(e).finish(),
                         Casts1::B(e) => f.debug_tuple("Casts1::B").field(e).finish(),
@@ -296,8 +311,11 @@ pub mod foo {
                 #[component(name = "b")]
                 B(f32),
             }
-            impl core::fmt::Debug for Casts2 {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for Casts2 {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     match self {
                         Casts2::A(e) => f.debug_tuple("Casts2::A").field(e).finish(),
                         Casts2::B(e) => f.debug_tuple("Casts2::B").field(e).finish(),
@@ -319,8 +337,11 @@ pub mod foo {
                 #[component(name = "b")]
                 B(u64),
             }
-            impl core::fmt::Debug for Casts3 {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for Casts3 {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     match self {
                         Casts3::A(e) => f.debug_tuple("Casts3::A").field(e).finish(),
                         Casts3::B(e) => f.debug_tuple("Casts3::B").field(e).finish(),
@@ -342,8 +363,11 @@ pub mod foo {
                 #[component(name = "b")]
                 B(i64),
             }
-            impl core::fmt::Debug for Casts4 {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for Casts4 {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     match self {
                         Casts4::A(e) => f.debug_tuple("Casts4::A").field(e).finish(),
                         Casts4::B(e) => f.debug_tuple("Casts4::B").field(e).finish(),
@@ -365,8 +389,11 @@ pub mod foo {
                 #[component(name = "b")]
                 B(i64),
             }
-            impl core::fmt::Debug for Casts5 {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for Casts5 {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     match self {
                         Casts5::A(e) => f.debug_tuple("Casts5::A").field(e).finish(),
                         Casts5::B(e) => f.debug_tuple("Casts5::B").field(e).finish(),
@@ -388,8 +415,11 @@ pub mod foo {
                 #[component(name = "b")]
                 B((u32, u32)),
             }
-            impl core::fmt::Debug for Casts6 {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for Casts6 {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     match self {
                         Casts6::A(e) => f.debug_tuple("Casts6::A").field(e).finish(),
                         Casts6::B(e) => f.debug_tuple("Casts6::B").field(e).finish(),
@@ -426,8 +456,11 @@ pub mod foo {
                     }
                 }
             }
-            impl core::fmt::Debug for MyErrno {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for MyErrno {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     f.debug_struct("MyErrno")
                         .field("code", &(*self as i32))
                         .field("name", &self.name())
@@ -435,12 +468,15 @@ pub mod foo {
                         .finish()
                 }
             }
-            impl core::fmt::Display for MyErrno {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Display for MyErrno {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     write!(f, "{} (error {})", self.name(), * self as i32)
                 }
             }
-            impl core::error::Error for MyErrno {}
+            impl ::core::error::Error for MyErrno {}
             const _: () = {
                 assert!(1 == < MyErrno as wasmtime::component::ComponentType >::SIZE32);
                 assert!(1 == < MyErrno as wasmtime::component::ComponentType >::ALIGN32);
@@ -454,8 +490,11 @@ pub mod foo {
                 #[component(name = "v1")]
                 pub v1: V1,
             }
-            impl core::fmt::Debug for IsClone {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            impl ::core::fmt::Debug for IsClone {
+                fn fmt(
+                    &self,
+                    f: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
                     f.debug_struct("IsClone").field("v1", &self.v1).finish()
                 }
             }
@@ -463,10 +502,10 @@ pub mod foo {
                 assert!(12 == < IsClone as wasmtime::component::ComponentType >::SIZE32);
                 assert!(4 == < IsClone as wasmtime::component::ComponentType >::ALIGN32);
             };
-            pub trait HostWithStore: wasmtime::component::HasData {}
-            impl<_T: ?Sized> HostWithStore for _T
+            pub trait HostWithStore<T>: wasmtime::component::HasData {}
+            impl<H: ?Sized, T> HostWithStore<T> for H
             where
-                _T: wasmtime::component::HasData,
+                H: wasmtime::component::HasData,
             {}
             pub trait Host {
                 fn e1_arg(&mut self, x: E1) -> ();
@@ -478,7 +517,7 @@ pub mod foo {
                 fn option_arg(
                     &mut self,
                     a: Option<bool>,
-                    b: Option<()>,
+                    b: Option<(u32,)>,
                     c: Option<u32>,
                     d: Option<E1>,
                     e: Option<f32>,
@@ -488,7 +527,7 @@ pub mod foo {
                     &mut self,
                 ) -> (
                     Option<bool>,
-                    Option<()>,
+                    Option<(u32,)>,
                     Option<u32>,
                     Option<E1>,
                     Option<f32>,
@@ -508,7 +547,7 @@ pub mod foo {
                     a: Result<(), ()>,
                     b: Result<(), E1>,
                     c: Result<E1, ()>,
-                    d: Result<(), ()>,
+                    d: Result<(u32,), (u32,)>,
                     e: Result<u32, V1>,
                     f: Result<
                         wasmtime::component::__internal::String,
@@ -521,7 +560,7 @@ pub mod foo {
                     Result<(), ()>,
                     Result<(), E1>,
                     Result<E1, ()>,
-                    Result<(), ()>,
+                    Result<(u32,), (u32,)>,
                     Result<u32, V1>,
                     Result<
                         wasmtime::component::__internal::String,
@@ -560,7 +599,7 @@ pub mod foo {
                 fn option_arg(
                     &mut self,
                     a: Option<bool>,
-                    b: Option<()>,
+                    b: Option<(u32,)>,
                     c: Option<u32>,
                     d: Option<E1>,
                     e: Option<f32>,
@@ -572,7 +611,7 @@ pub mod foo {
                     &mut self,
                 ) -> (
                     Option<bool>,
-                    Option<()>,
+                    Option<(u32,)>,
                     Option<u32>,
                     Option<E1>,
                     Option<f32>,
@@ -596,7 +635,7 @@ pub mod foo {
                     a: Result<(), ()>,
                     b: Result<(), E1>,
                     c: Result<E1, ()>,
-                    d: Result<(), ()>,
+                    d: Result<(u32,), (u32,)>,
                     e: Result<u32, V1>,
                     f: Result<
                         wasmtime::component::__internal::String,
@@ -611,7 +650,7 @@ pub mod foo {
                     Result<(), ()>,
                     Result<(), E1>,
                     Result<E1, ()>,
-                    Result<(), ()>,
+                    Result<(u32,), (u32,)>,
                     Result<u32, V1>,
                     Result<
                         wasmtime::component::__internal::String,
@@ -648,16 +687,15 @@ pub mod foo {
                     Host::is_clone_return(*self)
                 }
             }
-            pub fn add_to_linker<T, D>(
-                linker: &mut wasmtime::component::Linker<T>,
+            pub fn add_to_linker_instance<T, D>(
+                inst: &mut wasmtime::component::LinkerInstance<'_, T>,
                 host_getter: fn(&mut T) -> D::Data<'_>,
             ) -> wasmtime::Result<()>
             where
-                D: HostWithStore,
+                D: HostWithStore<T>,
                 for<'a> D::Data<'a>: Host,
                 T: 'static,
             {
-                let mut inst = linker.instance("foo:foo/variants")?;
                 inst.func_wrap(
                     "e1-arg",
                     move |mut caller: wasmtime::StoreContextMut<'_, T>, (arg0,): (E1,)| {
@@ -722,7 +760,7 @@ pub mod foo {
                             arg5,
                         ): (
                             Option<bool>,
-                            Option<()>,
+                            Option<(u32,)>,
                             Option<u32>,
                             Option<E1>,
                             Option<f32>,
@@ -783,7 +821,7 @@ pub mod foo {
                             Result<(), ()>,
                             Result<(), E1>,
                             Result<E1, ()>,
-                            Result<(), ()>,
+                            Result<(u32,), (u32,)>,
                             Result<u32, V1>,
                             Result<
                                 wasmtime::component::__internal::String,
@@ -889,6 +927,18 @@ pub mod foo {
                 )?;
                 Ok(())
             }
+            pub fn add_to_linker<T, D>(
+                linker: &mut wasmtime::component::Linker<T>,
+                host_getter: fn(&mut T) -> D::Data<'_>,
+            ) -> wasmtime::Result<()>
+            where
+                D: HostWithStore<T>,
+                for<'a> D::Data<'a>: Host,
+                T: 'static,
+            {
+                let mut inst = linker.instance("foo:foo/variants")?;
+                add_to_linker_instance::<T, D>(&mut inst, host_getter)
+            }
         }
     }
 }
@@ -909,11 +959,11 @@ pub mod exports {
                     #[component(name = "a")]
                     A,
                 }
-                impl core::fmt::Debug for E1 {
+                impl ::core::fmt::Debug for E1 {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         match self {
                             E1::A => f.debug_tuple("E1::A").finish(),
                         }
@@ -928,21 +978,24 @@ pub mod exports {
                 #[derive(wasmtime::component::Lower)]
                 #[component(record)]
                 #[derive(Clone, Copy)]
-                pub struct Empty {}
-                impl core::fmt::Debug for Empty {
+                pub struct Empty {
+                    #[component(name = "a")]
+                    pub a: u32,
+                }
+                impl ::core::fmt::Debug for Empty {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
-                        f.debug_struct("Empty").finish()
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
+                        f.debug_struct("Empty").field("a", &self.a).finish()
                     }
                 }
                 const _: () = {
                     assert!(
-                        0 == < Empty as wasmtime::component::ComponentType >::SIZE32
+                        4 == < Empty as wasmtime::component::ComponentType >::SIZE32
                     );
                     assert!(
-                        1 == < Empty as wasmtime::component::ComponentType >::ALIGN32
+                        4 == < Empty as wasmtime::component::ComponentType >::ALIGN32
                     );
                 };
                 #[derive(wasmtime::component::ComponentType)]
@@ -964,11 +1017,11 @@ pub mod exports {
                     #[component(name = "g")]
                     G(u32),
                 }
-                impl core::fmt::Debug for V1 {
+                impl ::core::fmt::Debug for V1 {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         match self {
                             V1::A => f.debug_tuple("V1::A").finish(),
                             V1::C(e) => f.debug_tuple("V1::C").field(e).finish(),
@@ -994,11 +1047,11 @@ pub mod exports {
                     #[component(name = "b")]
                     B(f32),
                 }
-                impl core::fmt::Debug for Casts1 {
+                impl ::core::fmt::Debug for Casts1 {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         match self {
                             Casts1::A(e) => f.debug_tuple("Casts1::A").field(e).finish(),
                             Casts1::B(e) => f.debug_tuple("Casts1::B").field(e).finish(),
@@ -1024,11 +1077,11 @@ pub mod exports {
                     #[component(name = "b")]
                     B(f32),
                 }
-                impl core::fmt::Debug for Casts2 {
+                impl ::core::fmt::Debug for Casts2 {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         match self {
                             Casts2::A(e) => f.debug_tuple("Casts2::A").field(e).finish(),
                             Casts2::B(e) => f.debug_tuple("Casts2::B").field(e).finish(),
@@ -1054,11 +1107,11 @@ pub mod exports {
                     #[component(name = "b")]
                     B(u64),
                 }
-                impl core::fmt::Debug for Casts3 {
+                impl ::core::fmt::Debug for Casts3 {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         match self {
                             Casts3::A(e) => f.debug_tuple("Casts3::A").field(e).finish(),
                             Casts3::B(e) => f.debug_tuple("Casts3::B").field(e).finish(),
@@ -1084,11 +1137,11 @@ pub mod exports {
                     #[component(name = "b")]
                     B(i64),
                 }
-                impl core::fmt::Debug for Casts4 {
+                impl ::core::fmt::Debug for Casts4 {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         match self {
                             Casts4::A(e) => f.debug_tuple("Casts4::A").field(e).finish(),
                             Casts4::B(e) => f.debug_tuple("Casts4::B").field(e).finish(),
@@ -1114,11 +1167,11 @@ pub mod exports {
                     #[component(name = "b")]
                     B(i64),
                 }
-                impl core::fmt::Debug for Casts5 {
+                impl ::core::fmt::Debug for Casts5 {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         match self {
                             Casts5::A(e) => f.debug_tuple("Casts5::A").field(e).finish(),
                             Casts5::B(e) => f.debug_tuple("Casts5::B").field(e).finish(),
@@ -1144,11 +1197,11 @@ pub mod exports {
                     #[component(name = "b")]
                     B((u32, u32)),
                 }
-                impl core::fmt::Debug for Casts6 {
+                impl ::core::fmt::Debug for Casts6 {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         match self {
                             Casts6::A(e) => f.debug_tuple("Casts6::A").field(e).finish(),
                             Casts6::B(e) => f.debug_tuple("Casts6::B").field(e).finish(),
@@ -1189,11 +1242,11 @@ pub mod exports {
                         }
                     }
                 }
-                impl core::fmt::Debug for MyErrno {
+                impl ::core::fmt::Debug for MyErrno {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         f.debug_struct("MyErrno")
                             .field("code", &(*self as i32))
                             .field("name", &self.name())
@@ -1201,15 +1254,15 @@ pub mod exports {
                             .finish()
                     }
                 }
-                impl core::fmt::Display for MyErrno {
+                impl ::core::fmt::Display for MyErrno {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         write!(f, "{} (error {})", self.name(), * self as i32)
                     }
                 }
-                impl core::error::Error for MyErrno {}
+                impl ::core::error::Error for MyErrno {}
                 const _: () = {
                     assert!(
                         1 == < MyErrno as wasmtime::component::ComponentType >::SIZE32
@@ -1227,11 +1280,11 @@ pub mod exports {
                     #[component(name = "v1")]
                     pub v1: V1,
                 }
-                impl core::fmt::Debug for IsClone {
+                impl ::core::fmt::Debug for IsClone {
                     fn fmt(
                         &self,
-                        f: &mut core::fmt::Formatter<'_>,
-                    ) -> core::fmt::Result {
+                        f: &mut ::core::fmt::Formatter<'_>,
+                    ) -> ::core::fmt::Result {
                         f.debug_struct("IsClone").field("v1", &self.v1).finish()
                     }
                 }
@@ -1307,7 +1360,7 @@ pub mod exports {
                                     "no exported instance named `foo:foo/variants`"
                                 )
                             })?;
-                        let mut lookup = move |name| {
+                        let mut lookup = move |name: &str| {
                             _instance_pre
                                 .component()
                                 .get_export_index(Some(&instance), name)
@@ -1397,7 +1450,7 @@ pub mod exports {
                             .get_typed_func::<
                                 (
                                     Option<bool>,
-                                    Option<()>,
+                                    Option<(u32,)>,
                                     Option<u32>,
                                     Option<E1>,
                                     Option<f32>,
@@ -1412,7 +1465,7 @@ pub mod exports {
                                 (
                                     (
                                         Option<bool>,
-                                        Option<()>,
+                                        Option<(u32,)>,
                                         Option<u32>,
                                         Option<E1>,
                                         Option<f32>,
@@ -1433,7 +1486,7 @@ pub mod exports {
                                     Result<(), ()>,
                                     Result<(), E1>,
                                     Result<E1, ()>,
-                                    Result<(), ()>,
+                                    Result<(u32,), (u32,)>,
                                     Result<u32, &V1>,
                                     Result<&str, &[u8]>,
                                 ),
@@ -1448,7 +1501,7 @@ pub mod exports {
                                         Result<(), ()>,
                                         Result<(), E1>,
                                         Result<E1, ()>,
-                                        Result<(), ()>,
+                                        Result<(u32,), (u32,)>,
                                         Result<u32, V1>,
                                         Result<
                                             wasmtime::component::__internal::String,
@@ -1537,102 +1590,135 @@ pub mod exports {
                     }
                 }
                 impl Guest {
+                    pub fn func_e1_arg(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(E1,), ()> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (E1,),
+                                (),
+                            >::new_unchecked(self.e1_arg)
+                        }
+                    }
                     pub fn call_e1_arg<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                         arg0: E1,
                     ) -> wasmtime::Result<()> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (E1,),
-                                (),
-                            >::new_unchecked(self.e1_arg)
-                        };
+                        let callee = self.func_e1_arg();
                         let () = callee.call(store.as_context_mut(), (arg0,))?;
                         Ok(())
+                    }
+                    pub fn func_e1_result(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (E1,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (E1,),
+                            >::new_unchecked(self.e1_result)
+                        }
                     }
                     pub fn call_e1_result<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<E1> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (E1,),
-                            >::new_unchecked(self.e1_result)
-                        };
+                        let callee = self.func_e1_result();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_v1_arg(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(&V1,), ()> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (&V1,),
+                                (),
+                            >::new_unchecked(self.v1_arg)
+                        }
                     }
                     pub fn call_v1_arg<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                         arg0: &V1,
                     ) -> wasmtime::Result<()> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (&V1,),
-                                (),
-                            >::new_unchecked(self.v1_arg)
-                        };
+                        let callee = self.func_v1_arg();
                         let () = callee.call(store.as_context_mut(), (arg0,))?;
                         Ok(())
+                    }
+                    pub fn func_v1_result(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (V1,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (V1,),
+                            >::new_unchecked(self.v1_result)
+                        }
                     }
                     pub fn call_v1_result<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<V1> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (V1,),
-                            >::new_unchecked(self.v1_result)
-                        };
+                        let callee = self.func_v1_result();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_bool_arg(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(bool,), ()> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (bool,),
+                                (),
+                            >::new_unchecked(self.bool_arg)
+                        }
                     }
                     pub fn call_bool_arg<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                         arg0: bool,
                     ) -> wasmtime::Result<()> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (bool,),
-                                (),
-                            >::new_unchecked(self.bool_arg)
-                        };
+                        let callee = self.func_bool_arg();
                         let () = callee.call(store.as_context_mut(), (arg0,))?;
                         Ok(())
+                    }
+                    pub fn func_bool_result(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (bool,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (bool,),
+                            >::new_unchecked(self.bool_result)
+                        }
                     }
                     pub fn call_bool_result<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<bool> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (bool,),
-                            >::new_unchecked(self.bool_result)
-                        };
+                        let callee = self.func_bool_result();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
                     }
-                    pub fn call_option_arg<S: wasmtime::AsContextMut>(
+                    pub fn func_option_arg(
                         &self,
-                        mut store: S,
-                        arg0: Option<bool>,
-                        arg1: Option<()>,
-                        arg2: Option<u32>,
-                        arg3: Option<E1>,
-                        arg4: Option<f32>,
-                        arg5: Option<Option<bool>>,
-                    ) -> wasmtime::Result<()> {
-                        let callee = unsafe {
+                    ) -> wasmtime::component::TypedFunc<
+                        (
+                            Option<bool>,
+                            Option<(u32,)>,
+                            Option<u32>,
+                            Option<E1>,
+                            Option<f32>,
+                            Option<Option<bool>>,
+                        ),
+                        (),
+                    > {
+                        unsafe {
                             wasmtime::component::TypedFunc::<
                                 (
                                     Option<bool>,
-                                    Option<()>,
+                                    Option<(u32,)>,
                                     Option<u32>,
                                     Option<E1>,
                                     Option<f32>,
@@ -1640,7 +1726,19 @@ pub mod exports {
                                 ),
                                 (),
                             >::new_unchecked(self.option_arg)
-                        };
+                        }
+                    }
+                    pub fn call_option_arg<S: wasmtime::AsContextMut>(
+                        &self,
+                        mut store: S,
+                        arg0: Option<bool>,
+                        arg1: Option<(u32,)>,
+                        arg2: Option<u32>,
+                        arg3: Option<E1>,
+                        arg4: Option<f32>,
+                        arg5: Option<Option<bool>>,
+                    ) -> wasmtime::Result<()> {
+                        let callee = self.func_option_arg();
                         let () = callee
                             .call(
                                 store.as_context_mut(),
@@ -1648,26 +1746,28 @@ pub mod exports {
                             )?;
                         Ok(())
                     }
-                    pub fn call_option_result<S: wasmtime::AsContextMut>(
+                    pub fn func_option_result(
                         &self,
-                        mut store: S,
-                    ) -> wasmtime::Result<
+                    ) -> wasmtime::component::TypedFunc<
+                        (),
                         (
-                            Option<bool>,
-                            Option<()>,
-                            Option<u32>,
-                            Option<E1>,
-                            Option<f32>,
-                            Option<Option<bool>>,
+                            (
+                                Option<bool>,
+                                Option<(u32,)>,
+                                Option<u32>,
+                                Option<E1>,
+                                Option<f32>,
+                                Option<Option<bool>>,
+                            ),
                         ),
                     > {
-                        let callee = unsafe {
+                        unsafe {
                             wasmtime::component::TypedFunc::<
                                 (),
                                 (
                                     (
                                         Option<bool>,
-                                        Option<()>,
+                                        Option<(u32,)>,
                                         Option<u32>,
                                         Option<E1>,
                                         Option<f32>,
@@ -1675,9 +1775,37 @@ pub mod exports {
                                     ),
                                 ),
                             >::new_unchecked(self.option_result)
-                        };
+                        }
+                    }
+                    pub fn call_option_result<S: wasmtime::AsContextMut>(
+                        &self,
+                        mut store: S,
+                    ) -> wasmtime::Result<
+                        (
+                            Option<bool>,
+                            Option<(u32,)>,
+                            Option<u32>,
+                            Option<E1>,
+                            Option<f32>,
+                            Option<Option<bool>>,
+                        ),
+                    > {
+                        let callee = self.func_option_result();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_casts(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<
+                        (Casts1, Casts2, Casts3, Casts4, Casts5, Casts6),
+                        ((Casts1, Casts2, Casts3, Casts4, Casts5, Casts6),),
+                    > {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (Casts1, Casts2, Casts3, Casts4, Casts5, Casts6),
+                                ((Casts1, Casts2, Casts3, Casts4, Casts5, Casts6),),
+                            >::new_unchecked(self.casts)
+                        }
                     }
                     pub fn call_casts<S: wasmtime::AsContextMut>(
                         &self,
@@ -1691,12 +1819,7 @@ pub mod exports {
                     ) -> wasmtime::Result<
                         (Casts1, Casts2, Casts3, Casts4, Casts5, Casts6),
                     > {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (Casts1, Casts2, Casts3, Casts4, Casts5, Casts6),
-                                ((Casts1, Casts2, Casts3, Casts4, Casts5, Casts6),),
-                            >::new_unchecked(self.casts)
-                        };
+                        let callee = self.func_casts();
                         let (ret0,) = callee
                             .call(
                                 store.as_context_mut(),
@@ -1704,35 +1827,87 @@ pub mod exports {
                             )?;
                         Ok(ret0)
                     }
+                    pub fn func_result_arg(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<
+                        (
+                            Result<(), ()>,
+                            Result<(), E1>,
+                            Result<E1, ()>,
+                            Result<(u32,), (u32,)>,
+                            Result<u32, &V1>,
+                            Result<&str, &[u8]>,
+                        ),
+                        (),
+                    > {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (
+                                    Result<(), ()>,
+                                    Result<(), E1>,
+                                    Result<E1, ()>,
+                                    Result<(u32,), (u32,)>,
+                                    Result<u32, &V1>,
+                                    Result<&str, &[u8]>,
+                                ),
+                                (),
+                            >::new_unchecked(self.result_arg)
+                        }
+                    }
                     pub fn call_result_arg<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                         arg0: Result<(), ()>,
                         arg1: Result<(), E1>,
                         arg2: Result<E1, ()>,
-                        arg3: Result<(), ()>,
+                        arg3: Result<(u32,), (u32,)>,
                         arg4: Result<u32, &V1>,
                         arg5: Result<&str, &[u8]>,
                     ) -> wasmtime::Result<()> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (
-                                    Result<(), ()>,
-                                    Result<(), E1>,
-                                    Result<E1, ()>,
-                                    Result<(), ()>,
-                                    Result<u32, &V1>,
-                                    Result<&str, &[u8]>,
-                                ),
-                                (),
-                            >::new_unchecked(self.result_arg)
-                        };
+                        let callee = self.func_result_arg();
                         let () = callee
                             .call(
                                 store.as_context_mut(),
                                 (arg0, arg1, arg2, arg3, arg4, arg5),
                             )?;
                         Ok(())
+                    }
+                    pub fn func_result_result(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<
+                        (),
+                        (
+                            (
+                                Result<(), ()>,
+                                Result<(), E1>,
+                                Result<E1, ()>,
+                                Result<(u32,), (u32,)>,
+                                Result<u32, V1>,
+                                Result<
+                                    wasmtime::component::__internal::String,
+                                    wasmtime::component::__internal::Vec<u8>,
+                                >,
+                            ),
+                        ),
+                    > {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (
+                                    (
+                                        Result<(), ()>,
+                                        Result<(), E1>,
+                                        Result<E1, ()>,
+                                        Result<(u32,), (u32,)>,
+                                        Result<u32, V1>,
+                                        Result<
+                                            wasmtime::component::__internal::String,
+                                            wasmtime::component::__internal::Vec<u8>,
+                                        >,
+                                    ),
+                                ),
+                            >::new_unchecked(self.result_result)
+                        }
                     }
                     pub fn call_result_result<S: wasmtime::AsContextMut>(
                         &self,
@@ -1742,7 +1917,7 @@ pub mod exports {
                             Result<(), ()>,
                             Result<(), E1>,
                             Result<E1, ()>,
-                            Result<(), ()>,
+                            Result<(u32,), (u32,)>,
                             Result<u32, V1>,
                             Result<
                                 wasmtime::component::__internal::String,
@@ -1750,142 +1925,176 @@ pub mod exports {
                             >,
                         ),
                     > {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (
-                                    (
-                                        Result<(), ()>,
-                                        Result<(), E1>,
-                                        Result<E1, ()>,
-                                        Result<(), ()>,
-                                        Result<u32, V1>,
-                                        Result<
-                                            wasmtime::component::__internal::String,
-                                            wasmtime::component::__internal::Vec<u8>,
-                                        >,
-                                    ),
-                                ),
-                            >::new_unchecked(self.result_result)
-                        };
+                        let callee = self.func_result_result();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_return_result_sugar(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (Result<i32, MyErrno>,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (Result<i32, MyErrno>,),
+                            >::new_unchecked(self.return_result_sugar)
+                        }
                     }
                     pub fn call_return_result_sugar<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<Result<i32, MyErrno>> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (Result<i32, MyErrno>,),
-                            >::new_unchecked(self.return_result_sugar)
-                        };
+                        let callee = self.func_return_result_sugar();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_return_result_sugar2(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (Result<(), MyErrno>,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (Result<(), MyErrno>,),
+                            >::new_unchecked(self.return_result_sugar2)
+                        }
                     }
                     pub fn call_return_result_sugar2<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<Result<(), MyErrno>> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (Result<(), MyErrno>,),
-                            >::new_unchecked(self.return_result_sugar2)
-                        };
+                        let callee = self.func_return_result_sugar2();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_return_result_sugar3(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<
+                        (),
+                        (Result<MyErrno, MyErrno>,),
+                    > {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (Result<MyErrno, MyErrno>,),
+                            >::new_unchecked(self.return_result_sugar3)
+                        }
                     }
                     pub fn call_return_result_sugar3<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<Result<MyErrno, MyErrno>> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (Result<MyErrno, MyErrno>,),
-                            >::new_unchecked(self.return_result_sugar3)
-                        };
+                        let callee = self.func_return_result_sugar3();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_return_result_sugar4(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<
+                        (),
+                        (Result<(i32, u32), MyErrno>,),
+                    > {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (Result<(i32, u32), MyErrno>,),
+                            >::new_unchecked(self.return_result_sugar4)
+                        }
                     }
                     pub fn call_return_result_sugar4<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<Result<(i32, u32), MyErrno>> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (Result<(i32, u32), MyErrno>,),
-                            >::new_unchecked(self.return_result_sugar4)
-                        };
+                        let callee = self.func_return_result_sugar4();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_return_option_sugar(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (Option<i32>,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (Option<i32>,),
+                            >::new_unchecked(self.return_option_sugar)
+                        }
                     }
                     pub fn call_return_option_sugar<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<Option<i32>> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (Option<i32>,),
-                            >::new_unchecked(self.return_option_sugar)
-                        };
+                        let callee = self.func_return_option_sugar();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_return_option_sugar2(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (Option<MyErrno>,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (Option<MyErrno>,),
+                            >::new_unchecked(self.return_option_sugar2)
+                        }
                     }
                     pub fn call_return_option_sugar2<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<Option<MyErrno>> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (Option<MyErrno>,),
-                            >::new_unchecked(self.return_option_sugar2)
-                        };
+                        let callee = self.func_return_option_sugar2();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_result_simple(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (Result<u32, i32>,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (Result<u32, i32>,),
+                            >::new_unchecked(self.result_simple)
+                        }
                     }
                     pub fn call_result_simple<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<Result<u32, i32>> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (Result<u32, i32>,),
-                            >::new_unchecked(self.result_simple)
-                        };
+                        let callee = self.func_result_simple();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
+                    }
+                    pub fn func_is_clone_arg(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(&IsClone,), ()> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (&IsClone,),
+                                (),
+                            >::new_unchecked(self.is_clone_arg)
+                        }
                     }
                     pub fn call_is_clone_arg<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                         arg0: &IsClone,
                     ) -> wasmtime::Result<()> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (&IsClone,),
-                                (),
-                            >::new_unchecked(self.is_clone_arg)
-                        };
+                        let callee = self.func_is_clone_arg();
                         let () = callee.call(store.as_context_mut(), (arg0,))?;
                         Ok(())
+                    }
+                    pub fn func_is_clone_return(
+                        &self,
+                    ) -> wasmtime::component::TypedFunc<(), (IsClone,)> {
+                        unsafe {
+                            wasmtime::component::TypedFunc::<
+                                (),
+                                (IsClone,),
+                            >::new_unchecked(self.is_clone_return)
+                        }
                     }
                     pub fn call_is_clone_return<S: wasmtime::AsContextMut>(
                         &self,
                         mut store: S,
                     ) -> wasmtime::Result<IsClone> {
-                        let callee = unsafe {
-                            wasmtime::component::TypedFunc::<
-                                (),
-                                (IsClone,),
-                            >::new_unchecked(self.is_clone_return)
-                        };
+                        let callee = self.func_is_clone_return();
                         let (ret0,) = callee.call(store.as_context_mut(), ())?;
                         Ok(ret0)
                     }

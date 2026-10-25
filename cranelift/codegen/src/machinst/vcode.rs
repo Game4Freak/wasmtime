@@ -211,7 +211,7 @@ pub struct VCode<I: VCodeInst> {
 /// and optionally metadata about the code layout.
 pub struct EmitResult {
     /// The MachBuffer containing the machine code.
-    pub buffer: MachBufferFinalized<Stencil>,
+    pub buffer: MachBufferFinalized,
 
     /// Offset of each basic block, recorded during emission. Computed
     /// only if `machine_code_cfg_info` is enabled.
@@ -739,7 +739,7 @@ impl<I: VCodeInst> VCode<I> {
         want_disasm: bool,
         flags: &settings::Flags,
         ctrl_plane: &mut ControlPlane,
-    ) -> EmitResult
+    ) -> CodegenResult<EmitResult>
     where
         I: VCodeInst,
     {
@@ -783,7 +783,7 @@ impl<I: VCodeInst> VCode<I> {
             regalloc.num_spillslots,
             clobbers,
             function_calls,
-        );
+        )?;
 
         // Emit blocks.
         let mut cur_srcloc = None;
@@ -820,7 +820,7 @@ impl<I: VCodeInst> VCode<I> {
         };
         let mut total_bb_padding = 0;
 
-        for (block_order_idx, &block) in final_order.iter().enumerate() {
+        for &block in final_order.iter() {
             trace!("emitting block {:?}", block);
 
             // Call the new block hook for state
@@ -835,15 +835,35 @@ impl<I: VCodeInst> VCode<I> {
             }
             assert_eq!(buffer.cur_offset(), new_offset);
 
-            let do_emit = |inst: &I,
-                           disasm: &mut String,
-                           buffer: &mut MachBuffer<I>,
-                           state: &mut I::State| {
+            // The buffer maintains its deadline invariant per-`MachInst`:
+            // after each instruction, ensure that the worst-case end of any
+            // island the buffer might emit lies before the soonest deadline,
+            // even after the next instruction.
+            let emit_island_if_needed = |buffer: &mut MachBuffer<I>, state: &mut I::State| {
+                let lookahead = I::worst_case_size() + I::worst_case_island_growth();
+                if buffer.island_needed(lookahead) {
+                    let jump_around = buffer.get_label();
+                    I::gen_jump(jump_around).emit(buffer, &self.emit_info, state);
+                    buffer.emit_island(0, state.ctrl_plane_mut());
+                    buffer.bind_label(jump_around, state.ctrl_plane_mut());
+                }
+            };
+            let emit_inst = |inst: &I,
+                             disasm: &mut String,
+                             buffer: &mut MachBuffer<I>,
+                             state: &mut I::State| {
                 if want_disasm && !inst.is_args() {
                     let mut s = state.clone();
                     writeln!(disasm, "  {}", inst.pretty_print_inst(&mut s)).unwrap();
                 }
                 inst.emit(buffer, &self.emit_info, state);
+            };
+            let do_emit = |inst: &I,
+                           disasm: &mut String,
+                           buffer: &mut MachBuffer<I>,
+                           state: &mut I::State| {
+                emit_inst(inst, disasm, buffer, state);
+                emit_island_if_needed(buffer, state);
             };
 
             // Is this the first block? Emit the prologue directly if so.
@@ -1018,16 +1038,19 @@ impl<I: VCodeInst> VCode<I> {
                             log::trace!("emitting: {:?}", self.insts[iix.index()]);
 
                             // Emit the instruction!
-                            do_emit(
+                            emit_inst(
                                 &self.insts[iix.index()],
                                 &mut disasm,
                                 &mut buffer,
                                 &mut state,
                             );
 
+                            // Place post-position tags at the instruction's
+                            // end, before any island that follows it.
                             if debug_tag_pos == MachDebugTagPos::Post {
                                 place_debug_tags(&self, debug_tag_pos, &mut buffer);
                             }
+                            emit_island_if_needed(&mut buffer, &mut state);
 
                             if let Some(stack_map_disasm) = stack_map_disasm {
                                 disasm.push_str(&stack_map_disasm);
@@ -1080,27 +1103,6 @@ impl<I: VCodeInst> VCode<I> {
                 cur_srcloc = None;
             }
 
-            // Do we need an island? Get the worst-case size of the next BB, add
-            // it to the optional padding behind the block, and pass this to the
-            // `MachBuffer` to determine if an island is necessary.
-            let worst_case_next_bb = if block_order_idx < final_order.len() - 1 {
-                let next_block = final_order[block_order_idx + 1];
-                let next_block_range = self.block_ranges.get(next_block.index());
-                let next_block_size = next_block_range.len() as u32;
-                let next_block_ra_insertions = ra_edits_per_block[next_block.index()];
-                I::worst_case_size() * (next_block_size + next_block_ra_insertions)
-            } else {
-                0
-            };
-            let padding = if bb_padding.is_empty() {
-                0
-            } else {
-                bb_padding.len() as u32 + I::LabelUse::ALIGN - 1
-            };
-            if buffer.island_needed(padding + worst_case_next_bb) {
-                buffer.emit_island(padding + worst_case_next_bb, ctrl_plane);
-            }
-
             // Insert padding, if configured, to stress the `MachBuffer`'s
             // relocation and island calculations.
             //
@@ -1110,6 +1112,18 @@ impl<I: VCodeInst> VCode<I> {
             // test case generating a GB+ memory footprint in Cranelift for
             // example.
             if !bb_padding.is_empty() {
+                // The padding bytes go directly into the buffer without
+                // passing through `do_emit`, so check the deadline invariant
+                // *before* writing them: if the padding would push the
+                // worst-case end of an island past any pending deadline,
+                // drain pending fixups via an island now. We're between
+                // blocks, so no jump-around is needed.
+                let padding_len = bb_padding.len() as u32 + I::LabelUse::ALIGN - 1;
+                let lookahead = I::worst_case_size() + I::worst_case_island_growth();
+                if buffer.island_needed(padding_len + lookahead) {
+                    buffer.emit_island(padding_len + lookahead, ctrl_plane);
+                }
+
                 buffer.put_data(&bb_padding);
                 buffer.align_to(I::LabelUse::ALIGN);
                 total_bb_padding += bb_padding.len();
@@ -1162,13 +1176,13 @@ impl<I: VCodeInst> VCode<I> {
         // Store metadata about frame layout in the MachBuffer.
         buffer.set_frame_layout(self.abi.frame_slot_metadata());
 
-        EmitResult {
+        Ok(EmitResult {
             buffer: buffer.finish(&self.constants, ctrl_plane),
             bb_offsets,
             bb_edges,
             disasm: if want_disasm { Some(disasm) } else { None },
             value_labels_ranges,
-        }
+        })
     }
 
     fn monotonize_inst_offsets(&self, inst_offsets: &mut [CodeOffset], func_body_len: u32) {
@@ -1716,7 +1730,7 @@ impl<I: VCodeInst> VRegAllocator<I> {
             return Err(CodegenError::CodeTooLarge);
         }
         let v = self.vreg_types.len();
-        let (regclasses, tys) = I::rc_for_type(ty)?;
+        let (regclasses, tys) = I::rc_for_type(&ty)?;
 
         // Check that new indices are in-bounds for regalloc2's
         // VReg/Operand representation.
@@ -1772,7 +1786,7 @@ impl<I: VCodeInst> VRegAllocator<I> {
     /// registers for the given type. This is meant to be used with
     /// deferred allocation errors (see `Lower::alloc_tmp()`).
     fn bogus_for_deferred_error(&self, ty: Type) -> ValueRegs<Reg> {
-        let (regclasses, _tys) = I::rc_for_type(ty).expect("must have valid type");
+        let (regclasses, _tys) = I::rc_for_type(&ty).expect("must have valid type");
         match regclasses {
             &[rc0] => ValueRegs::one(VReg::new(0, rc0).into()),
             &[rc0, rc1] => ValueRegs::two(VReg::new(0, rc0).into(), VReg::new(1, rc1).into()),

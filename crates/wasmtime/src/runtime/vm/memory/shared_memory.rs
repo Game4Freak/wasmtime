@@ -41,8 +41,7 @@ impl SharedMemory {
         // `assert_ready` should never panic.
         let (minimum_bytes, maximum_bytes) = vm::assert_ready(Memory::limit_new(ty, None))?;
         let mmap_memory = MmapMemory::new(ty, &memory_tunables, minimum_bytes, maximum_bytes)?;
-        let boxed: Box<dyn crate::runtime::vm::RuntimeLinearMemory> =
-            try_new::<Box<_>>(mmap_memory)?;
+        let boxed: Box<dyn crate::LinearMemory> = try_new::<Box<_>>(mmap_memory)?;
         Self::wrap(
             engine,
             ty,
@@ -87,7 +86,7 @@ impl SharedMemory {
         NonNull::from(&self.0.def.0)
     }
 
-    /// Same as `RuntimeLinearMemory::grow`, except with `&self`.
+    /// Same as `LocalMemory::grow`, except with `&self`.
     pub fn grow(&self, delta_pages: u64) -> Result<Option<(usize, usize)>, Error> {
         let mut memory = self.0.memory.write().unwrap();
         // Without a limiter being passed in this shouldn't have an await point,
@@ -146,6 +145,9 @@ impl SharedMemory {
         assert!(std::mem::size_of::<AtomicU32>() == 4);
         assert!(std::mem::align_of::<AtomicU32>() <= 4);
         let atomic = unsafe { AtomicU32::from_ptr(addr.cast()) };
+        // Wasm linear memory is always little-endian, but `AtomicU32` uses the
+        // host's native endianness.
+        let expected = expected.to_le();
 
         // Note that `checked_add` is used such that when `timeout` is too large
         // it'll cause there to be no timeout at all if we can't represent the
@@ -175,6 +177,9 @@ impl SharedMemory {
         assert!(std::mem::size_of::<AtomicU64>() == 8);
         assert!(std::mem::align_of::<AtomicU64>() <= 8);
         let atomic = unsafe { AtomicU64::from_ptr(addr.cast()) };
+        // Wasm linear memory is always little-endian, but `AtomicU64` uses the
+        // host's native endianness.
+        let expected = expected.to_le();
 
         // See `atomic_wait32` for why this is using `checked_add`.
         let deadline = timeout.and_then(|d| Instant::now().checked_add(d));

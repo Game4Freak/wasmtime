@@ -6,7 +6,8 @@ target riscv64
 
 function %callee_i64(i64) -> i64 tail {
 block0(v0: i64):
-    v1 = iadd_imm.i64 v0, 10
+    v2 = iconst.i64 10
+    v1 = iadd v0, v2
     return v1
 }
 
@@ -269,8 +270,8 @@ block0:
 ;   mv fp,sp
 ;   addi sp,sp,-144
 ;   sd ra,8(sp)
-;   ld fp,144(sp)
-;   sd fp,0(sp)
+;   ld t6,144(sp)
+;   sd t6,0(sp)
 ;   mv fp,sp
 ;   addi sp,sp,-112
 ;   sd s1,104(sp)
@@ -344,8 +345,8 @@ block0:
 ;   mv s0, sp
 ;   addi sp, sp, -0x90
 ;   sd ra, 8(sp)
-;   ld s0, 0x90(sp)
-;   sd s0, 0(sp)
+;   ld t6, 0x90(sp)
+;   sd t6, 0(sp)
 ;   mv s0, sp
 ;   addi sp, sp, -0x70
 ;   sd s1, 0x68(sp)
@@ -543,8 +544,8 @@ block2:
 ;   mv fp,sp
 ;   addi sp,sp,-160
 ;   sd ra,8(sp)
-;   ld fp,160(sp)
-;   sd fp,0(sp)
+;   ld t6,160(sp)
+;   sd t6,0(sp)
 ;   mv fp,sp
 ;   addi sp,sp,-128
 ;   sd s1,120(sp)
@@ -648,8 +649,8 @@ block2:
 ;   mv s0, sp
 ;   addi sp, sp, -0xa0
 ;   sd ra, 8(sp)
-;   ld s0, 0xa0(sp)
-;   sd s0, 0(sp)
+;   ld t6, 0xa0(sp)
+;   sd t6, 0(sp)
 ;   mv s0, sp
 ;   addi sp, sp, -0x80
 ;   sd s1, 0x78(sp)

@@ -492,11 +492,10 @@ stack overflow checks in the prologue.
 ### Global values
 
 A *global value* is an object whose value is not known at compile time. The
-value is computed at runtime by `global_value`, possibly using
-information provided by the linker via relocations. There are multiple
-kinds of global values using different methods for determining their value.
-Cranelift does not track the type of a global value, for they are just
-values stored in non-stack memory.
+value is computed at runtime, possibly using information provided by the linker
+via relocations. There are multiple kinds of global values using different
+methods for determining their value. Cranelift does not track the type of a
+global value, for they are just values stored in non-stack memory.
 
 When Cranelift is generating code for a virtual machine environment, globals can
 be used to access data structures in the VM's runtime. This requires functions
@@ -644,7 +643,7 @@ slot on the stack for its entire live range. Since the live range of an SSA
 value can be quite large, it is sometimes beneficial to split the live range
 into smaller parts.
 
-A live range is split by creating new SSA values that are copies or the
+A live range is split by creating new SSA values that are copies of the
 original value or each other. The copies are created by inserting `copy`,
 `spill`, or `fill` instructions, depending on whether the values
 are assigned to registers or stack slots.

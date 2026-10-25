@@ -135,29 +135,35 @@ void wasmtime_memory_image_free(struct wasmtime_memory_image *image) {
 // Multi-threaded TLS using pthread
 #include <pthread.h>
 
-static pthread_key_t wasmtime_tls_key;
+static pthread_key_t wasmtime_tls_keys[2];
 static pthread_once_t wasmtime_tls_key_once = PTHREAD_ONCE_INIT;
 
-static void make_tls_key(void) { pthread_key_create(&wasmtime_tls_key, NULL); }
-
-uint8_t *wasmtime_tls_get(void) {
-  pthread_once(&wasmtime_tls_key_once, make_tls_key);
-  return (uint8_t *)pthread_getspecific(wasmtime_tls_key);
+static void make_tls_key(void) {
+  pthread_key_create(&wasmtime_tls_keys[0], NULL);
+  pthread_key_create(&wasmtime_tls_keys[1], NULL);
 }
 
-void wasmtime_tls_set(uint8_t *val) {
+uint8_t *wasmtime_tls_get(size_t slot) {
   pthread_once(&wasmtime_tls_key_once, make_tls_key);
-  pthread_setspecific(wasmtime_tls_key, val);
+  return (uint8_t *)pthread_getspecific(wasmtime_tls_keys[slot]);
+}
+
+void wasmtime_tls_set(size_t slot, uint8_t *val) {
+  pthread_once(&wasmtime_tls_key_once, make_tls_key);
+  pthread_setspecific(wasmtime_tls_keys[slot], val);
 }
 
 #else
 
-// Single-threaded TLS using a static variable
-static uint8_t *WASMTIME_TLS = NULL;
+// Thread-local storage via the compiler's native support, which doesn't
+// require any synchronization. Note that this is still per-thread state as
+// separate threads may each be using Wasmtime (for example with a separate
+// `Engine` per thread) even without custom synchronization primitives.
+static _Thread_local uint8_t *WASMTIME_TLS[2] = {NULL, NULL};
 
-uint8_t *wasmtime_tls_get(void) { return WASMTIME_TLS; }
+uint8_t *wasmtime_tls_get(size_t slot) { return WASMTIME_TLS[slot]; }
 
-void wasmtime_tls_set(uint8_t *val) { WASMTIME_TLS = val; }
+void wasmtime_tls_set(size_t slot, uint8_t *val) { WASMTIME_TLS[slot] = val; }
 
 #endif
 
@@ -253,3 +259,18 @@ void wasmtime_sync_rwlock_write_release(uintptr_t *lock) {
 }
 
 #endif // WASMTIME_CUSTOM_SYNC
+
+// The following are not part of Wasmtime's platform API but are instead used
+// by this example embedding's `CustomCodeMemory` implementation to make loaded
+// code executable when Wasmtime itself doesn't use virtual memory (i.e. without
+// `WASMTIME_VIRTUAL_MEMORY`). `ptr` is page-aligned, and the embedding's
+// allocator ensures that the pages spanned by `len` are not shared with any
+// other allocation.
+
+int embedding_publish_executable(const uint8_t *ptr, size_t len) {
+  return mprotect((void *)ptr, len, PROT_READ | PROT_EXEC);
+}
+
+int embedding_unpublish_executable(const uint8_t *ptr, size_t len) {
+  return mprotect((void *)ptr, len, PROT_READ | PROT_WRITE);
+}

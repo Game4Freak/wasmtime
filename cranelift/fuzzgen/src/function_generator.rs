@@ -9,15 +9,16 @@ use cranelift::codegen::ir::instructions::{InstructionFormat, ResolvedConstraint
 use cranelift::codegen::ir::stackslot::StackSize;
 
 use cranelift::codegen::ir::{
-    AliasRegion, AtomicRmwOp, Block, BlockArg, ConstantData, Endianness, ExternalName, FuncRef,
-    Function, LibCall, Opcode, SigRef, Signature, StackSlot, UserExternalName, UserFuncName, Value,
-    types::*,
+    AliasRegionData, AliasRegionSet, AtomicRmwOp, Block, BlockArg, ConstantData, Endianness,
+    ExternalName, FuncRef, Function, LibCall, Opcode, SigRef, Signature, StackSlot,
+    UserExternalName, UserFuncName, Value, types::*,
 };
 use cranelift::codegen::isa::CallConv;
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift::prelude::isa::OwnedTargetIsa;
 use cranelift::prelude::{
-    ExtFuncData, FloatCC, InstBuilder, IntCC, JumpTableData, MemFlags, StackSlotData, StackSlotKind,
+    ExtFuncData, FloatCC, InstBuilder, IntCC, JumpTableData, MemFlagsData, StackSlotData,
+    StackSlotKind,
 };
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
@@ -122,59 +123,6 @@ fn insert_call(
     insert_call_to_function(fgen, builder, opcode, &sig, sig_ref, func_ref)
 }
 
-fn insert_stack_load(
-    fgen: &mut FunctionGenerator,
-    builder: &mut FunctionBuilder,
-    _opcode: Opcode,
-    _args: &[Type],
-    rets: &[Type],
-) -> Result<()> {
-    let typevar = rets[0];
-    let type_size = typevar.bytes();
-    let (slot, slot_size, _align, category) = fgen.stack_slot_with_size(type_size)?;
-
-    // `stack_load` doesn't support setting MemFlags, and it does not set any
-    // alias analysis bits, so we can only emit it for `Other` slots.
-    if category != AACategory::Other {
-        return Err(arbitrary::Error::IncorrectFormat.into());
-    }
-
-    let offset = fgen.u.int_in_range(0..=(slot_size - type_size))? as i32;
-
-    let val = builder.ins().stack_load(typevar, slot, offset);
-    let var = fgen.get_variable_of_type(typevar)?;
-    builder.def_var(var, val);
-
-    Ok(())
-}
-
-fn insert_stack_store(
-    fgen: &mut FunctionGenerator,
-    builder: &mut FunctionBuilder,
-    _opcode: Opcode,
-    args: &[Type],
-    _rets: &[Type],
-) -> Result<()> {
-    let typevar = args[0];
-    let type_size = typevar.bytes();
-
-    let (slot, slot_size, _align, category) = fgen.stack_slot_with_size(type_size)?;
-
-    // `stack_store` doesn't support setting MemFlags, and it does not set any
-    // alias analysis bits, so we can only emit it for `Other` slots.
-    if category != AACategory::Other {
-        return Err(arbitrary::Error::IncorrectFormat.into());
-    }
-
-    let offset = fgen.u.int_in_range(0..=(slot_size - type_size))? as i32;
-
-    let arg0 = fgen.get_variable_of_type(typevar)?;
-    let arg0 = builder.use_var(arg0);
-
-    builder.ins().stack_store(arg0, slot, offset);
-    Ok(())
-}
-
 fn insert_cmp(
     fgen: &mut FunctionGenerator,
     builder: &mut FunctionBuilder,
@@ -256,7 +204,7 @@ fn insert_bitcast(
     let to_var = fgen.get_variable_of_type(rets[0])?;
 
     // TODO: We can generate little/big endian flags here.
-    let mut memflags = MemFlags::new();
+    let mut memflags = MemFlagsData::new();
 
     // When bitcasting between vectors of different lane counts, we need to
     // specify the endianness.
@@ -284,11 +232,13 @@ fn insert_load_store(
     let type_size = ctrl_type.bytes();
 
     let is_atomic = [Opcode::AtomicLoad, Opcode::AtomicStore].contains(&opcode);
-    let (address, flags, offset) =
+    let (address, flags_data, offset) =
         fgen.generate_address_and_memflags(builder, type_size, is_atomic)?;
 
     // The variable being loaded or stored into
     let var = fgen.get_variable_of_type(ctrl_type)?;
+
+    let flags = builder.func.dfg.mem_flags.insert(flags_data).unwrap();
 
     match opcode.format() {
         InstructionFormat::LoadNoOffset => {
@@ -342,7 +292,7 @@ fn insert_atomic_rmw(
     let (address, flags, offset) = fgen.generate_address_and_memflags(builder, type_size, true)?;
 
     // AtomicRMW does not directly support offsets, so add the offset to the address separately.
-    let address = builder.ins().iadd_imm(address, i64::from(offset));
+    let address = builder.ins().iadd_imm_s(address, i64::from(offset));
 
     // Load and store target variables
     let source_var = fgen.get_variable_of_type(ctrl_type)?;
@@ -370,7 +320,7 @@ fn insert_atomic_cas(
     let (address, flags, offset) = fgen.generate_address_and_memflags(builder, type_size, true)?;
 
     // AtomicCas does not directly support offsets, so add the offset to the address separately.
-    let address = builder.ins().iadd_imm(address, i64::from(offset));
+    let address = builder.ins().iadd_imm_s(address, i64::from(offset));
 
     // Source and Target variables
     let expected_var = fgen.get_variable_of_type(ctrl_type)?;
@@ -519,6 +469,9 @@ fn valid_for_target(triple: &Triple, op: Opcode, args: &[Type], rets: &[Type]) -
         // all in fuzzgen just yet.
         Opcode::StackSwitch => return false,
 
+        // Not supported at this time.
+        Opcode::InterruptPoll => return false,
+
         _ => {}
     }
 
@@ -547,7 +500,6 @@ fn valid_for_target(triple: &Triple, op: Opcode, args: &[Type], rets: &[Type]) -
                 (Opcode::Cls, &[I128], &[I128]),
                 // TODO
                 (Opcode::Bitselect, &[_, _, _], &[F32 | F64]),
-                // https://github.com/bytecodealliance/wasmtime/issues/4897
                 // https://github.com/bytecodealliance/wasmtime/issues/4899
                 (
                     Opcode::FcvtToUint
@@ -555,7 +507,7 @@ fn valid_for_target(triple: &Triple, op: Opcode, args: &[Type], rets: &[Type]) -
                         | Opcode::FcvtToSint
                         | Opcode::FcvtToSintSat,
                     &[F32 | F64],
-                    &[I8 | I16 | I128]
+                    &[I128]
                 ),
                 (Opcode::FcvtToUint | Opcode::FcvtToSint, &[F32X4], &[I32X4]),
                 (
@@ -600,17 +552,6 @@ fn valid_for_target(triple: &Triple, op: Opcode, args: &[Type], rets: &[Type]) -
                 // Nothing wrong with this select. But we have an isle rule that can optimize it
                 // into a `min`/`max` instructions, which we don't have implemented yet.
                 (Opcode::Select, &[_, I128, I128]),
-                // These stack accesses can cause segfaults if they are merged into an SSE instruction.
-                // See: #5922
-                (
-                    Opcode::StackStore,
-                    &[I8X16 | I16X8 | I32X4 | I64X2 | F32X4 | F64X2]
-                ),
-                (
-                    Opcode::StackLoad,
-                    &[],
-                    &[I8X16 | I16X8 | I32X4 | I64X2 | F32X4 | F64X2]
-                ),
                 // TODO
                 (
                     Opcode::Sshr | Opcode::Ushr | Opcode::Ishl,
@@ -641,12 +582,7 @@ fn valid_for_target(triple: &Triple, op: Opcode, args: &[Type], rets: &[Type]) -
                 // https://github.com/bytecodealliance/wasmtime/issues/4870
                 (Opcode::Bnot, &[F32 | F64]),
                 (
-                    Opcode::Band
-                        | Opcode::Bor
-                        | Opcode::Bxor
-                        | Opcode::BandNot
-                        | Opcode::BorNot
-                        | Opcode::BxorNot,
+                    Opcode::Band | Opcode::Bor | Opcode::Bxor,
                     &([F32, F32] | [F64, F64])
                 ),
                 // https://github.com/bytecodealliance/wasmtime/issues/5198
@@ -706,12 +642,7 @@ fn valid_for_target(triple: &Triple, op: Opcode, args: &[Type], rets: &[Type]) -
                 ),
                 (Opcode::Bnot, &[F32 | F64]),
                 (
-                    Opcode::Band
-                        | Opcode::Bor
-                        | Opcode::Bxor
-                        | Opcode::BandNot
-                        | Opcode::BorNot
-                        | Opcode::BxorNot,
+                    Opcode::Band | Opcode::Bor | Opcode::Bxor,
                     &([F32, F32] | [F64, F64])
                 ),
                 (
@@ -909,10 +840,7 @@ static OPCODE_SIGNATURES: LazyLock<Vec<OpcodeSignature>> = LazyLock::new(|| {
                 (Opcode::Uload32x2),
                 (Opcode::Sload32x2),
                 (Opcode::StackAddr),
-                (Opcode::DynamicStackLoad),
-                (Opcode::DynamicStackStore),
                 (Opcode::DynamicStackAddr),
-                (Opcode::GlobalValue),
                 (Opcode::SymbolValue),
                 (Opcode::TlsValue),
                 (Opcode::GetPinnedReg),
@@ -921,28 +849,12 @@ static OPCODE_SIGNATURES: LazyLock<Vec<OpcodeSignature>> = LazyLock::new(|| {
                 (Opcode::GetStackPointer),
                 (Opcode::GetReturnAddress),
                 (Opcode::Blendv),
-                (Opcode::IcmpImm),
                 (Opcode::X86Pmulhrsw),
-                (Opcode::IaddImm),
-                (Opcode::ImulImm),
-                (Opcode::UdivImm),
-                (Opcode::SdivImm),
-                (Opcode::UremImm),
-                (Opcode::SremImm),
-                (Opcode::IrsubImm),
                 (Opcode::UaddOverflowCin),
                 (Opcode::SaddOverflowCin),
                 (Opcode::UaddOverflowTrap),
                 (Opcode::UsubOverflowBin),
                 (Opcode::SsubOverflowBin),
-                (Opcode::BandImm),
-                (Opcode::BorImm),
-                (Opcode::BxorImm),
-                (Opcode::RotlImm),
-                (Opcode::RotrImm),
-                (Opcode::IshlImm),
-                (Opcode::UshrImm),
-                (Opcode::SshrImm),
                 (Opcode::ScalarToVector),
                 (Opcode::X86Pmaddubsw),
                 (Opcode::X86Cvtt2dq),
@@ -1078,24 +990,20 @@ fn inserter_for_format(fmt: InstructionFormat) -> OpcodeInserter {
         InstructionFormat::AtomicCas => insert_atomic_cas,
         InstructionFormat::AtomicRmw => insert_atomic_rmw,
         InstructionFormat::Binary => insert_opcode,
-        InstructionFormat::BinaryImm64 => todo!(),
         InstructionFormat::BinaryImm8 => insert_ins_ext_lane,
         InstructionFormat::Call => insert_call,
         InstructionFormat::CallIndirect => insert_call,
         InstructionFormat::CondTrap => todo!(),
-        InstructionFormat::DynamicStackLoad => todo!(),
-        InstructionFormat::DynamicStackStore => todo!(),
+        InstructionFormat::DynamicStackAddr => todo!(),
         InstructionFormat::FloatCompare => insert_cmp,
         InstructionFormat::FuncAddr => todo!(),
         InstructionFormat::IntAddTrap => todo!(),
         InstructionFormat::IntCompare => insert_cmp,
-        InstructionFormat::IntCompareImm => todo!(),
         InstructionFormat::Load => insert_load_store,
         InstructionFormat::LoadNoOffset => insert_load_store,
         InstructionFormat::NullAry => insert_opcode,
         InstructionFormat::Shuffle => insert_shuffle,
-        InstructionFormat::StackLoad => insert_stack_load,
-        InstructionFormat::StackStore => insert_stack_store,
+        InstructionFormat::StackAddr => todo!(),
         InstructionFormat::Store => insert_load_store,
         InstructionFormat::StoreNoOffset => insert_load_store,
         InstructionFormat::Ternary => insert_opcode,
@@ -1184,12 +1092,21 @@ impl AACategory {
         ]
     }
 
-    pub fn update_memflags(&self, flags: &mut MemFlags) {
+    pub fn update_memflags(&self, flags: &mut MemFlagsData, alias_regions: &mut AliasRegionSet) {
         flags.set_alias_region(match self {
             AACategory::Other => None,
-            AACategory::Heap => Some(AliasRegion::Heap),
-            AACategory::Table => Some(AliasRegion::Table),
-            AACategory::VmCtx => Some(AliasRegion::Vmctx),
+            AACategory::Heap => Some(alias_regions.insert(AliasRegionData {
+                user_id: 0,
+                description: "heap".into(),
+            })),
+            AACategory::Table => Some(alias_regions.insert(AliasRegionData {
+                user_id: 1,
+                description: "table".into(),
+            })),
+            AACategory::VmCtx => Some(alias_regions.insert(AliasRegionData {
+                user_id: 2,
+                description: "vmctx".into(),
+            })),
         })
     }
 }
@@ -1350,7 +1267,7 @@ where
         builder: &mut FunctionBuilder,
         min_size: u32,
         is_atomic: bool,
-    ) -> Result<(Value, MemFlags, Offset32)> {
+    ) -> Result<(Value, MemFlagsData, Offset32)> {
         // Should we generate an aligned address
         // Some backends have issues with unaligned atomics.
         // AArch64: https://github.com/bytecodealliance/wasmtime/issues/5483
@@ -1371,10 +1288,10 @@ where
             bool::arbitrary(self.u)?
         };
 
-        let mut flags = MemFlags::new();
+        let mut flags = MemFlagsData::new();
         // Even if we picked an aligned address, we can always generate unaligned memflags
         if aligned && bool::arbitrary(self.u)? {
-            flags.set_aligned();
+            flags.set_aligned(true);
         }
         // If the address is aligned, then we know it won't trap
         if aligned && bool::arbitrary(self.u)? {
@@ -1385,7 +1302,7 @@ where
             self.generate_load_store_address(builder, min_size, aligned)?;
 
         // Set the Alias Analysis bits on the memflags
-        category.update_memflags(&mut flags);
+        category.update_memflags(&mut flags, &mut builder.func.dfg.alias_regions);
 
         // Pick an offset to pass into the load/store.
         let offset = if aligned {
@@ -1680,9 +1597,9 @@ where
 
                 // Each stack slot has an associated category, that means we have to set the
                 // correct memflags for it. So we can't use `stack_store` directly.
-                let mut flags = MemFlags::new();
+                let mut flags = MemFlagsData::new();
                 flags.set_notrap();
-                category.update_memflags(&mut flags);
+                category.update_memflags(&mut flags, &mut builder.func.dfg.alias_regions);
 
                 builder.ins().store(flags, val, addr, 0);
 
@@ -1919,7 +1836,6 @@ where
 
         for (ty, value) in vars.into_iter() {
             let var = builder.declare_var(ty);
-            builder.def_var(var, value);
 
             // Randomly declare variables as needing a stack map.
             // We limit these to only types that have fewer than 16 bytes
@@ -1927,6 +1843,8 @@ where
             if ty.bytes() <= 16 && self.u.arbitrary()? {
                 builder.declare_var_needs_stack_map(var);
             }
+
+            builder.def_var(var, value);
 
             self.resources
                 .vars
@@ -1991,7 +1909,7 @@ where
         }
 
         builder.seal_all_blocks();
-        builder.finalize();
+        builder.finalize(self.isa.frontend_config());
 
         Ok(func)
     }

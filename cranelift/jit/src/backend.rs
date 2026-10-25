@@ -16,10 +16,11 @@ use cranelift_module::{
 };
 use log::info;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::Write;
-use target_lexicon::PointerWidth;
+use target_lexicon::{Architecture, PointerWidth};
 
 const WRITABLE_DATA_ALIGNMENT: u64 = 0x8;
 const READONLY_DATA_ALIGNMENT: u64 = 0x1;
@@ -65,7 +66,18 @@ impl JITBuilder {
         // which might not reach all definitions; we can't handle that here, so
         // we require long-range relocation types.
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
-        flag_builder.set("is_pic", "false").unwrap();
+        // On x86_64, enable PIC so that symbol addresses are materialized with
+        // GOT-relative loads rather than RIP-relative `lea`s, which assume the
+        // symbol is within ±2 GiB of the code. The JIT memory provider makes
+        // no such promise, so `CompiledBlob::perform_relocations` resolves the
+        // loads through per-blob GOT entries, relaxing them back to `lea` when
+        // the symbol does turn out to be in range.
+        let is_pic = if cfg!(target_arch = "x86_64") {
+            "true"
+        } else {
+            "false"
+        };
+        flag_builder.set("is_pic", is_pic).unwrap();
         let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
             panic!("host machine is not supported: {msg}");
         });
@@ -175,7 +187,9 @@ pub struct JITModule {
     declarations: ModuleDeclarations,
     compiled_functions: SecondaryMap<FuncId, Option<CompiledBlob>>,
     compiled_data_objects: SecondaryMap<DataId, Option<CompiledBlob>>,
-    code_ranges: Vec<(usize, usize, FuncId)>,
+    /// Map from a function's start address to its (end address, FuncId), used
+    /// to resolve a PC back to its function for exception unwinding.
+    code_ranges: BTreeMap<usize, (usize, FuncId)>,
     functions_to_finalize: Vec<FuncId>,
     data_objects_to_finalize: Vec<DataId>,
 }
@@ -210,7 +224,13 @@ impl JITModule {
         }
     }
 
-    fn get_address(&self, name: &ModuleRelocTarget) -> *const u8 {
+    /// Get the address that the given [`ModuleRelocTarget`] would resolve to.
+    ///
+    /// For locally defined functions and data objects this is equivalent to
+    /// [`Self::get_finalized_function`] cq [`Self::get_finalized_data`], while
+    /// for external functions and data objects this will iterate through the
+    /// registered symbol lookup functions until one matches.
+    pub fn get_address(&self, name: &ModuleRelocTarget) -> *const u8 {
         match name {
             ModuleRelocTarget::User { .. } => {
                 let (name, linkage) = if ModuleDeclarations::is_function(name) {
@@ -334,9 +354,6 @@ impl JITModule {
             data.perform_relocations(|name| self.get_address(name));
         }
 
-        self.code_ranges
-            .sort_unstable_by_key(|(start, _end, _)| *start);
-
         // Now that we're done patching, prepare the memory for execution!
         let branch_protection = if cfg!(target_arch = "aarch64") && use_bti(&self.isa.isa_flags()) {
             BranchProtection::BTI
@@ -351,8 +368,9 @@ impl JITModule {
     /// Create a new `JITModule`.
     pub fn new(builder: JITBuilder) -> Self {
         assert!(
-            !builder.isa.flags().is_pic(),
-            "cranelift-jit needs is_pic=false"
+            !builder.isa.flags().is_pic()
+                || builder.isa.triple().architecture == Architecture::X86_64,
+            "cranelift-jit only supports is_pic=true on x86_64"
         );
 
         let memory = builder
@@ -367,7 +385,7 @@ impl JITModule {
             declarations: ModuleDeclarations::default(),
             compiled_functions: SecondaryMap::new(),
             compiled_data_objects: SecondaryMap::new(),
-            code_ranges: Vec::new(),
+            code_ranges: BTreeMap::new(),
             functions_to_finalize: Vec::new(),
             data_objects_to_finalize: Vec::new(),
         }
@@ -381,24 +399,10 @@ impl JITModule {
         &'a self,
         pc: usize,
     ) -> Option<(usize, wasmtime_unwinder::ExceptionTable<'a>)> {
-        // Search the sorted code-ranges for the PC.
-        let idx = match self
-            .code_ranges
-            .binary_search_by_key(&pc, |(start, _end, _func)| *start)
-        {
-            Ok(exact_start_match) => Some(exact_start_match),
-            Err(least_upper_bound) if least_upper_bound > 0 => {
-                let last_range_before_pc = &self.code_ranges[least_upper_bound - 1];
-                if last_range_before_pc.0 <= pc && pc < last_range_before_pc.1 {
-                    Some(least_upper_bound - 1)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }?;
-
-        let (start, _, func) = self.code_ranges[idx];
+        let (&start, &(end, func)) = self.code_ranges.range(..=pc).next_back()?;
+        if pc >= end {
+            return None;
+        }
 
         // Get the ExceptionTable. The "parse" here simply reads two
         // u32s for lengths and constructs borrowed slices, so it's
@@ -480,7 +484,7 @@ impl Module for JITModule {
 
         // work around borrow-checker to allow reuse of ctx below
         let res = ctx.compile(self.isa(), ctrl_plane)?;
-        let alignment = res.buffer.alignment as u64;
+        let alignment = res.buffer.min_alignment as u64;
         let compiled_code = ctx.compiled_code().unwrap();
 
         let align = alignment
@@ -521,8 +525,7 @@ impl Module for JITModule {
 
         let range_start = ptr.addr();
         let range_end = range_start + size;
-        // These will be sorted when we finalize.
-        self.code_ranges.push((range_start, range_end, id));
+        self.code_ranges.insert(range_start, (range_end, id));
 
         self.functions_to_finalize.push(id);
 
@@ -593,7 +596,7 @@ impl Module for JITModule {
             data_decls: _,
             function_relocs: _,
             data_relocs: _,
-            custom_segment_section: _,
+            custom_section: _,
             align,
             used: _,
         } = data;

@@ -4,15 +4,18 @@ use crate::code::{EngineCode, EngineCodePC, ModuleWithCode, StoreCode, StoreCode
 #[cfg(feature = "component-model")]
 use crate::component::Component;
 use crate::runtime::vm::VMWasmCallFunction;
-use crate::sync::{OnceLock, RwLock};
 use crate::vm::CompiledModuleId;
-use crate::{Engine, FrameInfo, Module, code_memory::CodeMemory, prelude::*};
+use crate::{Engine, FrameInfo, Module, prelude::*};
 use alloc::sync::Arc;
 #[cfg(not(feature = "debug"))]
 use core::marker::PhantomData;
 use core::ops::Range;
 use core::ptr::NonNull;
-use wasmtime_environ::{VMSharedTypeIndex, collections::btree_map::Entry};
+use wasmtime_core::undo::Undo;
+use wasmtime_environ::{
+    CompiledFunctionsTable, FuncKey, StaticModuleIndex, VMSharedTypeIndex,
+    collections::btree_map::Entry,
+};
 
 /// Used for registering modules with a store.
 ///
@@ -79,8 +82,19 @@ struct LoadedCode {
     /// The StoreCode in this range.
     code: StoreCode,
 
-    /// Map by starting text offset of Modules in this code region.
-    modules: TryBTreeMap<usize, RegisteredModuleId>,
+    /// The index of compiled functions in `code`.
+    ///
+    /// This index is used to map from program counters back to a `FuncKey`.
+    /// Primarily used in [`ModuleRegistry::lookup_frame_info`] at this time
+    /// below.
+    index: Arc<CompiledFunctionsTable>,
+
+    /// A mapping from the [`StaticModuleIndex`] values returned by the `index`
+    /// field above to a module within this registry.
+    ///
+    /// This is lazily populated as modules are registered and instantiated from
+    /// a component.
+    modules: TrySecondaryMap<StaticModuleIndex, Option<RegisteredModuleId>>,
 }
 
 /// An identifier of a module that has previously been inserted into a
@@ -119,6 +133,22 @@ impl<'a> RegisterBreakpointState<'a> {
     }
 }
 
+enum ModuleOrComponent<'a> {
+    Module(&'a Module),
+    #[cfg(feature = "component-model")]
+    Component(&'a Component),
+}
+
+impl<'a> ModuleOrComponent<'a> {
+    fn engine(&self) -> &'a Engine {
+        match self {
+            ModuleOrComponent::Module(module) => module.engine(),
+            #[cfg(feature = "component-model")]
+            ModuleOrComponent::Component(component) => component.engine(),
+        }
+    }
+}
+
 impl ModuleRegistry {
     /// Get a previously-registered module by id.
     pub fn module_by_id(&self, id: RegisteredModuleId) -> Option<&Module> {
@@ -130,17 +160,29 @@ impl ModuleRegistry {
         self.modules.get(RegisteredModuleId(id))
     }
 
-    /// Fetches a registered StoreCode and module and an offset within
-    /// it given a program counter value.
-    pub fn module_and_code_by_pc<'a>(&'a self, pc: usize) -> Option<(ModuleWithCode<'a>, usize)> {
+    /// Looks up `pc`, an absolute program counter address, to see if it
+    /// corresponds to any loaded code within this [`ModuleRegistry`].
+    ///
+    /// Returns `None` if nothing is found, and otherwise returns the
+    /// corresponding [`LoadedCode`] as well as a relative pc from the start of
+    /// the code's text section if found.
+    fn loaded_code_by_pc(&self, pc: usize) -> Option<(&LoadedCode, usize)> {
         let (_, code) = self
             .loaded_code
             .range(..=StoreCodePC::from_raw(pc))
             .next_back()?;
         let offset = StoreCodePC::offset_of(code.code.text_range(), pc)?;
-        let (_, module_id) = code.modules.range(..=offset).next_back()?;
-        let module = self.modules.get(*module_id)?;
-        Some((ModuleWithCode::from_raw(module, &code.code), offset))
+        Some((code, offset))
+    }
+
+    /// Consults this [`ModuleRegistry`] to see if `pc` corrseponds to any
+    /// previously-registered block of code.
+    ///
+    /// Upon success returns the [`StoreCode`] as well as a relative pc from the
+    /// start of the text section.
+    pub fn store_code_by_pc(&self, pc: usize) -> Option<(&StoreCode, usize)> {
+        let (code, pc) = self.loaded_code_by_pc(pc)?;
+        Some((&code.code, pc))
     }
 
     /// Fetches the `StoreCode` for a given `EngineCode`.
@@ -178,28 +220,27 @@ impl ModuleRegistry {
     }
 
     /// Gets an iterator over all modules in the registry.
-    #[cfg(any(feature = "coredump", feature = "debug"))]
-    pub fn all_modules(&self) -> impl Iterator<Item = &'_ Module> + '_ {
-        self.modules.values()
+    #[cfg(any(feature = "coredump", feature = "debug", feature = "gc"))]
+    pub fn all_modules(&self) -> impl Iterator<Item = (RegisteredModuleId, &'_ Module)> + '_ {
+        self.modules.iter()
     }
 
     /// Registers a new module with the registry.
+    ///
+    /// Returns an error if `module` was not compiled by `engine`.
     pub fn register_module(
         &mut self,
         module: &Module,
         engine: &Engine,
         breakpoint_state: RegisterBreakpointState,
     ) -> Result<RegisteredModuleId> {
-        self.register(
-            module.id(),
-            module.engine_code(),
-            Some(module),
-            engine,
-            breakpoint_state,
-        )
-        .map(|id| id.unwrap())
+        self.register(ModuleOrComponent::Module(module), engine, breakpoint_state)
+            .map(|id| id.unwrap())
     }
 
+    /// Registers a new component with the registry.
+    ///
+    /// Returns an error if `component` was not compiled by `engine`.
     #[cfg(feature = "component-model")]
     pub fn register_component(
         &mut self,
@@ -208,9 +249,7 @@ impl ModuleRegistry {
         breakpoint_state: RegisterBreakpointState,
     ) -> Result<()> {
         self.register(
-            component.id(),
-            component.engine_code(),
-            None,
+            ModuleOrComponent::Component(component),
             engine,
             breakpoint_state,
         )?;
@@ -218,53 +257,122 @@ impl ModuleRegistry {
     }
 
     /// Registers a new module with the registry.
+    ///
+    /// Returns an error if `module_or_component` was not compiled by `engine`.
+    /// All code and metadata enters a store through here, so callers
+    /// registering on a store's behalf pass that store's engine to keep foreign
+    /// code out of it.
     fn register(
         &mut self,
-        compiled_id: CompiledModuleId,
-        code: &Arc<EngineCode>,
-        module: Option<&Module>,
+        module_or_component: ModuleOrComponent<'_>,
         engine: &Engine,
         breakpoint_state: RegisterBreakpointState,
     ) -> Result<Option<RegisteredModuleId>> {
-        // Register the module, if any.
-        let id = if let Some(module) = module {
-            let id = RegisteredModuleId(compiled_id);
-            self.modules.entry(id).or_insert_with(|| module.clone())?;
-            Some(id)
-        } else {
-            None
+        // Nothing below here may run for a foreign module or component: the
+        // type indices it carries mean something else entirely in this
+        // engine.
+        ensure!(
+            Engine::same(engine, module_or_component.engine()),
+            "cross-`Engine` usage is not supported"
+        );
+        let compiled_id = match module_or_component {
+            ModuleOrComponent::Module(module) => module.id(),
+            #[cfg(feature = "component-model")]
+            ModuleOrComponent::Component(component) => component.id(),
+        };
+        let code = match module_or_component {
+            ModuleOrComponent::Module(module) => module.engine_code(),
+            #[cfg(feature = "component-model")]
+            ModuleOrComponent::Component(component) => component.engine_code(),
         };
 
+        // Register the module, if any.
+        let mut new_module = false;
+        let id = match module_or_component {
+            ModuleOrComponent::Module(module) => {
+                let id = RegisteredModuleId(compiled_id);
+                if !self.modules.contains_key(id) {
+                    self.modules.insert(id, module.clone())?;
+                    new_module = true;
+                }
+                Some(id)
+            }
+            #[cfg(feature = "component-model")]
+            ModuleOrComponent::Component(_) => None,
+        };
+        // If further steps fail then undo the registration that just happened,
+        // if one happened.
+        let mut module_undo = Undo::new(self, |registry| {
+            if new_module {
+                registry.modules.remove(id.unwrap());
+            }
+        });
+        let this = &mut **module_undo;
+
         // Create a StoreCode if one does not already exist.
-        let store_code_pc = match self.store_code.entry(code.text_range().start) {
+        let engine_code_pc = code.text_range().start;
+        let (store_code_pc, new_code) = match this.store_code.entry(engine_code_pc) {
             Entry::Vacant(v) => {
                 let store_code = StoreCode::new(engine, code)?;
                 let store_code_pc = store_code.text_range().start;
-                assert_no_overlap(&self.loaded_code, store_code.text_range());
-                self.loaded_code.insert(
+                assert_no_overlap(&this.loaded_code, store_code.text_range());
+                let index = match module_or_component {
+                    ModuleOrComponent::Module(module) => module.index(),
+                    #[cfg(feature = "component-model")]
+                    ModuleOrComponent::Component(component) => component.index(),
+                };
+                v.insert(store_code_pc)?;
+                let result = this.loaded_code.insert(
                     store_code_pc,
                     LoadedCode {
                         code: store_code,
-                        modules: TryBTreeMap::default(),
+                        index: index.clone(),
+                        modules: Default::default(),
                     },
-                )?;
-                *v.insert(store_code_pc)?
+                );
+                if let Err(e) = result {
+                    this.store_code.remove(engine_code_pc);
+                    return Err(e.into());
+                }
+                (store_code_pc, true)
             }
-            Entry::Occupied(o) => *o.get(),
+            Entry::Occupied(o) => (*o.get(), false),
         };
+        // Like with `module_undo`, remove the entries inserted above if that
+        // just happened.
+        let mut code_undo = Undo::new(this, |registry| {
+            if new_code {
+                registry.store_code.remove(engine_code_pc);
+                registry.loaded_code.remove(store_code_pc);
+            }
+        });
+        let this = &mut **code_undo;
 
         // Add this module to the LoadedCode if not present.
-        if let (Some(module), Some(id)) = (module, id) {
-            if let Some((_, range)) = module.compiled_module().finished_function_ranges().next() {
-                let loaded_code = self
-                    .loaded_code
-                    .get_mut(store_code_pc)
-                    .expect("loaded_code must have entry for StoreCodePC");
-                loaded_code.modules.insert(range.start, id)?;
-                breakpoint_state.update(&mut loaded_code.code, module)?;
+        if let (ModuleOrComponent::Module(module), Some(id)) = (module_or_component, id) {
+            let module_index = module.env_module().module_index;
+            let loaded_code = this
+                .loaded_code
+                .get_mut(store_code_pc)
+                .expect("loaded_code must have entry for StoreCodePC");
+            let prev = loaded_code.modules.insert(module_index, Some(id))?;
+            match breakpoint_state.update(&mut loaded_code.code, module) {
+                Ok(()) => {}
+                Err(e) => {
+                    if prev.flatten().is_none() {
+                        loaded_code.modules.remove(module_index);
+                    }
+                    return Err(e);
+                }
             }
         }
 
+        // NB: if more logic is added here before the `Undo::commit`s below, be
+        // sure to add a new `Undo` for the `breakpoint_state` and `modules`
+        // update above.
+
+        Undo::commit(code_undo);
+        Undo::commit(module_undo);
         Ok(id)
     }
 
@@ -280,15 +388,18 @@ impl ModuleRegistry {
         &'a self,
         pc: usize,
     ) -> Option<(FrameInfo, ModuleWithCode<'a>)> {
-        let (_, code) = self
-            .loaded_code
-            .range(..=StoreCodePC::from_raw(pc))
-            .next_back()?;
-        let text_offset = StoreCodePC::offset_of(code.code.text_range(), pc)?;
-        let (_, module_id) = code.modules.range(..=text_offset).next_back()?;
+        let (code, text_offset) = self.loaded_code_by_pc(pc)?;
+        let module_index = match code
+            .index
+            .func_by_text_offset(u32::try_from(text_offset).ok()?)?
+        {
+            FuncKey::DefinedWasmFunction(module, _) => module,
+            _ => return None,
+        };
+        let module_id = (*code.modules.get(module_index)?)?;
         let module = self
             .modules
-            .get(*module_id)
+            .get(module_id)
             .expect("referenced module ID not found");
         let info = FrameInfo::new(module.clone(), text_offset)?;
         let module_with_code = ModuleWithCode::from_raw(module, &code.code);
@@ -315,64 +426,109 @@ impl ModuleRegistry {
     }
 }
 
-// This is the global code registry that stores information for all loaded code
-// objects that are currently in use by any `Store` in the current process.
-//
-// The purpose of this map is to be called from signal handlers to determine
-// whether a program counter is a wasm trap or not. Specifically macOS has
-// no contextual information about the thread available, hence the necessity
-// for global state rather than using thread local state.
-//
-// This is similar to `ModuleRegistry` except that it has less information and
-// supports removal. Any time anything is registered with a `ModuleRegistry`
-// it is also automatically registered with the singleton global module
-// registry. When a `ModuleRegistry` is destroyed then all of its entries
-// are removed from the global registry.
-fn global_code() -> &'static RwLock<GlobalRegistry> {
-    static GLOBAL_CODE: OnceLock<RwLock<GlobalRegistry>> = OnceLock::new();
-    GLOBAL_CODE.get_or_init(Default::default)
-}
+#[cfg(has_native_signals)]
+pub use global_registry::*;
+#[cfg(not(has_native_signals))]
+pub use no_global_registry::*;
 
-type GlobalRegistry = TryBTreeMap<usize, (usize, Arc<CodeMemory>)>;
-
-/// Find which registered region of code contains the given program counter, and
-/// what offset that PC is within that module's code.
-pub fn lookup_code(pc: usize) -> Option<(Arc<CodeMemory>, usize)> {
-    let all_modules = global_code().read();
-    let (_end, (start, module)) = all_modules.range(pc..).next()?;
-    let text_offset = pc.checked_sub(*start)?;
-    Some((module.clone(), text_offset))
-}
-
-/// Registers a new region of code.
+/// This is the global code registry that stores information for all loaded
+/// code objects that are currently in use by any `Store` in the current
+/// process.
 ///
-/// Must not have been previously registered and must be `unregister`'d to
-/// prevent leaking memory.
+/// The purpose of this map is to be called from signal handlers to determine
+/// whether a program counter is a wasm trap or not. Specifically macOS has no
+/// contextual information about the thread available, hence the necessity for
+/// global state rather than using thread local state.
 ///
-/// This is required to enable traps to work correctly since the signal handler
-/// will lookup in the `GLOBAL_CODE` list to determine which a particular pc
-/// is a trap or not.
-pub fn register_code(image: &Arc<CodeMemory>, address: Range<usize>) -> Result<(), OutOfMemory> {
-    if address.is_empty() {
-        return Ok(());
+/// This is similar to `ModuleRegistry` except that it has less information
+/// and supports removal. Any time anything is registered with a
+/// `ModuleRegistry` it is also automatically registered with the singleton
+/// global module registry. When a `ModuleRegistry` is destroyed then all of
+/// its entries are removed from the global registry.
+///
+/// Note that this global registry only exists when native signals are used to
+/// implement traps (`cfg(has_native_signals)`); see `no_global_registry`
+/// below for the alternative.
+#[cfg(has_native_signals)]
+mod global_registry {
+    use crate::code_memory::CodeMemory;
+    use crate::prelude::*;
+    use crate::sync::{OnceLock, RwLock};
+    use alloc::sync::Arc;
+    use core::ops::Range;
+
+    fn global_code() -> &'static RwLock<GlobalRegistry> {
+        static GLOBAL_CODE: OnceLock<RwLock<GlobalRegistry>> = OnceLock::new();
+        GLOBAL_CODE.get_or_init(Default::default)
     }
-    let start = address.start;
-    let end = address.end - 1;
-    let prev = global_code().write().insert(end, (start, image.clone()))?;
-    assert!(prev.is_none());
-    Ok(())
+
+    type GlobalRegistry = TryBTreeMap<usize, (usize, Arc<CodeMemory>)>;
+
+    /// Find which registered region of code contains the given program
+    /// counter, and what offset that PC is within that module's code.
+    pub fn lookup_code(pc: usize) -> Option<(Arc<CodeMemory>, usize)> {
+        let all_modules = global_code().read();
+        let (_end, (start, module)) = all_modules.range(pc..).next()?;
+        let text_offset = pc.checked_sub(*start)?;
+        Some((module.clone(), text_offset))
+    }
+
+    /// Registers a new region of code.
+    ///
+    /// Must not have been previously registered and must be `unregister`'d to
+    /// prevent leaking memory.
+    ///
+    /// This is required to enable traps to work correctly since the signal
+    /// handler will lookup in the `GLOBAL_CODE` list to determine which a
+    /// particular pc is a trap or not.
+    pub fn register_code(
+        image: &Arc<CodeMemory>,
+        address: Range<usize>,
+    ) -> Result<(), OutOfMemory> {
+        if address.is_empty() {
+            return Ok(());
+        }
+        let start = address.start;
+        let end = address.end - 1;
+        let prev = global_code().write().insert(end, (start, image.clone()))?;
+        assert!(prev.is_none());
+        Ok(())
+    }
+
+    /// Unregisters a code mmap from the global map.
+    ///
+    /// Must have been previously registered with `register`.
+    pub fn unregister_code(address: Range<usize>) {
+        if address.is_empty() {
+            return;
+        }
+        let end = address.end - 1;
+        let code = global_code().write().remove(end);
+        assert!(code.is_some());
+    }
 }
 
-/// Unregisters a code mmap from the global map.
-///
-/// Must have been previously registered with `register`.
-pub fn unregister_code(address: Range<usize>) {
-    if address.is_empty() {
-        return;
+/// Without native signals there is no global registry: traps are only ever
+/// raised synchronously from contexts that have access to a `Store`'s own
+/// `ModuleRegistry`, so trap lookups happen there instead. This means that
+/// loading and unloading modules performs no cross-thread synchronization.
+#[cfg(not(has_native_signals))]
+mod no_global_registry {
+    use crate::code_memory::CodeMemory;
+    use crate::prelude::*;
+    use alloc::sync::Arc;
+    use core::ops::Range;
+
+    /// No-op: there is no global registry in this configuration.
+    pub fn register_code(
+        _image: &Arc<CodeMemory>,
+        _address: Range<usize>,
+    ) -> Result<(), OutOfMemory> {
+        Ok(())
     }
-    let end = address.end - 1;
-    let code = global_code().write().remove(end);
-    assert!(code.is_some());
+
+    /// No-op: there is no global registry in this configuration.
+    pub fn unregister_code(_address: Range<usize>) {}
 }
 
 #[test]

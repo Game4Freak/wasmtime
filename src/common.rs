@@ -4,7 +4,7 @@ use clap::Parser;
 use std::net::TcpListener;
 use std::{fs::File, path::Path, time::Duration};
 use wasmtime::{
-    Engine, Module, Precompiled, Result, StoreLimits, StoreLimitsBuilder, bail,
+    Engine, Module, Precompiled, Result, Store, StoreLimits, StoreLimitsBuilder, bail,
     error::Context as _, format_err,
 };
 use wasmtime_cli_flags::{CommonOptions, opt::WasmtimeOptionValue};
@@ -14,10 +14,7 @@ use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime::component::Component;
 
 /// Whether or not WASIp3 is enabled by default.
-///
-/// Currently this is disabled (the `&& false`), but that'll get removed in the
-/// future.
-pub const P3_DEFAULT: bool = cfg!(feature = "component-model-async") && false;
+pub const P3_DEFAULT: bool = cfg!(feature = "component-model-async");
 
 #[derive(Clone)]
 pub enum RunTarget {
@@ -104,9 +101,11 @@ pub struct RunCommon {
     /// Attach the built-in gdbstub debugger component, listening on
     /// the given TCP address. Accepts a port number (e.g. `1234`) or
     /// a full `address:port`. A bare port number will bind on
-    /// localhost only (`127.0.0.1`). A debugger (e.g. LLDB) can then
-    /// connect via `process connect --plugin=wasm
-    /// connect://<ADDR>:<PORT>`.
+    /// localhost only (`127.0.0.1`). A port number of `0` indicates
+    /// that any free port should be chosen; the port is printed on startup.
+    ///
+    /// A debugger (e.g. LLDB) can then connect via `process connect
+    /// --plugin=wasm connect://<ADDR>:<PORT>`.
     #[cfg(feature = "gdbstub")]
     #[arg(short = 'g', long = "gdbstub", value_name = "[ADDR:]PORT")]
     pub gdbstub: Option<String>,
@@ -288,6 +287,7 @@ impl RunCommon {
             None => {
                 let mut code = wasmtime::CodeBuilder::new(engine);
                 code.wasm_binary_or_text(bytes, Some(path))?;
+                crate::code_builder::configure_code_builder(&self.common, &mut code)?;
                 match code.hint() {
                     Some(wasmtime::CodeHint::Component) => {
                         #[cfg(feature = "component-model")]
@@ -326,7 +326,13 @@ impl RunCommon {
         builder.allow_blocking_current_thread(self.common.wasm.timeout.is_none());
 
         if self.common.wasi.inherit_env == Some(true) {
-            for (k, v) in std::env::vars() {
+            for (k, v) in std::env::vars_os() {
+                let k = k.to_str().ok_or_else(|| {
+                    format_err!("environment variable name {k:?} not valid utf-8")
+                })?;
+                let v = v.to_str().ok_or_else(|| {
+                    format_err!("environment variable {k:?} value {v:?} not valid utf-8")
+                })?;
                 builder.env(&k, &v);
             }
         }
@@ -347,23 +353,21 @@ impl RunCommon {
         }
 
         for (host, guest) in self.dirs.iter() {
-            builder.preopened_dir(
-                host,
-                guest,
-                wasmtime_wasi::DirPerms::all(),
-                wasmtime_wasi::FilePerms::all(),
-            )?;
+            builder.preopened_dir(host, guest, wasmtime_wasi::FsPerms::ReadWrite)?;
+        }
+        if let Some(cwd) = &self.common.wasi.cwd {
+            builder.initial_cwd(cwd);
         }
 
-        if self.common.wasi.listenfd == Some(true) {
-            bail!("components do not support --listenfd");
-        }
         for _ in self.compute_preopen_sockets()? {
             bail!("components do not support --tcplisten");
         }
 
         if self.common.wasi.inherit_network == Some(true) {
             builder.inherit_network();
+            // Implicitly enable TCP/UDP if the entire network is being
+            // inherited to avoid the need to also pass `-Stcp,udp`.
+            builder.allow_tcp(true).allow_udp(true);
         }
         if let Some(enable) = self.common.wasi.allow_ip_name_lookup {
             builder.allow_ip_name_lookup(enable);
@@ -397,12 +401,28 @@ impl RunCommon {
                 .common
                 .wasi
                 .http_outgoing_body_buffer_chunks
-                .unwrap_or_else(|| wasmtime_wasi_http::p2::DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS),
+                .map(|n| n.get())
+                .unwrap_or(wasmtime_wasi_http::p2::DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS),
             p2_outgoing_body_chunk_size: self
                 .common
                 .wasi
                 .http_outgoing_body_chunk_size
-                .unwrap_or_else(|| wasmtime_wasi_http::p2::DEFAULT_OUTGOING_BODY_CHUNK_SIZE),
+                .map(|n| n.get())
+                .unwrap_or(wasmtime_wasi_http::p2::DEFAULT_OUTGOING_BODY_CHUNK_SIZE),
+            #[cfg(feature = "component-model-async")]
+            p3_outgoing_body_buffer_chunks: self
+                .common
+                .wasi
+                .http_outgoing_body_buffer_chunks
+                .map(|n| n.get())
+                .unwrap_or(wasmtime_wasi_http::p3::DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS),
+            #[cfg(feature = "component-model-async")]
+            p3_outgoing_body_chunk_size: self
+                .common
+                .wasi
+                .http_outgoing_body_chunk_size
+                .map(|n| n.get())
+                .unwrap_or(wasmtime_wasi_http::p3::DEFAULT_OUTGOING_BODY_CHUNK_SIZE),
         }
     }
 
@@ -461,18 +481,57 @@ impl RunCommon {
         T: wasmtime_wasi::WasiView,
     {
         let mut p2_options = wasmtime_wasi::p2::bindings::LinkOptions::default();
-        p2_options.cli_exit_with_code(self.common.wasi.cli_exit_with_code.unwrap_or(false));
+        if self.common.wasi.cli_exit_with_code == Some(false) {
+            eprintln!("warning: cannot disable `-Scli-exit-with-code` any more");
+        }
         p2_options.network_error_code(self.common.wasi.network_error_code.unwrap_or(false));
         wasmtime_wasi::p2::add_to_linker_with_options_async(linker, &p2_options)?;
 
         #[cfg(feature = "component-model-async")]
         if self.common.wasi.p3.unwrap_or(P3_DEFAULT) {
-            let mut p3_options = wasmtime_wasi::p3::bindings::LinkOptions::default();
-            p3_options.cli_exit_with_code(self.common.wasi.cli_exit_with_code.unwrap_or(false));
+            let p3_options = wasmtime_wasi::p3::bindings::LinkOptions::default();
             wasmtime_wasi::p3::add_to_linker_with_options(linker, &p3_options)
                 .context("failed to link `wasi:cli@0.3.x`")?;
         }
 
+        Ok(())
+    }
+
+    pub fn configure_store<T>(
+        &self,
+        store: &mut Store<T>,
+        limits: fn(&mut T) -> &mut StoreLimits,
+    ) -> Result<()>
+    where
+        T: wasmtime_wasi::WasiView,
+    {
+        if let Some(max) = self.common.wasi.max_resources {
+            if self.common.wasi.cli != Some(false) {
+                store.data_mut().ctx().table.set_max_capacity(max);
+            }
+            #[cfg(feature = "component-model-async")]
+            if let Some(table) = store.concurrent_resource_table() {
+                table.set_max_capacity(max);
+            }
+        }
+        if let Some(fuel) = self.common.wasi.hostcall_fuel {
+            store.set_hostcall_fuel(fuel);
+        }
+        if let Some(max) = self.common.wasi.max_component_handles {
+            store.set_max_component_handles(max);
+        }
+        if let Some(max) = self.common.wasi.max_fibers {
+            store.set_max_fibers(max);
+        }
+
+        *limits(store.data_mut()) = self.store_limits();
+        store.limiter(move |t| limits(t));
+
+        // If fuel has been configured, we want to add the configured
+        // fuel amount to this store.
+        if let Some(fuel) = self.common.wasm.fuel {
+            store.set_fuel(fuel)?;
+        }
         Ok(())
     }
 }
@@ -532,6 +591,10 @@ impl Profile {
 pub struct HttpHooks {
     p2_outgoing_body_buffer_chunks: usize,
     p2_outgoing_body_chunk_size: usize,
+    #[cfg(feature = "component-model-async")]
+    p3_outgoing_body_buffer_chunks: usize,
+    #[cfg(feature = "component-model-async")]
+    p3_outgoing_body_chunk_size: usize,
 }
 
 #[cfg(feature = "wasi-http")]
@@ -541,20 +604,67 @@ impl Default for HttpHooks {
             p2_outgoing_body_buffer_chunks:
                 wasmtime_wasi_http::p2::DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS,
             p2_outgoing_body_chunk_size: wasmtime_wasi_http::p2::DEFAULT_OUTGOING_BODY_CHUNK_SIZE,
+            #[cfg(feature = "component-model-async")]
+            p3_outgoing_body_buffer_chunks:
+                wasmtime_wasi_http::p3::DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS,
+            #[cfg(feature = "component-model-async")]
+            p3_outgoing_body_chunk_size: wasmtime_wasi_http::p3::DEFAULT_OUTGOING_BODY_CHUNK_SIZE,
         }
     }
 }
 
 #[cfg(feature = "wasi-http")]
-impl wasmtime_wasi_http::p2::WasiHttpHooks for HttpHooks {
-    fn outgoing_body_buffer_chunks(&mut self) -> usize {
+impl wasmtime_wasi_http::WasiHttpHooks for HttpHooks {
+    fn p2_outgoing_body_buffer_chunks(&mut self) -> usize {
         self.p2_outgoing_body_buffer_chunks
     }
 
-    fn outgoing_body_chunk_size(&mut self) -> usize {
+    fn p2_outgoing_body_chunk_size(&mut self) -> usize {
         self.p2_outgoing_body_chunk_size
+    }
+
+    #[cfg(feature = "component-model-async")]
+    fn p3_outgoing_body_buffer_chunks(&mut self) -> usize {
+        self.p3_outgoing_body_buffer_chunks
+    }
+
+    #[cfg(feature = "component-model-async")]
+    fn p3_outgoing_body_chunk_size(&mut self) -> usize {
+        self.p3_outgoing_body_chunk_size
     }
 }
 
-#[cfg(feature = "wasi-http")]
-impl wasmtime_wasi_http::p3::WasiHttpHooks for HttpHooks {}
+#[cfg(all(test, feature = "wasi-http", feature = "component-model-async"))]
+mod tests {
+    use super::RunCommon;
+    use clap::Parser as _;
+    use std::num::NonZeroUsize;
+    use wasmtime_wasi_http::WasiHttpHooks as _;
+
+    /// `-Shttp-outgoing-body-*` lands in `CommonWasiOptions`; from there it has
+    /// to reach both the p2 and the p3 hooks.
+    #[test]
+    fn p3_outgoing_body_options_reach_hooks() {
+        let mut cli = RunCommon::try_parse_from(["wasmtime"]).expect("failed to parse options");
+        cli.common.wasi.http_outgoing_body_buffer_chunks = NonZeroUsize::new(3);
+        cli.common.wasi.http_outgoing_body_chunk_size = NonZeroUsize::new(1024);
+
+        let mut hooks = cli.wasi_http_hooks();
+        assert_eq!(hooks.p2_outgoing_body_buffer_chunks(), 3);
+        assert_eq!(hooks.p3_outgoing_body_buffer_chunks(), 3);
+        assert_eq!(hooks.p2_outgoing_body_chunk_size(), 1024);
+        assert_eq!(hooks.p3_outgoing_body_chunk_size(), 1024);
+
+        // Without the options set, both sides keep their documented defaults.
+        let cli = RunCommon::try_parse_from(["wasmtime"]).expect("failed to parse options");
+        let mut hooks = cli.wasi_http_hooks();
+        assert_eq!(
+            hooks.p3_outgoing_body_buffer_chunks(),
+            wasmtime_wasi_http::p3::DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS,
+        );
+        assert_eq!(
+            hooks.p3_outgoing_body_chunk_size(),
+            wasmtime_wasi_http::p3::DEFAULT_OUTGOING_BODY_CHUNK_SIZE,
+        );
+    }
+}

@@ -30,7 +30,7 @@ fn can_compile() -> Result<()> {
             r#"(component
                 (import "a" (func $f (param "a" string)))
                 {libc}
-                (core func (canon lower (func $f) (memory $libc "memory") (realloc (func $libc "realloc"))))
+                (core func (canon lower (func $f) (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
             )"#
         ),
     )?;
@@ -40,14 +40,14 @@ fn can_compile() -> Result<()> {
             r#"(component
                 (import "f1" (func $f1 (param "a" string) (result string)))
                 {libc}
-                (core func (canon lower (func $f1) (memory $libc "memory") (realloc (func $libc "realloc"))))
+                (core func (canon lower (func $f1) (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
 
                 (import "f2" (func $f2 (param "a" u32) (result (list u8))))
                 (core instance $libc2 (instantiate $libc))
-                (core func (canon lower (func $f2) (memory $libc2 "memory") (realloc (func $libc2 "realloc"))))
+                (core func (canon lower (func $f2) (memory (core memory $libc2 "memory")) (realloc (core func $libc2 "realloc"))))
 
-                (core func (canon lower (func $f1) (memory $libc2 "memory") (realloc (func $libc2 "realloc"))))
-                (core func (canon lower (func $f2) (memory $libc "memory") (realloc (func $libc "realloc"))))
+                (core func (canon lower (func $f1) (memory (core memory $libc2 "memory")) (realloc (core func $libc2 "realloc"))))
+                (core func (canon lower (func $f2) (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
             )"#
         ),
     )?;
@@ -57,7 +57,7 @@ fn can_compile() -> Result<()> {
             r#"(component
                 (import "log" (func $log (param "a" string)))
                 {libc}
-                (core func $log_lower (canon lower (func $log) (memory $libc "memory") (realloc (func $libc "realloc"))))
+                (core func $log_lower (canon lower (func $log) (memory (core memory $libc "memory")) (realloc (core func $libc "realloc"))))
 
                 (core module $logger
                     (import "host" "log" (func $log (param i32 i32)))
@@ -96,7 +96,7 @@ fn simple() -> Result<()> {
             )
             (core instance $libc (instantiate $libc))
             (core func $log_lower
-                (canon lower (func $log) (memory $libc "memory") (realloc (func $libc "realloc")))
+                (canon lower (func $log) (memory (core memory $libc "memory")) (realloc (core func $libc "realloc")))
             )
             (core module $m
                 (import "libc" "memory" (memory 1))
@@ -186,7 +186,7 @@ fn functions_in_instances() -> Result<()> {
             )
             (core instance $libc (instantiate $libc))
             (core func $log_lower
-                (canon lower (func $log) (memory $libc "memory") (realloc (func $libc "realloc")))
+                (canon lower (func $log) (memory (core memory $libc "memory")) (realloc (core func $libc "realloc")))
             )
             (core module $m
                 (import "libc" "memory" (memory 1))
@@ -313,11 +313,11 @@ fn attempt_to_leave_during_malloc() -> Result<()> {
   )
 
   (core func $thunk_lower
-    (canon lower (func $thunk) (memory $m "memory") (realloc (func $m "realloc")))
+    (canon lower (func $thunk) (memory (core memory $m "memory")) (realloc (core func $m "realloc")))
   )
 
   (core func $ret_string_lower
-    (canon lower (func $ret_string) (memory $m "memory") (realloc (func $m "realloc")))
+    (canon lower (func $ret_string) (memory (core memory $m "memory")) (realloc (core func $m "realloc")))
   )
 
   (core instance (instantiate $host_shim_filler_inner
@@ -332,7 +332,7 @@ fn attempt_to_leave_during_malloc() -> Result<()> {
     (canon lift (core func $m "run"))
   )
   (func (export "take-string") (param "a" string)
-    (canon lift (core func $m "take-string") (memory $m "memory") (realloc (func $m "realloc")))
+    (canon lift (core func $m "take-string") (memory (core memory $m "memory")) (realloc (core func $m "realloc")))
   )
 )
     "#;
@@ -409,7 +409,7 @@ fn attempt_to_leave_during_malloc() -> Result<()> {
 }
 
 #[test]
-fn attempt_to_reenter_during_host() -> Result<()> {
+fn reenter_during_host() -> Result<()> {
     let component = r#"
 (component
   (import "thunk" (func $thunk))
@@ -445,13 +445,9 @@ fn attempt_to_reenter_during_host() -> Result<()> {
     linker.root().func_wrap(
         "thunk",
         |mut store: StoreContextMut<'_, StaticState>, _: ()| -> Result<()> {
-            let func = store.data_mut().func.take().unwrap();
-            let trap = func.call(&mut store, ()).unwrap_err();
-            assert_eq!(
-                trap.downcast_ref(),
-                Some(&Trap::CannotEnterComponent),
-                "bad trap: {trap:?}",
-            );
+            if let Some(func) = store.data_mut().func.take() {
+                func.call(&mut store, ())?;
+            }
             Ok(())
         },
     )?;
@@ -471,13 +467,9 @@ fn attempt_to_reenter_during_host() -> Result<()> {
     linker.root().func_new(
         "thunk",
         |mut store: StoreContextMut<'_, DynamicState>, _, _, _| {
-            let func = store.data_mut().func.take().unwrap();
-            let trap = func.call(&mut store, &[], &mut []).unwrap_err();
-            assert_eq!(
-                trap.downcast_ref(),
-                Some(&Trap::CannotEnterComponent),
-                "bad trap: {trap:?}",
-            );
+            if let Some(func) = store.data_mut().func.take() {
+                func.call(&mut store, &[], &mut [])?;
+            }
             Ok(())
         },
     )?;
@@ -485,6 +477,63 @@ fn attempt_to_reenter_during_host() -> Result<()> {
     let func = instance.get_func(&mut store, "run").unwrap();
     store.data_mut().func = Some(func);
     func.call(&mut store, &[], &mut [])?;
+
+    Ok(())
+}
+
+#[test]
+fn reenter_during_host_and_trap() -> Result<()> {
+    let component = r#"
+(component
+  (import "thunk" (func $thunk))
+  (core func $thunk_lower (canon lower (func $thunk)))
+
+  (core module $m
+    (import "host" "thunk" (func $thunk))
+
+    (func (export "run")
+      call $thunk
+      unreachable)
+    (func (export "trap")
+      unreachable)
+  )
+  (core instance $m (instantiate $m
+    (with "host" (instance (export "thunk" (func $thunk_lower))))
+  ))
+
+  (func (export "run")
+    (canon lift (core func $m "run"))
+  )
+  (func (export "trap")
+    (canon lift (core func $m "trap"))
+  )
+)
+    "#;
+
+    let engine = super::engine();
+    let component = Component::new(&engine, component)?;
+
+    // The host handles the reentrant call's trap and returns normally, but
+    // the store is now poisoned so the guest must not continue running.
+    let mut store = Store::new(&engine, None);
+    let mut linker = Linker::new(&engine);
+    linker.root().func_wrap(
+        "thunk",
+        |mut store: StoreContextMut<'_, Option<TypedFunc<(), ()>>>, _: ()| -> Result<()> {
+            let func = store.data().unwrap();
+            assert!(func.call(&mut store, ()).is_err());
+            Ok(())
+        },
+    )?;
+    let instance = linker.instantiate(&mut store, &component)?;
+    let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+    *store.data_mut() = Some(instance.get_typed_func::<(), ()>(&mut store, "trap")?);
+    let err = run.call(&mut store, ()).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<Trap>(),
+        Some(&Trap::CannotEnterComponent),
+        "{err:?}"
+    );
 
     Ok(())
 }
@@ -556,7 +605,7 @@ async fn test_stack_and_heap_args_and_rets(concurrent: bool) -> Result<()> {
     )
             "#,
             "async",
-            r#"async (callback (func $m "callback"))"#,
+            r#"async (callback (core func $m "callback"))"#,
             "async",
         )
     } else {
@@ -626,23 +675,23 @@ async fn test_stack_and_heap_args_and_rets(concurrent: bool) -> Result<()> {
   (core instance $libc (instantiate (module $libc)))
 
   (core func $f1_lower (canon lower (func $f1)
-      (memory $libc "memory")
-      (realloc (func $libc "realloc"))
+      (memory (core memory $libc "memory"))
+      (realloc (core func $libc "realloc"))
       {async_lower_opts}
   ))
   (core func $f2_lower (canon lower (func $f2)
-      (memory $libc "memory")
-      (realloc (func $libc "realloc"))
+      (memory (core memory $libc "memory"))
+      (realloc (core func $libc "realloc"))
       {async_lower_opts}
   ))
   (core func $f3_lower (canon lower (func $f3)
-      (memory $libc "memory")
-      (realloc (func $libc "realloc"))
+      (memory (core memory $libc "memory"))
+      (realloc (core func $libc "realloc"))
       {async_lower_opts}
   ))
   (core func $f4_lower (canon lower (func $f4)
-      (memory $libc "memory")
-      (realloc (func $libc "realloc"))
+      (memory (core memory $libc "memory"))
+      (realloc (core func $libc "realloc"))
       {async_lower_opts}
   ))
 
@@ -999,10 +1048,10 @@ fn bad_import_alignment() -> Result<()> {
   (core instance $libc_panic (instantiate $libc_panic))
 
   (core func $unaligned_retptr_lower
-    (canon lower (func $unaligned_retptr) (memory $libc_panic "memory") (realloc (func $libc_panic "realloc")))
+    (canon lower (func $unaligned_retptr) (memory (core memory $libc_panic "memory")) (realloc (core func $libc_panic "realloc")))
   )
   (core func $unaligned_argptr_lower
-    (canon lower (func $unaligned_argptr) (memory $libc_panic "memory") (realloc (func $libc_panic "realloc")))
+    (canon lower (func $unaligned_argptr) (memory (core memory $libc_panic "memory")) (realloc (core func $libc_panic "realloc")))
   )
 
   (core module $m
@@ -1202,7 +1251,7 @@ fn use_types_across_component_boundaries() -> Result<()> {
             (type $func-type (func (param "my-record" $my-record)))
             (alias core export $instance "my-func" (core func $my-func))
             (alias core export $instance "memory" (core memory $memory))
-            (func $my-func (type $func-type) (canon lift (core func $my-func) (memory $memory) string-encoding=utf8 (realloc (func $instance "realloc"))))
+            (func $my-func (type $func-type) (canon lift (core func $my-func) (memory $memory) string-encoding=utf8 (realloc (core func $instance "realloc"))))
             (export $export "my-func" (func $my-func))
         )"#
         ),
@@ -1239,7 +1288,7 @@ fn hostcall_fuel_limits_val() -> Result<()> {
                     call $hi)
             )
             (core instance $libc (instantiate $libc))
-            (core func $hi (canon lower (func $hi) (memory $libc "memory")))
+            (core func $hi (canon lower (func $hi) (memory (core memory $libc "memory"))))
             (core instance $i (instantiate $m
                 (with "libc" (instance $libc))
                 (with "" (instance (export "hi" (func $hi))))
@@ -1257,5 +1306,56 @@ fn hostcall_fuel_limits_val() -> Result<()> {
     store.set_hostcall_fuel(100);
     assert!(run.call(&mut store, &[], &mut []).is_err());
 
+    Ok(())
+}
+
+#[test]
+fn host_throw_is_trap() -> Result<()> {
+    for concurrency in [true, false] {
+        let mut config = Config::new();
+        config.wasm_exceptions(true);
+        config.wasm_component_model(true);
+        config.concurrency_support(concurrency);
+        let engine = Engine::new(&config)?;
+        let component = Component::new(
+            &engine,
+            r#"
+                (component
+                    (import "f" (func $f))
+                    (core func $f (canon lower (func $f)))
+                    (core module $m
+                        (import "" "f" (func $f))
+                        (func (export "run")
+                            (block $caught
+                                (try_table (catch_all $caught)
+                                    (call $f))
+                                return)
+                            unreachable)
+                    )
+                    (core instance $i (instantiate $m
+                        (with "" (instance (export "f" (func $f))))
+                    ))
+                    (func (export "run") (canon lift (core func $i "run")))
+                )
+            "#,
+        )?;
+        let mut linker = Linker::<()>::new(&engine);
+        linker.root().func_wrap("f", |mut store, (): ()| {
+            let ty = wasmtime::TagType::new(wasmtime::FuncType::new(store.engine(), [], []));
+            let tag = wasmtime::Tag::new(&mut store, &ty)?;
+            let pre = wasmtime::ExnRefPre::new(&mut store, wasmtime::ExnType::from_tag_type(&ty)?);
+            let exn = wasmtime::ExnRef::new(&mut store, &pre, &tag, &[])?;
+            store.throw::<()>(exn)
+        })?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component)?;
+        let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+        let err = run.call(&mut store, ()).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<wasmtime::Trap>(),
+            Some(&wasmtime::Trap::UncaughtException),
+            "{err:?}",
+        );
+    }
     Ok(())
 }

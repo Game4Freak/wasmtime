@@ -19,25 +19,27 @@
     i32.load8_u offset=0x1000))
 
 ;; function u0:0(i64 vmctx, i64, i32, i32) tail {
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 215 ""
+;;     region3 = 105 ""
+;;     region4 = 171 ""
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
-;;     gv3 = vmctx
-;;     gv4 = load.i64 notrap aligned gv3+64
-;;     gv5 = load.i64 notrap aligned can_move gv3+56
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32, v3: i32):
 ;; @0040                               v4 = uextend.i64 v2
-;; @0040                               v5 = load.i64 notrap aligned v0+64
+;; @0040                               v5 = load.i64 notrap aligned region3 v0+64
 ;; @0040                               v6 = icmp ugt v4, v5
-;; @0040                               v7 = load.i64 notrap aligned can_move v0+56
+;; @0040                               v7 = load.i64 notrap aligned can_move region2 v0+56
 ;; @0040                               v8 = iadd v7, v4
 ;; @0040                               v9 = iconst.i64 4096
 ;; @0040                               v10 = iadd v8, v9  ; v9 = 4096
 ;; @0040                               v11 = iconst.i64 0
 ;; @0040                               v12 = select_spectre_guard v6, v11, v10  ; v11 = 0
-;; @0040                               istore8 little heap v3, v12
+;; @0040                               istore8 little region4 v3, v12
 ;; @0044                               jump block1
 ;;
 ;;                                 block1:
@@ -45,27 +47,29 @@
 ;; }
 ;;
 ;; function u0:1(i64 vmctx, i64, i32) -> i32 tail {
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 215 ""
+;;     region3 = 105 ""
+;;     region4 = 171 ""
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
-;;     gv3 = vmctx
-;;     gv4 = load.i64 notrap aligned gv3+64
-;;     gv5 = load.i64 notrap aligned can_move gv3+56
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32):
-;; @0049                               v4 = uextend.i64 v2
-;; @0049                               v5 = load.i64 notrap aligned v0+64
-;; @0049                               v6 = icmp ugt v4, v5
-;; @0049                               v7 = load.i64 notrap aligned can_move v0+56
-;; @0049                               v8 = iadd v7, v4
-;; @0049                               v9 = iconst.i64 4096
-;; @0049                               v10 = iadd v8, v9  ; v9 = 4096
-;; @0049                               v11 = iconst.i64 0
-;; @0049                               v12 = select_spectre_guard v6, v11, v10  ; v11 = 0
-;; @0049                               v13 = uload8.i32 little heap v12
+;; @0049                               v3 = uextend.i64 v2
+;; @0049                               v4 = load.i64 notrap aligned region3 v0+64
+;; @0049                               v5 = icmp ugt v3, v4
+;; @0049                               v6 = load.i64 notrap aligned can_move region2 v0+56
+;; @0049                               v7 = iadd v6, v3
+;; @0049                               v8 = iconst.i64 4096
+;; @0049                               v9 = iadd v7, v8  ; v8 = 4096
+;; @0049                               v10 = iconst.i64 0
+;; @0049                               v11 = select_spectre_guard v5, v10, v9  ; v10 = 0
+;; @0049                               v12 = uload8.i32 little region4 v11
 ;; @004d                               jump block1
 ;;
 ;;                                 block1:
-;; @004d                               return v13
+;; @004d                               return v12
 ;; }

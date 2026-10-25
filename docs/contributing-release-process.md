@@ -11,7 +11,8 @@ and all that needs to be done is to merge GitHub PRs that CI will
 generate. At a high-level the structure of Wasmtime's release process is:
 
 * On the 5th of every month a new `release-X.Y.Z` branch is created with the
-  current contents of `main`.
+  current contents of `main`, and `X.Y.Z-rc.1` is published as a release
+  candidate.
 * On the 20th of every month this release branch is published to crates.io and
   release artifacts are built.
 
@@ -21,6 +22,16 @@ development on `main` and additionally happen once a month. The lag time behind
 testing for any users using `main`. It's expected, though, that most consumers
 will likely use the release branches of wasmtime.
 
+Version numbers move through a lifecycle over the course of this process:
+
+* The `main` branch permanently carries a `X.Y.Z-dev` version. This version is
+  never published anywhere and exists to make it obvious that a checkout of
+  `main` is in-development.
+* Once a release branch is cut it moves to `X.Y.Z-rc.1`, which is published to
+  crates.io and as a GitHub pre-release. Further release candidates may be cut
+  as `-rc.2`, `-rc.3`, etc.
+* On release day the pre-release suffix is dropped and `X.Y.Z` is published.
+
 A detailed list of all the steps in the release automation process are below.
 The steps requiring interactions are **bolded**, otherwise everything else is
 automatic and this is documenting what automation does.
@@ -29,25 +40,39 @@ automatic and this is documenting what automation does.
    `.github/workflows/release-process.yml`) a CI job
    will run and do these steps:
    * Download the current `main` branch
-   * Push the `main` branch to `release-X.Y.Z`
-   * Run `./scripts/publish.rs` with the `bump` argument
+   * Push the `main` branch to `release-X.0.0`
+   * Run the `wasmtime-publish` crate with the `bump-major` argument
    * Commit the changes
    * Push these changes to a temporary `ci/*` branch
    * Open a PR with this branch against `main`
+   * Then, starting again from the commit the release branch was cut at, run
+     the `wasmtime-publish` crate with the `bump-rc` argument to move to
+     `X.0.0-rc.1`, add the tag-and-release marker to the commit message, and
+     open a second PR against `release-X.0.0`
    * This step can also be [triggered manually][ci-trigger] with the `main`
      branch and the `cut` argument.
-2. **A maintainer of Wasmtime merges this PR**
-   * It's intended that this PR can be immediately merged as the release branch
-     has been created and all it's doing is bumping the version.
-3. **Time passes and the `release-X.Y.Z` branch is maintained**
-   * All changes land on `main` first, then are backported to `release-X.Y.Z` as
+2. **A maintainer of Wasmtime merges these two PRs**
+   * It's intended that both PRs can be immediately merged as all they're doing
+     is bumping the version.
+   * Merging the release branch PR publishes `X.0.0-rc.1` following the same
+     tag-and-publish path as a real release, except that the GitHub release is
+     marked as a pre-release.
+3. **Time passes and the `release-X.0.0` branch is maintained**
+   * All changes land on `main` first, then are backported to `release-X.0.0` as
      necessary.
+   * If enough has changed to be worth testing again, a new release candidate
+     can be [triggered manually][ci-trigger] with the release branch selected
+     and the `release-rc` argument. This opens a PR bumping to the next `-rc.N`;
+     merging it publishes that candidate and yanks the previous one.
 4. On the 20th of every month (same CI job as before) another CI job will run
    performing:
-   * Reset to `release-X.Y.Z`
-   * Update the release date of `X.Y.Z` to today in `RELEASES.md`
-   * Add a special marker to the commit message to indicate a tag should be made.
-   * Open a PR against `release-X.Y.Z` for this change
+   * Reset to `release-X.0.0`
+   * Run the `wasmtime-publish` crate with the `bump-drop-rc` argument to drop
+     the `-rc.N` suffix, leaving the version at `X.0.0`
+   * Update the release date of `X.0.0` to today in `RELEASES.md`
+   * Add a special marker to the commit message to indicate a tag should be
+     made.
+   * Open a PR against `release-X.0.0` for this change
    * This step can also be [triggered manually][ci-trigger] with the `main`
      branch and the `release-latest` argument.
 5. **A maintainer of Wasmtime merges this PR**
@@ -86,8 +111,8 @@ of criteria. It's done on an as-needed basis. Requirements, however, are:
   equally patched to ensure that releases remain consistent.
 
 * Patch releases must not contain API-breaking changes in public crates. The
-  list of `PUBLIC_CRATES` in `scripts/publish.rs` is the list of crates to worry
-  about in terms of breaking changes.
+  list of `PUBLIC_CRATES` in `crates/misc/publish/src/main.rs` is the list of
+  crates to worry about in terms of breaking changes.
 
 * Wasm-level ABI-breaking changes are by default not allowed in patch releases.
   Users are expected to, for example, be able to load `*.cwasm` artifacts from
@@ -109,14 +134,14 @@ Like above human interaction is indicated with **bold** text in these steps.
      it's at most broken for a week. Nevertheless issues come up, so be aware
      that CI may be green on `main` but red on a release branch.
    * When merging backports maintainers need to double-check that the
-     `PUBLIC_CRATES` listed in `scripts/publish.rs` do not have
+     `PUBLIC_CRATES` listed in `crates/misc/publish/src/main.rs` do not have
      semver-API-breaking changes (in the strictest sense). All security fixes
      must be done in such a way that the API doesn't break between the patch
      version and the original version.
    * Don't forget to write patch notes in `RELEASES.md` for backported changes.
 2. **The patch release process is [triggered manually][ci-trigger] with
    the `release-2.0.0` branch and the `release-patch` argument**
-   * This will run the `release-process.yml` workflow. The `scripts/publish.rs`
+   * This will run the `release-process.yml` workflow. The `wasmtime-publish`
      script will be run with the `bump-patch` argument.
    * The changes will be committed with a special marker indicating a release
      needs to be made.
@@ -153,6 +178,57 @@ the repository. Management of this file looks like:
 This means that `RELEASES.md` only has release notes for the release branch that
 it is on. Historical release notes can be found through links at the bottom to
 previous copies of `RELEASES.md`
+
+### Writing release notes for a major release
+
+Release notes for a major release are written on the `release-X.0.0` branch some
+time between the branch being cut and the release itself. To get a log of all
+commits to document for the 50.0.0 release, use a command like:
+
+```console
+$ git log --oneline \
+    $(git merge-base origin/release-49.0.0 origin/release-50.0.0)..origin/release-50.0.0
+```
+
+Commits are manually reviewed to typically go into one of three buckets in the
+release notes section: Added, Changed, or Fixed. Use your best judgement for
+deciding what gets a release note and what doesn't, there's no strict guidelines
+at this time. In general internal changes like those for CI aren't documented,
+and if a fix for something is particularly niche then it's also not always
+documented. Erring on the side of documenting it is fine though.
+
+Stylistically release note entries look like:
+
+* Each entry is assigned a bullet, blank lines between entries.
+* A summary sentence is written with a link to the PR(s) below that. Note that
+  the link must be a manual markdown link, #12345 is not enough.
+* Security fixes link to their advisory rather than the PR.
+
+For example:
+
+```markdown
+### Added
+
+* Wasmtime now supports the WebAssembly compact imports proposal, disabled by
+  default, via `Config::wasm_compact_imports`.
+  [#14335](https://github.com/bytecodealliance/wasmtime/pull/14335)
+
+### Changed
+
+* Wasmtime now requires Rust 1.97.0 to compile.
+  [#14466](https://github.com/bytecodealliance/wasmtime/pull/14466)
+```
+
+The release date line, `Unreleased.`, is left as-is as it's automatically
+updated during the release process.
+
+### Writing release notes for a patch release
+
+Patch release notes are written as part of each backport PR, or alternatively
+in the PR generated by the `release-patch` process. A new `## X.Y.Z` section is
+added at the top of `RELEASES.md`. Be sure to include the `----` separator
+between releases as this is used in the release automation to determine what
+notes go into the github release.
 
 ## Keeping Old release branch CI up-to-date
 

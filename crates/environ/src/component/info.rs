@@ -48,7 +48,7 @@
 
 use crate::component::*;
 use crate::prelude::*;
-use crate::{EntityIndex, ModuleInternedTypeIndex, PrimaryMap, WasmValType};
+use crate::{EntityIndex, ModuleInternedTypeIndex, PrimaryMap, Trap, WasmValType};
 use cranelift_entity::packed_option::PackedOption;
 use serde_derive::{Deserialize, Serialize};
 
@@ -76,7 +76,7 @@ pub struct Component {
     ///
     /// Note that each name is given an `ImportIndex` here for the next map to
     /// refer back to.
-    pub import_types: PrimaryMap<ImportIndex, (String, TypeDef)>,
+    pub import_types: TryPrimaryMap<ImportIndex, (TryString, ComponentExtern)>,
 
     /// A list of "flattened" imports that are used by this instance.
     ///
@@ -104,16 +104,16 @@ pub struct Component {
     // strings could otherwise be globally intern'd via some other mechanism to
     // avoid `Linker`-specific intern-ing plus intern-ing here. Unsure what the
     // best route is or whether such an optimization is even necessary here.
-    pub imports: PrimaryMap<RuntimeImportIndex, (ImportIndex, Vec<String>)>,
+    pub imports: TryPrimaryMap<RuntimeImportIndex, (ImportIndex, TryVec<TryString>)>,
 
     /// This component's own root exports from the component itself.
-    pub exports: NameMap<TryString, ExportIndex>,
+    pub exports: NameMap<TryString, (ExportIndex, ComponentExternData)>,
 
     /// All exports of this component and exported instances of this component.
     ///
     /// This is indexed by `ExportIndex` for fast lookup and `Export::Instance`
     /// will refer back into this list.
-    pub export_items: PrimaryMap<ExportIndex, Export>,
+    pub export_items: TryPrimaryMap<ExportIndex, Export>,
 
     /// Initializers that must be processed when instantiating this component.
     ///
@@ -124,7 +124,7 @@ pub struct Component {
     /// have instantiations, for example, in addition to entries which
     /// initialize `VMComponentContext` fields with previously instantiated
     /// instances.
-    pub initializers: Vec<GlobalInitializer>,
+    pub initializers: TryVec<GlobalInitializer>,
 
     /// The number of runtime instances (maximum `RuntimeInstanceIndex`) created
     /// when instantiating this component.
@@ -161,7 +161,7 @@ pub struct Component {
     pub num_runtime_post_returns: u32,
 
     /// WebAssembly type signature of all trampolines.
-    pub trampolines: PrimaryMap<TrampolineIndex, ModuleInternedTypeIndex>,
+    pub trampolines: TryPrimaryMap<TrampolineIndex, ModuleInternedTypeIndex>,
 
     /// A map from a `UnsafeIntrinsic::index()` to that intrinsic's
     /// module-interned type.
@@ -191,18 +191,19 @@ pub struct Component {
     /// imports array.
     ///
     /// This map is only as large as the number of imported resources.
-    pub imported_resources: PrimaryMap<ResourceIndex, RuntimeImportIndex>,
+    pub imported_resources: TryPrimaryMap<ResourceIndex, RuntimeImportIndex>,
 
     /// Metadata about which component instances defined each resource within
     /// this component.
     ///
     /// This is used to determine which set of instance flags are inspected when
     /// testing reentrance.
-    pub defined_resource_instances: PrimaryMap<DefinedResourceIndex, RuntimeComponentInstanceIndex>,
+    pub defined_resource_instances:
+        TryPrimaryMap<DefinedResourceIndex, RuntimeComponentInstanceIndex>,
 
     /// All canonical options used by this component. Stored as a table here
     /// from index-to-options so the options can be consulted at runtime.
-    pub options: PrimaryMap<OptionsIndex, CanonicalOptions>,
+    pub options: TryPrimaryMap<OptionsIndex, CanonicalOptions>,
 }
 
 impl Component {
@@ -221,6 +222,15 @@ impl Component {
     /// which includes all imports.
     pub fn resource_index(&self, idx: DefinedResourceIndex) -> ResourceIndex {
         ResourceIndex::from_u32(self.imported_resources.len() as u32 + idx.as_u32())
+    }
+
+    /// Returns the component instance which defines `idx`, or `None` if `idx`
+    /// is imported rather than defined within this component.
+    pub fn defined_resource_instance(
+        &self,
+        idx: ResourceIndex,
+    ) -> Option<RuntimeComponentInstanceIndex> {
+        Some(self.defined_resource_instances[self.defined_resource_index(idx)?])
     }
 }
 
@@ -359,7 +369,7 @@ pub enum InstantiateModule {
     /// order of imports required is statically known and can be pre-calculated
     /// to avoid string lookups related to names at runtime, represented by the
     /// flat list of arguments here.
-    Static(StaticModuleIndex, Box<[CoreDef]>),
+    Static(StaticModuleIndex, TryVec<CoreDef>),
 
     /// An imported module is being instantiated.
     ///
@@ -368,7 +378,7 @@ pub enum InstantiateModule {
     /// runtime.
     Import(
         RuntimeImportIndex,
-        IndexMap<String, IndexMap<String, CoreDef>>,
+        TryIndexMap<TryString, TryIndexMap<TryString, CoreDef>>,
     ),
 }
 
@@ -379,7 +389,7 @@ pub enum InstantiateModule {
 /// during compile time of the component itself. References to core wasm items
 /// are "compiled" to either referring to a previous instance or to some sort of
 /// lowered host import.
-#[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub enum CoreDef {
     /// This item refers to an export of a previously instantiated core wasm
     /// instance.
@@ -392,10 +402,17 @@ pub enum CoreDef {
     Trampoline(TrampolineIndex),
     /// An intrinsic for compile-time builtins.
     UnsafeIntrinsic(UnsafeIntrinsic),
-    /// Reference to a wasm global which represents a runtime-managed boolean
-    /// indicating whether the currently-running task may perform a blocking
-    /// operation.
-    TaskMayBlock,
+}
+
+impl TryClone for CoreDef {
+    fn try_clone(&self) -> Result<Self, OutOfMemory> {
+        Ok(match self {
+            CoreDef::Export(e) => CoreDef::Export(e.try_clone()?),
+            CoreDef::InstanceFlags(i) => CoreDef::InstanceFlags(*i),
+            CoreDef::Trampoline(i) => CoreDef::Trampoline(*i),
+            CoreDef::UnsafeIntrinsic(i) => CoreDef::UnsafeIntrinsic(*i),
+        })
+    }
 }
 
 impl<T> From<CoreExport<T>> for CoreDef
@@ -412,7 +429,7 @@ where
 /// Note that the `T` here is the index type for exports which can be
 /// identified by index. The `T` is monomorphized with types like
 /// [`EntityIndex`] or [`FuncIndex`].
-#[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub struct CoreExport<T> {
     /// The instance that this item is located within.
     ///
@@ -423,6 +440,15 @@ pub struct CoreExport<T> {
 
     /// The item that this export is referencing, either by name or by index.
     pub item: ExportItem<T>,
+}
+
+impl<T: TryClone> TryClone for CoreExport<T> {
+    fn try_clone(&self) -> Result<Self, OutOfMemory> {
+        Ok(CoreExport {
+            instance: self.instance,
+            item: self.item.try_clone()?,
+        })
+    }
 }
 
 impl<T> CoreExport<T> {
@@ -440,7 +466,7 @@ impl<T> CoreExport<T> {
 }
 
 /// An index at which to find an item within a runtime instance.
-#[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub enum ExportItem<T> {
     /// An exact index that the target can be found at.
     ///
@@ -455,7 +481,16 @@ pub enum ExportItem<T> {
     ///
     /// This is used for instantiations of imported modules, for example, since
     /// the precise shape of the module is not known.
-    Name(String),
+    Name(TryString),
+}
+
+impl<T: TryClone> TryClone for ExportItem<T> {
+    fn try_clone(&self) -> Result<Self, OutOfMemory> {
+        Ok(match self {
+            ExportItem::Index(i) => ExportItem::Index(i.try_clone()?),
+            ExportItem::Name(name) => ExportItem::Name(name.try_clone()?),
+        })
+    }
 }
 
 /// Possible exports from a component.
@@ -491,7 +526,7 @@ pub enum Export {
         /// Instance type index, if such is assigned
         ty: TypeComponentInstanceIndex,
         /// Instance export map
-        exports: NameMap<TryString, ExportIndex>,
+        exports: NameMap<TryString, (ExportIndex, ComponentExternData)>,
     },
     /// An exported type from a component or instance, currently only
     /// informational.
@@ -534,10 +569,6 @@ pub struct CanonicalOptions {
 
     /// Whether to use the async ABI for lifting or lowering.
     pub async_: bool,
-
-    /// Whether or not this function can consume a task cancellation
-    /// notification.
-    pub cancellable: bool,
 
     /// The core function type that is being lifted from / lowered to.
     pub core_type: ModuleInternedTypeIndex,
@@ -841,16 +872,6 @@ pub enum Trampoline {
         instance: RuntimeComponentInstanceIndex,
     },
 
-    /// A `thread.yield` intrinsic, which yields control to the host so that other
-    /// tasks are able to make progress, if any.
-    ThreadYield {
-        /// The specific component instance which is calling the intrinsic.
-        instance: RuntimeComponentInstanceIndex,
-        /// If `true`, indicates the caller instance may receive notification
-        /// of task cancellation.
-        cancellable: bool,
-    },
-
     /// A `subtask.drop` intrinsic to drop a specified task which has completed.
     SubtaskDrop {
         /// The specific component instance which is calling the intrinsic.
@@ -1053,6 +1074,11 @@ pub enum Trampoline {
     /// Same as `ResourceTransferOwn` but for borrows.
     ResourceTransferBorrow,
 
+    /// Same as `ResourceTransferBorrow` but for a destination instance which
+    /// owns the resource and so receives its representation directly, meaning
+    /// no destination table is consulted.
+    ResourceTransferBorrowToOwner,
+
     /// An intrinsic used by FACT-generated modules to prepare a call involving
     /// an async-lowered import and/or an async-lifted export.
     PrepareCall {
@@ -1062,21 +1088,17 @@ pub enum Trampoline {
         memory: Option<RuntimeMemoryIndex>,
     },
 
-    /// An intrinsic used by FACT-generated modules to start a call involving a
-    /// sync-lowered import and async-lifted export.
-    SyncStartCall {
-        /// The callee's callback function, if any.
-        callback: Option<RuntimeCallbackIndex>,
-    },
-
-    /// An intrinsic used by FACT-generated modules to start a call involving
-    /// an async-lowered import function.
+    /// An intrinsic used by FACT-generated modules to start a call previously
+    /// set up with `PrepareCall`.
     ///
-    /// Note that `AsyncPrepareCall` and `AsyncStartCall` could theoretically be
-    /// combined into a single `AsyncCall` intrinsic, but we separate them to
-    /// allow the FACT-generated module to optionally call the callee directly
-    /// without an intermediate host stack frame.
-    AsyncStartCall {
+    /// This is used for calls where something async is involved, for example an
+    /// async function type, an async lift, or an async lower.
+    ///
+    /// Note that `PrepareCall` and `StartCall` could theoretically be combined
+    /// into a single intrinsic, but we separate them to allow the
+    /// FACT-generated module to optionally call the callee directly without an
+    /// intermediate host stack frame.
+    StartCall {
         /// The callee's callback, if any.
         callback: Option<RuntimeCallbackIndex>,
         /// The callee's post-return function, if any.
@@ -1107,9 +1129,9 @@ pub enum Trampoline {
     /// component does not invalidate the handle in the original component.
     ErrorContextTransfer,
 
-    /// An intrinsic used by FACT-generated modules to trap with a specified
+    /// An intrinsic used by FACT-generated modules to trap with the specified
     /// code.
-    Trap,
+    Trap(Trap),
 
     /// An intrinsic used by FACT-generated modules to push a task onto the
     /// stack for a sync-to-sync, guest-to-guest call.
@@ -1119,58 +1141,68 @@ pub enum Trampoline {
     ExitSyncCall,
 
     /// Intrinsic used to implement the `thread.index` component model builtin.
-    ThreadIndex,
+    ThreadIndex {
+        /// The specific component instance which is calling the intrinsic.
+        instance: RuntimeComponentInstanceIndex,
+    },
 
     /// Intrinsic used to implement the `thread.new-indirect` component model builtin.
     ThreadNewIndirect {
         /// The specific component instance which is calling the intrinsic.
         instance: RuntimeComponentInstanceIndex,
-        /// The type index for the start function of the thread.
-        start_func_ty_idx: ComponentTypeIndex,
+        /// The core function type that the thread's start function must have,
+        /// as declared by the `thread.new-indirect` built-in.
+        start_func_ty_idx: ModuleInternedTypeIndex,
         /// The index of the table that stores the start function.
         start_func_table_idx: RuntimeTableIndex,
     },
 
-    /// Intrinsic used to implement the `thread.suspend-to-suspended` component model builtin.
-    ThreadSuspendToSuspended {
+    /// Intrinsic used to implement the `thread.resume-later` component model
+    /// builtin.
+    ThreadResumeLater {
         /// The specific component instance which is calling the intrinsic.
         instance: RuntimeComponentInstanceIndex,
-        /// If `true`, indicates the caller instance may receive notification
-        /// of task cancellation.
-        cancellable: bool,
-    },
-
-    /// Intrinsic used to implement the `thread.suspend-to` component model builtin.
-    ThreadSuspendTo {
-        /// The specific component instance which is calling the intrinsic.
-        instance: RuntimeComponentInstanceIndex,
-        /// If `true`, indicates the caller instance may receive notification
-        /// of task cancellation.
-        cancellable: bool,
     },
 
     /// Intrinsic used to implement the `thread.suspend` component model builtin.
     ThreadSuspend {
         /// The specific component instance which is calling the intrinsic.
         instance: RuntimeComponentInstanceIndex,
-        /// If `true`, indicates the caller instance may receive notification
-        /// of task cancellation.
-        cancellable: bool,
     },
 
-    /// Intrinsic used to implement the `thread.unsuspend` component model builtin.
-    ThreadUnsuspend {
+    /// A `thread.yield` intrinsic, which yields control to the host so that other
+    /// tasks are able to make progress, if any.
+    ThreadYield {
         /// The specific component instance which is calling the intrinsic.
         instance: RuntimeComponentInstanceIndex,
     },
 
-    /// Intrinsic used to implement the `thread.yield-to-suspended` component model builtin.
-    ThreadYieldToSuspended {
+    /// Intrinsic used to implement the `thread.suspend-then-resume` component
+    /// model builtin.
+    ThreadSuspendThenResume {
         /// The specific component instance which is calling the intrinsic.
         instance: RuntimeComponentInstanceIndex,
-        /// If `true`, indicates the caller instance may receive notification
-        /// of task cancellation.
-        cancellable: bool,
+    },
+
+    /// Intrinsic used to implement the `thread.yield-then-resume` component
+    /// model builtin.
+    ThreadYieldThenResume {
+        /// The specific component instance which is calling the intrinsic.
+        instance: RuntimeComponentInstanceIndex,
+    },
+
+    /// Intrinsic used to implement the `thread.suspend-then-promote` component
+    /// model builtin.
+    ThreadSuspendThenPromote {
+        /// The specific component instance which is calling the intrinsic.
+        instance: RuntimeComponentInstanceIndex,
+    },
+
+    /// Intrinsic used to implement the `thread.yield-then-promote` component
+    /// model builtin.
+    ThreadYieldThenPromote {
+        /// The specific component instance which is calling the intrinsic.
+        instance: RuntimeComponentInstanceIndex,
     },
 }
 
@@ -1203,7 +1235,6 @@ impl Trampoline {
             WaitableSetPoll { .. } => format!("waitable-set-poll"),
             WaitableSetDrop { .. } => format!("waitable-set-drop"),
             WaitableJoin { .. } => format!("waitable-join"),
-            ThreadYield { .. } => format!("thread-yield"),
             SubtaskDrop { .. } => format!("subtask-drop"),
             SubtaskCancel { .. } => format!("subtask-cancel"),
             StreamNew { .. } => format!("stream-new"),
@@ -1225,22 +1256,26 @@ impl Trampoline {
             ErrorContextDrop { .. } => format!("error-context-drop"),
             ResourceTransferOwn => format!("component-resource-transfer-own"),
             ResourceTransferBorrow => format!("component-resource-transfer-borrow"),
+            ResourceTransferBorrowToOwner => {
+                format!("component-resource-transfer-borrow-to-owner")
+            }
             PrepareCall { .. } => format!("component-prepare-call"),
-            SyncStartCall { .. } => format!("component-sync-start-call"),
-            AsyncStartCall { .. } => format!("component-async-start-call"),
+            StartCall { .. } => format!("component-start-call"),
             FutureTransfer => format!("future-transfer"),
             StreamTransfer => format!("stream-transfer"),
             ErrorContextTransfer => format!("error-context-transfer"),
-            Trap => format!("trap"),
+            Trap(trap) => format!("trap-{}", *trap as u8),
             EnterSyncCall => format!("enter-sync-call"),
             ExitSyncCall => format!("exit-sync-call"),
-            ThreadIndex => format!("thread-index"),
+            ThreadIndex { .. } => format!("thread-index"),
             ThreadNewIndirect { .. } => format!("thread-new-indirect"),
-            ThreadSuspendToSuspended { .. } => format!("thread-suspend-to-suspended"),
-            ThreadSuspendTo { .. } => format!("thread-suspend-to"),
+            ThreadResumeLater { .. } => format!("thread-resume-later"),
             ThreadSuspend { .. } => format!("thread-suspend"),
-            ThreadUnsuspend { .. } => format!("thread-unsuspend"),
-            ThreadYieldToSuspended { .. } => format!("thread-yield-to-suspended"),
+            ThreadYield { .. } => format!("thread-yield"),
+            ThreadSuspendThenResume { .. } => format!("thread-suspend-then-resume"),
+            ThreadYieldThenResume { .. } => format!("thread-yield-then-resume"),
+            ThreadSuspendThenPromote { .. } => format!("thread-suspend-then-promote"),
+            ThreadYieldThenPromote { .. } => format!("thread-yield-then-promote"),
         }
     }
 }

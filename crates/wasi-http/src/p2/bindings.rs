@@ -27,11 +27,15 @@ mod generated {
             "wasi:http/types.outgoing-request": types::HostOutgoingRequest,
             "wasi:http/types.incoming-request": types::HostIncomingRequest,
             "wasi:http/types.fields": crate::FieldMap,
-            "wasi:http/types.request-options": types::HostRequestOptions,
+            "wasi:http/types.request-options": crate::RequestOptions,
         },
         trappable_error_type: {
             "wasi:http/types.error-code" => crate::p2::HttpError,
             "wasi:http/types.header-error" => crate::p2::HeaderError,
+        },
+        named_imports: {
+            "wasi:http/outgoing-handler": wasmtime_wasi::NamedId,
+            "wasi:http/types": wasmtime_wasi::NamedId,
         },
     });
 }
@@ -40,6 +44,9 @@ pub use self::generated::wasi::*;
 
 /// Raw bindings to the `wasi:http/proxy` exports.
 pub use self::generated::exports;
+
+/// Raw bindings to `wasi:http` interfaces when used as named imports.
+pub use self::generated::named_imports;
 
 /// Bindings to the `wasi:http/proxy` world.
 pub use self::generated::{LinkOptions, Proxy, ProxyIndices, ProxyPre};

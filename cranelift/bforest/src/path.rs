@@ -4,7 +4,7 @@ use super::node::Removed;
 use super::{Comparator, Forest, MAX_PATH, Node, NodeData, NodePool, slice_insert, slice_shift};
 use core::borrow::Borrow;
 use core::marker::PhantomData;
-use wasmtime_core::error::OutOfMemory;
+use wasmtime_core::{alloc::PanicOnOom, error::OutOfMemory};
 
 #[cfg(test)]
 use core::fmt;
@@ -82,7 +82,7 @@ impl<F: Forest> Path<F> {
                         }
                     };
                 }
-                NodeData::Free { .. } => panic!("Free {} reached from {}", node, root),
+                NodeData::Free { .. } => panic!("Free {node} reached from {root}"),
             }
         }
         unreachable!();
@@ -98,7 +98,7 @@ impl<F: Forest> Path<F> {
             match pool[node] {
                 NodeData::Inner { tree, .. } => node = tree[0],
                 NodeData::Leaf { keys, vals, .. } => return (keys.borrow()[0], vals.borrow()[0]),
-                NodeData::Free { .. } => panic!("Free {} reached from {}", node, root),
+                NodeData::Free { .. } => panic!("Free {node} reached from {root}"),
             }
         }
         unreachable!();
@@ -216,7 +216,7 @@ impl<F: Forest> Path<F> {
                     self.size = l + 1;
                     break;
                 }
-                NodeData::Free { .. } => panic!("Free {} reached from {}", node, root),
+                NodeData::Free { .. } => panic!("Free {node} reached from {root}"),
             }
         }
         node
@@ -296,6 +296,12 @@ impl<F: Forest> Path<F> {
     ) -> Result<(), OutOfMemory> {
         let orig_root = self.node[0];
 
+        // In the worst case this will perform one allocation for each iteration
+        // of the loop and one additional allocation at the end. Reserving each
+        // of these nodes up front guarantees that we'll either OOM now or the
+        // full operation will succeed.
+        pool.reserve(self.size + 1)?;
+
         // Loop invariant: We need to split the node at `level` and then retry a failed insertion.
         // The items to insert are either `(key, ins_node)` or `(key, value)`.
         let mut ins_node = None;
@@ -305,7 +311,7 @@ impl<F: Forest> Path<F> {
             let mut node = self.node[level];
             let mut entry = self.entry[level].into();
             split = pool[node].split(entry);
-            let rhs_node = pool.alloc_node(split.rhs_data)?;
+            let rhs_node = pool.alloc_node(split.rhs_data).panic_on_oom();
 
             // Should the path be moved to the new RHS node?
             // Prefer the smaller node if we're right in the middle.
@@ -365,7 +371,9 @@ impl<F: Forest> Path<F> {
 
         // If we get here we have split the original root node and need to add an extra level.
         let rhs_node = ins_node.expect("empty path");
-        let root = pool.alloc_node(NodeData::inner(orig_root, key, rhs_node))?;
+        let root = pool
+            .alloc_node(NodeData::inner(orig_root, key, rhs_node))
+            .panic_on_oom();
         let entry = if self.node[0] == rhs_node { 1 } else { 0 };
         self.size += 1;
         slice_insert(&mut self.node[0..self.size], 0, root);

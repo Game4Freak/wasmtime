@@ -1,5 +1,6 @@
 use crate::{
-    WasmtimeStoreContextMut, wasmtime_anyref_t, wasmtime_arrayref_t, wasmtime_structref_t,
+    WasmtimeStoreContextMut, wasmtime_anyref_t, wasmtime_arrayref_t, wasmtime_heaptype_t,
+    wasmtime_structref_t,
 };
 use std::mem::MaybeUninit;
 use wasmtime::{ArrayRef, EqRef, I31, OwnedRooted, RootScope, StructRef};
@@ -17,7 +18,7 @@ pub unsafe extern "C" fn wasmtime_eqref_to_anyref(
     out: &mut MaybeUninit<wasmtime_anyref_t>,
 ) {
     let anyref = eqref.and_then(|e| e.as_wasmtime()).map(|e| e.to_anyref());
-    crate::initialize(out, anyref.into());
+    out.write(anyref.into());
 }
 
 #[unsafe(no_mangle)]
@@ -29,7 +30,7 @@ pub extern "C" fn wasmtime_eqref_from_i31(
     let mut scope = RootScope::new(cx);
     let eqref = EqRef::from_i31(&mut scope, I31::wrapping_u32(val));
     let eqref = eqref.to_owned_rooted(&mut scope).expect("in scope");
-    crate::initialize(out, Some(eqref).into())
+    out.write(Some(eqref).into());
 }
 
 #[unsafe(no_mangle)]
@@ -52,7 +53,7 @@ pub unsafe extern "C" fn wasmtime_eqref_i31_get_u(
     let mut scope = RootScope::new(cx);
     if let Some(eqref) = eqref.and_then(|e| e.as_wasmtime()) {
         if let Some(val) = eqref.as_i31(&mut scope).expect("in scope") {
-            crate::initialize(dst, val.get_u32());
+            dst.write(val.get_u32());
             return true;
         }
     }
@@ -68,7 +69,7 @@ pub unsafe extern "C" fn wasmtime_eqref_i31_get_s(
     let mut scope = RootScope::new(cx);
     if let Some(eqref) = eqref.and_then(|e| e.as_wasmtime()) {
         if let Some(val) = eqref.as_i31(&mut scope).expect("in scope") {
-            crate::initialize(dst, val.get_i32());
+            dst.write(val.get_i32());
             return true;
         }
     }
@@ -97,11 +98,11 @@ pub unsafe extern "C" fn wasmtime_eqref_as_struct(
         let rooted = eqref.to_rooted(&mut scope);
         if let Ok(Some(structref)) = rooted.as_struct(&scope) {
             let owned = structref.to_owned_rooted(&mut scope).expect("in scope");
-            crate::initialize(out, Some(owned).into());
+            out.write(Some(owned).into());
             return true;
         }
     }
-    crate::initialize(out, None::<OwnedRooted<StructRef>>.into());
+    out.write(None::<OwnedRooted<StructRef>>.into());
     false
 }
 
@@ -127,10 +128,26 @@ pub unsafe extern "C" fn wasmtime_eqref_as_array(
         let rooted = eqref.to_rooted(&mut scope);
         if let Ok(Some(arrayref)) = rooted.as_array(&scope) {
             let owned = arrayref.to_owned_rooted(&mut scope).expect("just created");
-            crate::initialize(out, Some(owned).into());
+            out.write(Some(owned).into());
             return true;
         }
     }
-    crate::initialize(out, None::<OwnedRooted<ArrayRef>>.into());
+    out.write(None::<OwnedRooted<ArrayRef>>.into());
     false
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasmtime_eqref_type(
+    mut cx: WasmtimeStoreContextMut<'_>,
+    eqref: Option<&wasmtime_eqref_t>,
+    out: &mut MaybeUninit<wasmtime_heaptype_t>,
+) -> bool {
+    match eqref.and_then(|a| a.as_wasmtime()) {
+        Some(eqref) => {
+            let ty = eqref.ty(&mut cx).expect("should be rooted");
+            out.write(ty.into());
+            true
+        }
+        None => false,
+    }
 }

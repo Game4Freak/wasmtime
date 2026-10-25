@@ -34,9 +34,17 @@ pub unsafe fn commit_pages(ptr: *mut u8, len: usize) -> io::Result<()> {
     Ok(())
 }
 
-pub unsafe fn decommit_pages(ptr: *mut u8, len: usize) -> io::Result<()> {
-    unsafe {
-        std::ptr::write_bytes(ptr, 0, len);
+#[allow(non_camel_case_types)] // matching C conventions
+pub struct iovec {
+    pub iov_base: *mut u8,
+    pub iov_len: usize,
+}
+
+pub unsafe fn decommit_pages(iov: &[iovec]) -> io::Result<()> {
+    for iov in iov {
+        unsafe {
+            std::ptr::write_bytes(iov.iov_base, 0, iov.iov_len);
+        }
     }
     Ok(())
 }
@@ -59,6 +67,15 @@ impl MemoryImageSource {
 
     pub fn from_data(_data: &[u8]) -> io::Result<Option<MemoryImageSource>> {
         Ok(None)
+    }
+
+    pub unsafe fn map_at(
+        &self,
+        _base: *mut u8,
+        _source_offset: u64,
+        _len: usize,
+    ) -> io::Result<()> {
+        match *self {}
     }
 
     pub unsafe fn remap_as_zeros_at(&self, _base: *mut u8, _len: usize) -> io::Result<()> {

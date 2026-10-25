@@ -3,17 +3,19 @@
 #[cfg(feature = "component-model-async")]
 use crate::component::ComponentType;
 use crate::component::matching::InstanceType;
-use crate::{Engine, ExternType, FuncType, prelude::*};
+use crate::component::{ResourceAny, Val};
+use crate::{AsContextMut, Engine, ExternType, FuncType, StoreContextMut, prelude::*};
 use alloc::sync::Arc;
 use core::fmt;
 use core::ops::Deref;
 use wasmtime_environ::PanicOnOom as _;
 use wasmtime_environ::component::{
     ComponentTypes, Export, InterfaceType, ResourceIndex, TypeComponentIndex,
-    TypeComponentInstanceIndex, TypeDef, TypeEnumIndex, TypeFlagsIndex, TypeFuncIndex,
-    TypeFutureIndex, TypeFutureTableIndex, TypeListIndex, TypeMapIndex, TypeModuleIndex,
-    TypeOptionIndex, TypeRecordIndex, TypeResourceTable, TypeResourceTableIndex, TypeResultIndex,
-    TypeStreamIndex, TypeStreamTableIndex, TypeTupleIndex, TypeVariantIndex,
+    TypeComponentInstanceIndex, TypeDef, TypeEnumIndex, TypeFixedLengthListIndex, TypeFlagsIndex,
+    TypeFuncIndex, TypeFutureIndex, TypeFutureTableIndex, TypeListIndex, TypeMapIndex,
+    TypeModuleIndex, TypeOptionIndex, TypeRecordIndex, TypeResourceTable, TypeResourceTableIndex,
+    TypeResultIndex, TypeStreamIndex, TypeStreamTableIndex, TypeTupleIndex, TypeVariantIndex,
+    alternate_lookup_key,
 };
 
 pub use crate::component::resources::ResourceType;
@@ -165,7 +167,10 @@ impl TypeChecker<'_> {
             (InterfaceType::Stream(_), _) => false,
             (InterfaceType::ErrorContext(_), InterfaceType::ErrorContext(_)) => true,
             (InterfaceType::ErrorContext(_), _) => false,
-            (InterfaceType::FixedLengthList(_), _) => todo!(), // FIXME(#12279)
+            (InterfaceType::FixedLengthList(t1), InterfaceType::FixedLengthList(t2)) => {
+                self.fixed_length_lists_equal(t1, t2)
+            }
+            (InterfaceType::FixedLengthList(_), _) => false,
         }
     }
 
@@ -179,6 +184,19 @@ impl TypeChecker<'_> {
         let a = &self.a_types[m1];
         let b = &self.b_types[m2];
         self.interface_types_equal(a.key, b.key) && self.interface_types_equal(a.value, b.value)
+    }
+
+    fn fixed_length_lists_equal(
+        &self,
+        l1: wasmtime_environ::component::TypeFixedLengthListIndex,
+        l2: wasmtime_environ::component::TypeFixedLengthListIndex,
+    ) -> bool {
+        let a = &self.a_types[l1];
+        let b = &self.b_types[l2];
+        if a.size != b.size {
+            return false;
+        }
+        self.interface_types_equal(a.element, b.element)
     }
 
     fn resources_equal(&self, o1: TypeResourceTableIndex, o2: TypeResourceTableIndex) -> bool {
@@ -363,6 +381,34 @@ impl Map {
     /// Retrieve the value type of this `map`.
     pub fn value(&self) -> Type {
         Type::from(&self.0.types[self.0.index].value, &self.0.instance())
+    }
+}
+/// A `list` interface type
+#[derive(Clone, Debug)]
+pub struct FixedLengthList(Handle<TypeFixedLengthListIndex>);
+
+impl PartialEq for FixedLengthList {
+    fn eq(&self, other: &Self) -> bool {
+        self.0
+            .equivalent(&other.0, TypeChecker::fixed_length_lists_equal)
+    }
+}
+
+impl Eq for FixedLengthList {}
+
+impl FixedLengthList {
+    pub(crate) fn from(index: TypeFixedLengthListIndex, ty: &InstanceType<'_>) -> Self {
+        FixedLengthList(Handle::new(index, ty))
+    }
+
+    /// Retrieve the element type of this `list`.
+    pub fn ty(&self) -> Type {
+        Type::from(&self.0.types[self.0.index].element, &self.0.instance())
+    }
+
+    /// Retrieve the length of this `list`.
+    pub fn len(&self) -> u32 {
+        self.0.types[self.0.index].size
     }
 }
 
@@ -738,6 +784,7 @@ pub enum Type {
     Future(FutureType),
     Stream(StreamType),
     ErrorContext,
+    FixedLengthList(FixedLengthList),
 }
 
 impl Type {
@@ -751,6 +798,19 @@ impl Type {
             &handle
         } else {
             panic!("attempted to unwrap a {} as a list", self.desc())
+        }
+    }
+
+    /// Retrieve the inner [`Map`] of a [`Type::Map`].
+    ///
+    /// # Panics
+    ///
+    /// This will panic if `self` is not a [`Type::Map`].
+    pub fn unwrap_map(&self) -> &Map {
+        if let Type::Map(handle) = self {
+            &handle
+        } else {
+            panic!("attempted to unwrap a {} as a map", self.desc())
         }
     }
 
@@ -899,8 +959,128 @@ impl Type {
             InterfaceType::Future(index) => Type::Future(instance.future_type(*index)),
             InterfaceType::Stream(index) => Type::Stream(instance.stream_type(*index)),
             InterfaceType::ErrorContext(_) => Type::ErrorContext,
-            InterfaceType::FixedLengthList(_) => todo!(), // FIXME(#12279)
+            InterfaceType::FixedLengthList(index) => {
+                Type::FixedLengthList(FixedLengthList::from(*index, instance))
+            }
         }
+    }
+
+    /// Construct a default value of this type, if one exists.
+    ///
+    /// Defaults are the "empty" or "zero" value of each type: zero for the
+    /// numerics, the empty `string`/`list`, `none` for `option`, `ok` for
+    /// `result`, no flags set, and the first case of a `variant` or `enum`.
+    ///
+    /// An `own` or `borrow` of a host-defined resource defaults to a fresh
+    /// handle in `store`, with an arbitrary representation and no destructor.
+    /// Nothing can be done with such a handle beyond passing it back to the
+    /// component that the resource was defined for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an `own` or `borrow` of a guest-defined resource,
+    /// whose representation belongs to the guest and so cannot be conjured by
+    /// the host.
+    ///
+    /// Returns an error for `future`, `stream`, and `error-context`, as there
+    /// is currently no way to synthesize these without statically knowing
+    /// their payload type.
+    ///
+    /// An aggregate containing any of the above is an error for the same
+    /// reason.
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error
+    /// when memory allocation fails. See the `OutOfMemory` type's
+    /// documentation for details on Wasmtime's out-of-memory handling.
+    pub fn default_value(&self, mut store: impl AsContextMut) -> Result<Val> {
+        self.default_value_impl(store.as_context_mut())
+    }
+
+    /// Recursive implementation of `default_value`.
+    fn default_value_impl<T>(&self, mut store: StoreContextMut<'_, T>) -> Result<Val> {
+        Ok(match self {
+            Type::Bool => Val::Bool(false),
+            Type::S8 => Val::S8(0),
+            Type::U8 => Val::U8(0),
+            Type::S16 => Val::S16(0),
+            Type::U16 => Val::U16(0),
+            Type::S32 => Val::S32(0),
+            Type::U32 => Val::U32(0),
+            Type::S64 => Val::S64(0),
+            Type::U64 => Val::U64(0),
+            Type::Float32 => Val::Float32(0.0),
+            Type::Float64 => Val::Float64(0.0),
+            Type::Char => Val::Char('\0'),
+            Type::String => Val::String(String::new()),
+
+            // These never visit their payload types.
+            Type::List(_) => Val::List(Vec::new()),
+            Type::Map(_) => Val::Map(Vec::new()),
+            Type::Option(_) => Val::Option(None),
+            Type::Flags(_) => Val::Flags(Vec::new()),
+
+            Type::Enum(e) => {
+                let name = e.names().next().ok_or_else(|| {
+                    format_err!("no default value exists for an `enum` with no cases")
+                })?;
+                Val::Enum(name.to_string())
+            }
+
+            Type::Record(record) => {
+                let mut fields = TryVec::with_capacity(record.fields().len())?;
+                for field in record.fields() {
+                    let val = field.ty.default_value_impl(store.as_context_mut())?;
+                    fields.push((field.name.to_string(), val))?;
+                }
+                Val::Record(fields.into())
+            }
+
+            Type::Tuple(tuple) => {
+                let mut vals = TryVec::with_capacity(tuple.types().len())?;
+                for ty in tuple.types() {
+                    vals.push(ty.default_value_impl(store.as_context_mut())?)?;
+                }
+                Val::Tuple(vals.into())
+            }
+
+            Type::Variant(variant) => {
+                let case = variant.cases().next().ok_or_else(|| {
+                    format_err!("no default value exists for a `variant` with no cases")
+                })?;
+                let payload = match &case.ty {
+                    Some(ty) => Some(Box::new(ty.default_value_impl(store.as_context_mut())?)),
+                    None => None,
+                };
+                Val::Variant(case.name.to_string(), payload)
+            }
+
+            Type::Result(result) => Val::Result(Ok(match result.ok() {
+                Some(ty) => Some(Box::new(ty.default_value_impl(store.as_context_mut())?)),
+                None => None,
+            })),
+
+            Type::FixedLengthList(list) => {
+                // Every element has the same type, so one value is cloned.
+                let element = list.ty().default_value_impl(store.as_context_mut())?;
+                let len = usize::try_from(list.len())?;
+                let mut vals = TryVec::with_capacity(len)?;
+                for _ in 0..len {
+                    vals.push(element.clone())?;
+                }
+                Val::FixedLengthList(vals.into())
+            }
+
+            // The `rep` is arbitrary and never dereferenced: there is no
+            // destructor, and the handle is opaque to everything but the
+            // component that defines the resource.
+            Type::Own(ty) | Type::Borrow(ty) => {
+                Val::Resource(ResourceAny::new_own_dynamic(*ty, 0, &mut store)?)
+            }
+
+            Type::Future(_) | Type::Stream(_) | Type::ErrorContext => {
+                bail!("no default value exists for type `{}`", self.desc())
+            }
+        })
     }
 
     fn desc(&self) -> &'static str {
@@ -932,6 +1112,7 @@ impl Type {
             Type::Future(_) => "future",
             Type::Stream(_) => "stream",
             Type::ErrorContext => "error-context",
+            Type::FixedLengthList(_) => "list<_, N>",
         }
     }
 }
@@ -1031,43 +1212,43 @@ impl Component {
     }
 
     /// Returns import associated with `name`, if such exists in the component
-    pub fn get_import(&self, engine: &Engine, name: &str) -> Option<ComponentItem> {
+    pub fn get_import<'a>(&'a self, engine: &'a Engine, name: &str) -> Option<ComponentExtern<'a>> {
         self.0.types[self.0.index]
             .imports
             .get(name)
-            .map(|ty| ComponentItem::from(engine, ty, &self.0.instance()))
+            .map(|e| ComponentExtern::new(engine, &self.0.instance(), e))
     }
 
     /// Iterates over imports of the component
     pub fn imports<'a>(
         &'a self,
         engine: &'a Engine,
-    ) -> impl ExactSizeIterator<Item = (&'a str, ComponentItem)> + 'a {
-        self.0.types[self.0.index].imports.iter().map(|(name, ty)| {
+    ) -> impl ExactSizeIterator<Item = (&'a str, ComponentExtern<'a>)> + 'a {
+        self.0.types[self.0.index].imports.iter().map(|(name, e)| {
             (
                 name.as_str(),
-                ComponentItem::from(engine, ty, &self.0.instance()),
+                ComponentExtern::new(engine, &self.0.instance(), e),
             )
         })
     }
 
     /// Returns export associated with `name`, if such exists in the component
-    pub fn get_export(&self, engine: &Engine, name: &str) -> Option<ComponentItem> {
+    pub fn get_export<'a>(&'a self, engine: &'a Engine, name: &str) -> Option<ComponentExtern<'a>> {
         self.0.types[self.0.index]
             .exports
             .get(name)
-            .map(|ty| ComponentItem::from(engine, ty, &self.0.instance()))
+            .map(|e| ComponentExtern::new(engine, &self.0.instance(), e))
     }
 
     /// Iterates over exports of the component
     pub fn exports<'a>(
         &'a self,
         engine: &'a Engine,
-    ) -> impl ExactSizeIterator<Item = (&'a str, ComponentItem)> + 'a {
-        self.0.types[self.0.index].exports.iter().map(|(name, ty)| {
+    ) -> impl ExactSizeIterator<Item = (&'a str, ComponentExtern<'a>)> + 'a {
+        self.0.types[self.0.index].exports.iter().map(|(name, e)| {
             (
                 name.as_str(),
-                ComponentItem::from(engine, ty, &self.0.instance()),
+                ComponentExtern::new(engine, &self.0.instance(), e),
             )
         })
     }
@@ -1091,24 +1272,81 @@ impl ComponentInstance {
     }
 
     /// Returns export associated with `name`, if such exists in the component instance
-    pub fn get_export(&self, engine: &Engine, name: &str) -> Option<ComponentItem> {
+    pub fn get_export<'a>(&'a self, engine: &'a Engine, name: &str) -> Option<ComponentExtern<'a>> {
         self.0.types[self.0.index]
             .exports
             .get(name)
-            .map(|ty| ComponentItem::from(engine, ty, &self.0.instance()))
+            .map(|e| ComponentExtern::new(engine, &self.0.instance(), e))
     }
 
     /// Iterates over exports of the component instance
     pub fn exports<'a>(
         &'a self,
         engine: &'a Engine,
-    ) -> impl ExactSizeIterator<Item = (&'a str, ComponentItem)> {
-        self.0.types[self.0.index].exports.iter().map(|(name, ty)| {
+    ) -> impl ExactSizeIterator<Item = (&'a str, ComponentExtern<'a>)> {
+        self.0.types[self.0.index].exports.iter().map(|(name, e)| {
             (
                 name.as_str(),
-                ComponentItem::from(engine, ty, &self.0.instance()),
+                ComponentExtern::new(engine, &self.0.instance(), e),
             )
         })
+    }
+}
+
+/// An import or an export from either [`Component`] or [`ComponentInstance`].
+///
+/// This records the type of the item that is being imported or exported along
+/// with any other metadata associated.
+#[derive(Clone, Debug)]
+pub struct ComponentExtern<'a> {
+    /// The type of this item.
+    pub ty: ComponentItem,
+    /// The `(implements "...")` annotation, if present.
+    pub implements: Option<&'a str>,
+    /// The `(external-id "...")` annotation, if present.
+    ///
+    /// This is a free-form host-defined identifier and is intended to indicate
+    /// how the host should satisfy an import (or interpret an export).
+    pub external_id: Option<&'a str>,
+}
+
+impl<'a> ComponentExtern<'a> {
+    fn new(
+        engine: &'a Engine,
+        instance_ty: &InstanceType<'_>,
+        env: &'a wasmtime_environ::component::ComponentExtern,
+    ) -> Self {
+        Self {
+            implements: env.data.implements.as_deref(),
+            external_id: env.data.external_id.as_deref(),
+            ty: ComponentItem::from(engine, &env.ty, instance_ty),
+        }
+    }
+
+    /// Returns whether this item is tagged with `(implements "..")` with an
+    /// interface that's compatible with `name`.
+    ///
+    /// This function will return `false` if `(implements "...")` is not
+    /// present. If it is present, and it's equal to `name`, then `true` is
+    /// returned. Failing that, this attempts to perform version-matching to see
+    /// if a compatible version of this item is implemented. For example if
+    /// `(implements "a:b/c@1.1.0")` is specified then this will return `true`
+    /// for `a:b/c@1.0.0` and `a:b/c@1.2.0` as well. The same goes for a
+    /// canonical name such as `(implements "a:b/c@1")`.
+    pub fn is_implements(&self, name: &str) -> bool {
+        let implements = match self.implements {
+            Some(s) => s,
+            None => return false,
+        };
+        if name == implements {
+            return true;
+        }
+
+        // Compare semver-compatible versions in their reduced form, for
+        // example `a:b/c@1.2.0` as `a:b/c@1`. Canonical names are already in
+        // that form, so they're compared as-is.
+        let reduced = |name| alternate_lookup_key(name).map_or(name, |(name, _)| name);
+        reduced(implements) == reduced(name)
     }
 }
 

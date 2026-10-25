@@ -138,6 +138,27 @@ enum wasmtime_trap_code_enum {
   WASMTIME_TRAP_CODE_REFERENCE_COUNT_OVERFLOW = 46,
   /// A read/write on a stream must be <2**28 items.
   WASMTIME_TRAP_CODE_STREAM_OP_TOO_BIG = 47,
+  /// The guest either attempted to add a waitable to a waitable set while it
+  /// was being used in a synchronous operation or tried to use it in a
+  /// synchronous operation while it was added to a waitable set.
+  WASMTIME_TRAP_CODE_WAITABLE_SYNC_AND_ASYNC = 48,
+  /// An exception propagated out of a component without being caught.
+  WASMTIME_TRAP_CODE_UNCAUGHT_EXCEPTION = 49,
+  /// Guest attempted to read from a stream after being notified that the
+  /// writable end was dropped.
+  WASMTIME_TRAP_READ_FROM_DROPPED_STREAM = 50,
+  /// Guest attempted to write to a stream after being notified that the
+  /// readable end was dropped.
+  WASMTIME_TRAP_WRITE_TO_DROPPED_STREAM = 51,
+  /// Guest attempted to write to a future after being notified that the
+  /// readable end was dropped.
+  WASMTIME_TRAP_WRITE_TO_DROPPED_FUTURE = 52,
+  /// Guest attempted to lift a stream after being notified that the writable
+  /// end was dropped.
+  WASMTIME_TRAP_LIFT_DROPPED_STREAM = 53,
+  /// `task.return` or `task.cancel` was called by a task which was not
+  /// created by an `async`-lifted export.
+  WASMTIME_TRAP_CODE_TASK_RETURN_OR_CANCEL_SYNC_LIFTED = 54,
 };
 
 /**

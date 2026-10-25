@@ -12,7 +12,7 @@ use crate::value::{DataValueExt, ValueError};
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::{
     ArgumentPurpose, Block, Endianness, ExternalName, FuncRef, Function, GlobalValue,
-    GlobalValueData, LibCall, MemFlags, StackSlot, Type,
+    GlobalValueData, LibCall, MemFlagsData, StackSlot, Type,
 };
 use log::trace;
 use smallvec::SmallVec;
@@ -322,7 +322,7 @@ impl<'a> State<'a> for InterpreterState<'a> {
         &self,
         addr: Address,
         ty: Type,
-        mem_flags: MemFlags,
+        mem_flags: MemFlagsData,
     ) -> Result<DataValue, MemoryError> {
         let load_size = ty.bytes() as usize;
         let addr_start = addr.offset as usize;
@@ -358,7 +358,7 @@ impl<'a> State<'a> for InterpreterState<'a> {
         &mut self,
         addr: Address,
         v: DataValue,
-        mem_flags: MemFlags,
+        mem_flags: MemFlagsData,
     ) -> Result<(), MemoryError> {
         let store_size = v.ty().bytes() as usize;
         let addr_start = addr.offset as usize;
@@ -537,7 +537,7 @@ impl<'a> State<'a> for InterpreterState<'a> {
                     global_type,
                 }) => {
                     let mut addr = Address::try_from(current_val)?;
-                    let mem_flags = MemFlags::trusted();
+                    let mem_flags = MemFlagsData::trusted();
                     // We can forego bounds checking here since its performed in `checked_load`
                     addr.offset += offset as u64;
                     current_val = self.checked_load(addr, global_type, mem_flags)?;
@@ -575,9 +575,12 @@ mod tests {
         let code = "function %test() -> i8 {
         block0:
             v0 = iconst.i32 1
-            v1 = iadd_imm v0, 1
-            v2 = irsub_imm v1, 44  ; 44 - 2 == 42 (see irsub_imm's semantics)
-            v3 = icmp_imm eq v2, 42
+            v5 = iconst.i32 1
+            v1 = iadd v0, v5
+            v6 = iconst.i32 44
+            v2 = isub v6, v1  ; 44 - 2 == 42
+            v4 = iconst.i32 42
+            v3 = icmp eq v2, v4
             return v3
         }";
 
@@ -596,7 +599,8 @@ mod tests {
         let code = "function %test() -> i32 {
         block0:
             v0 = iconst.i32 1
-            v1 = udiv_imm.i32 v0, 0
+            v2 = iconst.i32 0
+            v1 = udiv v0, v2
             return v1
         }";
 
@@ -617,7 +621,8 @@ mod tests {
         let code = "function %test() -> i8 {
         block0:
             v0 = iconst.i32 -2147483648
-            v1 = sdiv_imm.i32 v0, -1
+            v2 = iconst.i32 -1
+            v1 = sdiv v0, v2
             return v1
         }";
 
@@ -642,14 +647,16 @@ mod tests {
         let code = "
         function %child(i32) -> i32 {
         block0(v0: i32):
-            v1 = iadd_imm v0, -1
+            v2 = iconst.i32 -1
+            v1 = iadd v0, v2
             return v1
         }
 
         function %parent(i32) -> i32 {
             fn42 = %child(i32) -> i32
         block0(v0: i32):
-            v1 = iadd_imm v0, 1
+            v3 = iconst.i32 1
+            v1 = iadd v0, v3
             v2 = call fn42(v1)
             return v2
         }";
@@ -671,7 +678,8 @@ mod tests {
         let code = "function %test() -> i8 {
         block0:
             v0 = iconst.i32 1
-            v1 = iadd_imm v0, 1
+            v2 = iconst.i32 1
+            v1 = iadd v0, v2
             return v1
         }";
 
@@ -685,21 +693,21 @@ mod tests {
 
         assert_eq!(result, ControlFlow::Return(smallvec![DataValue::I32(2)]));
 
-        // With 2 fuel, we should execute the iconst and iadd, but not the return thus giving a
-        // fuel exhausted error
+        // With 3 fuel, we should execute the two iconsts and the iadd, but not the return thus
+        // giving a fuel exhausted error
         let state = InterpreterState::default().with_function_store(env.clone());
         let result = Interpreter::new(state)
-            .with_fuel(Some(2))
+            .with_fuel(Some(3))
             .call_by_name("%test", &[]);
         match result {
             Err(InterpreterError::FuelExhausted) => {}
             _ => panic!("Expected Err(FuelExhausted), but got {result:?}"),
         }
 
-        // With 3 fuel, we should be able to execute the return instruction, and complete the test
+        // With 4 fuel, we should be able to execute the return instruction, and complete the test
         let state = InterpreterState::default().with_function_store(env.clone());
         let result = Interpreter::new(state)
-            .with_fuel(Some(3))
+            .with_fuel(Some(4))
             .call_by_name("%test", &[])
             .unwrap();
 
@@ -716,10 +724,14 @@ mod tests {
             ss1 = explicit_slot 8
 
         block0(v0: i64, v1: i64):
-            stack_store.i64 v0, ss0
-            stack_store.i64 v1, ss1
-            v2 = stack_load.i64 ss0
-            v3 = stack_load.i64 ss1
+            v5 = stack_addr.i64 ss0
+            store.i64 v0, v5
+            v6 = stack_addr.i64 ss1
+            store.i64 v1, v6
+            v7 = stack_addr.i64 ss0
+            v2 = load.i64 v7
+            v8 = stack_addr.i64 ss1
+            v3 = load.i64 v8
             v4 = iadd.i64 v2, v3
             return v4
         }
@@ -730,13 +742,17 @@ mod tests {
             ss1 = explicit_slot 8
 
         block0(v0: i64, v1: i64, v2: i64, v3: i64):
-            stack_store.i64 v0, ss0
-            stack_store.i64 v1, ss1
+            v9 = stack_addr.i64 ss0
+            store.i64 v0, v9
+            v10 = stack_addr.i64 ss1
+            store.i64 v1, v10
 
             v4 = call fn0(v2, v3)
 
-            v5 = stack_load.i64 ss0
-            v6 = stack_load.i64 ss1
+            v11 = stack_addr.i64 ss0
+            v5 = load.i64 v11
+            v12 = stack_addr.i64 ss1
+            v6 = load.i64 v12
 
             v7 = iadd.i64 v4, v5
             v8 = iadd.i64 v7, v6
@@ -772,7 +788,8 @@ mod tests {
 
         block0:
             v0 = iconst.i64 10
-            stack_store.i64 v0, ss0+8
+            v1 = stack_addr.i64 ss0+8
+            store.i64 v0, v1
             return
         }";
 
@@ -798,7 +815,8 @@ mod tests {
 
         block0:
             v0 = iconst.i64 10
-            stack_store.i64 v0, ss0+4
+            v1 = stack_addr.i64 ss0+4
+            store.i64 v0, v1
             return
         }";
 
@@ -823,7 +841,8 @@ mod tests {
             ss0 = explicit_slot 8
 
         block0:
-            v0 = stack_load.i64 ss0+8
+            v1 = stack_addr.i64 ss0+8
+            v0 = load.i64 v1
             return
         }";
 
@@ -848,7 +867,8 @@ mod tests {
             ss0 = explicit_slot 8
 
         block0:
-            v0 = stack_load.i64 ss0+4
+            v1 = stack_addr.i64 ss0+4
+            v0 = load.i64 v1
             return
         }";
 
@@ -923,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn srem_trap() {
+    fn srem_min_by_neg_one_is_zero() {
         let code = "function %test() -> i64 {
         block0:
             v0 = iconst.i64 0x8000_0000_0000_0000
@@ -936,12 +956,9 @@ mod tests {
         let mut env = FunctionStore::default();
         env.add(func.name.to_string(), &func);
         let state = InterpreterState::default().with_function_store(env);
-        let trap = Interpreter::new(state).call_by_name("%test", &[]).unwrap();
+        let result = Interpreter::new(state).call_by_name("%test", &[]).unwrap();
 
-        assert_eq!(
-            trap,
-            ControlFlow::Trap(CraneliftTrap::User(TrapCode::INTEGER_OVERFLOW))
-        );
+        assert_eq!(result, ControlFlow::Return(smallvec![DataValue::I64(0)]));
     }
 
     #[test]

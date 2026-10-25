@@ -310,6 +310,7 @@ pub trait TargetIsa: fmt::Display + Send + Sync {
         &self,
         func: &Function,
         domtree: &DominatorTree,
+        regalloc_ctx: &mut regalloc2::Ctx,
         want_disasm: bool,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<CompiledCodeStencil>;
@@ -387,6 +388,13 @@ pub trait TargetIsa: fmt::Display + Send + Sync {
     /// Currently this only returns false on x86 when some native features are
     /// not detected.
     fn has_native_fma(&self) -> bool;
+
+    /// Returns whether this ISA supports vector loads and stores of `ty`.
+    ///
+    /// By default, vectors up to 128 bits are supported.
+    fn supports_vector_load_store(&self, ty: Type) -> bool {
+        ty.is_vector() && ty.bits() <= 128
+    }
 
     /// Returns whether this ISA has instructions for `ceil`, `floor`, etc.
     fn has_round(&self) -> bool;

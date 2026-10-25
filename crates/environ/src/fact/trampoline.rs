@@ -16,9 +16,9 @@
 //! can be somewhat arbitrary, an intentional decision.
 
 use crate::component::{
-    CanonicalAbiInfo, ComponentTypesBuilder, FLAG_MAY_LEAVE, FixedEncoding as FE, FlatType,
-    InterfaceType, MAX_FLAT_ASYNC_PARAMS, MAX_FLAT_PARAMS, PREPARE_ASYNC_NO_RESULT,
-    PREPARE_ASYNC_WITH_RESULT, START_FLAG_ASYNC_CALLEE, StringEncoding, Transcode,
+    CanonicalAbiInfo, ComponentTypesBuilder, FixedEncoding as FE, FlatType, InterfaceType,
+    MAX_FLAT_ASYNC_PARAMS, MAX_FLAT_PARAMS, PREPARE_ASYNC_NO_RESULT, PREPARE_ASYNC_WITH_RESULT,
+    START_FLAG_ASYNC_CALLEE, START_FLAG_ASYNC_CALLER, StringEncoding, Transcode,
     TypeComponentLocalErrorContextTableIndex, TypeEnumIndex, TypeFixedLengthListIndex,
     TypeFlagsIndex, TypeFutureTableIndex, TypeListIndex, TypeMapIndex, TypeOptionIndex,
     TypeRecordIndex, TypeResourceTableIndex, TypeResultIndex, TypeStreamTableIndex, TypeTupleIndex,
@@ -31,11 +31,11 @@ use crate::fact::{
     LinearMemoryOptions, Module, Options,
 };
 use crate::prelude::*;
-use crate::{FuncIndex, GlobalIndex, IndexType, Trap};
+use crate::{FuncIndex, GlobalIndex, IndexType, NUM_COMPONENT_CONTEXT_SLOTS, Trap};
 use std::collections::HashMap;
 use std::mem;
 use std::ops::Range;
-use wasm_encoder::{BlockType, Encode, Instruction, Instruction::*, MemArg, ValType};
+use wasm_encoder::{BlockType, Catch, Encode, Instruction, Instruction::*, MemArg, ValType};
 use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 
 use super::DataModel;
@@ -114,13 +114,12 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
         )
     }
 
-    // If the lift and lower instances are equal, or if one is an ancestor of
-    // the other, we trap unconditionally.  This ensures that recursive
-    // reentrance via an adapter is impossible.
-    if adapter.lift.instance == adapter.lower.instance
-        || adapter.lower.ancestors.contains(&adapter.lift.instance)
-        || adapter.lift.ancestors.contains(&adapter.lower.instance)
-    {
+    // Disallow same-instance adapters. This is, as of the time of this writing,
+    // technically not spec-conformant. This is something we'll want to
+    // reconcile with the upstream specification because without this check the
+    // precise order of lifts/lowers is visible to the guest which is generally
+    // not something that the spec desires.
+    if adapter.lift.instance == adapter.lower.instance {
         let (mut compiler, _, _) = compiler(module, adapter);
         compiler.trap(Trap::CannotEnterComponent);
         compiler.finish();
@@ -172,104 +171,44 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
         result
     };
 
-    match (adapter.lower.options.async_, adapter.lift.options.async_) {
-        (false, false) => {
-            // We can adapt sync->sync case with only minimal use of intrinsics,
-            // e.g. resource enter and exit calls as needed.
-            let (compiler, lower_sig, lift_sig) = compiler(module, adapter);
-            compiler.compile_sync_to_sync_adapter(adapter, &lower_sig, &lift_sig)
-        }
-        (true, true) => {
-            assert!(module.tunables.concurrency_support);
-
-            // In the async->async case, we must compile a couple of helper functions:
-            //
-            // - `async-start`: copies the parameters from the caller to the callee
-            // - `async-return`: copies the result from the callee to the caller
-            //
-            // Unlike synchronous calls, the above operations are asynchronous
-            // and subject to backpressure.  If the callee is not yet ready to
-            // handle a new call, the `async-start` function will not be called
-            // immediately.  Instead, control will return to the caller,
-            // allowing it to do other work while waiting for this call to make
-            // progress.  Once the callee indicates it is ready, `async-start`
-            // will be called, and sometime later (possibly after various task
-            // switch events), when the callee has produced a result, it will
-            // call `async-return` via the `task.return` intrinsic, at which
-            // point a `STATUS_RETURNED` event will be delivered to the caller.
-            let start = async_start_adapter(module);
-            let return_ = async_return_adapter(module);
-            let (compiler, lower_sig, lift_sig) = compiler(module, adapter);
-            compiler.compile_async_to_async_adapter(
-                adapter,
-                start,
-                return_,
-                i32::try_from(lift_sig.params.len()).unwrap(),
-                &lower_sig,
-            );
-        }
-        (false, true) => {
-            assert!(module.tunables.concurrency_support);
-
-            // Like the async->async case above, for the sync->async case we
-            // also need `async-start` and `async-return` helper functions to
-            // allow the callee to asynchronously "pull" the parameters and
-            // "push" the results when it is ready.
-            //
-            // However, since the caller is using the synchronous ABI, the
-            // parameters may have been passed via the stack rather than linear
-            // memory.  In that case, we pass them to the host to store in a
-            // task-local location temporarily in the case of backpressure.
-            // Similarly, the host will also temporarily store the results that
-            // the callee provides to `async-return` until it is ready to resume
-            // the caller.
-            let start = async_start_adapter(module);
-            let return_ = async_return_adapter(module);
-            let (compiler, lower_sig, lift_sig) = compiler(module, adapter);
-            compiler.compile_sync_to_async_adapter(
-                adapter,
-                start,
-                return_,
-                i32::try_from(lift_sig.params.len()).unwrap(),
-                &lower_sig,
-            );
-        }
-        (true, false) => {
-            assert!(module.tunables.concurrency_support);
-
-            // As with the async->async and sync->async cases above, for the
-            // async->sync case we use `async-start` and `async-return` helper
-            // functions.  Here, those functions allow the host to enforce
-            // backpressure in the case where the callee instance already has
-            // another synchronous call in progress, in which case we can't
-            // start a new one until the current one (and any others already
-            // waiting in line behind it) has completed.
-            //
-            // In the case of backpressure, we'll return control to the caller
-            // immediately so it can do other work.  Later, once the callee is
-            // ready, the host will call the `async-start` function to retrieve
-            // the parameters and pass them to the callee.  At that point, the
-            // callee may block on a host call, at which point the host will
-            // suspend the fiber it is running on and allow the caller (or any
-            // other ready instance) to run concurrently with the blocked
-            // callee.  Once the callee finally returns, the host will call the
-            // `async-return` function to write the result to the caller's
-            // linear memory and deliver a `STATUS_RETURNED` event to the
-            // caller.
-            let lift_sig = module.types.signature(&adapter.lift);
-            let start = async_start_adapter(module);
-            let return_ = async_return_adapter(module);
-            let (compiler, lower_sig, ..) = compiler(module, adapter);
-            compiler.compile_async_to_sync_adapter(
-                adapter,
-                start,
-                return_,
-                i32::try_from(lift_sig.params.len()).unwrap(),
-                i32::try_from(lift_sig.results.len()).unwrap(),
-                &lower_sig,
-            );
-        }
+    let lower_async = adapter.lower.options.async_;
+    let lift_async = adapter.lift.options.async_;
+    if !lower_async && !lift_async && !module.types[adapter.lift.ty].async_ {
+        // We can adapt sync->sync case with only minimal use of intrinsics,
+        // e.g. resource enter and exit calls as needed.
+        let (compiler, lower_sig, lift_sig) = compiler(module, adapter);
+        compiler.compile_sync_to_sync_adapter(adapter, &lower_sig, &lift_sig);
+        return;
     }
+
+    assert!(module.tunables.concurrency_support);
+
+    // All other cases are mediated by the host: the caller and/or callee use
+    // the async ABI, or the callee has an async function type (in which case
+    // it's subject to backpressure and exclusive-entry checks even if both
+    // sides are otherwise sync).  For these we compile a couple of helper
+    // functions:
+    //
+    // - `async-start`: copies the parameters from the caller to the callee
+    // - `async-return`: copies the result from the callee to the caller
+    //
+    // The host calls `async-start` once the callee is ready to handle a new
+    // call (e.g. it has no backpressure and, if required, its instance isn't
+    // exclusively held by another task), which may not be immediately.  It
+    // calls `async-return` once the callee has produced its result, either
+    // via `task.return` (if async-lifted) or by returning (if sync-lifted).
+    //
+    // In the meantime, an async caller gets control back immediately so it can
+    // do other work, and is later notified of the subtask's progress via
+    // events.  A sync caller instead blocks until the callee has produced its
+    // result.  Since a sync caller may have passed its parameters on the stack
+    // rather than in linear memory, the host stores them in a task-local
+    // location until `async-start` is called, and similarly stores the results
+    // until the caller is resumed.
+    let start = async_start_adapter(module);
+    let return_ = async_return_adapter(module);
+    let (compiler, lower_sig, lift_sig) = compiler(module, adapter);
+    compiler.compile_host_mediated_adapter(adapter, start, return_, &lower_sig, &lift_sig);
 }
 
 /// Compiles a helper function as specified by the `Helper` configuration.
@@ -463,28 +402,40 @@ impl<'a, 'b> Compiler<'a, 'b> {
         }
     }
 
-    /// Compile an adapter function supporting an async-lowered import to an
-    /// async-lifted export.
+    /// Compile an adapter function for a call which is mediated by the host,
+    /// i.e. any call other than a sync->sync call to a sync-typed function.
     ///
-    /// This uses a pair of `async-prepare` and `async-start` built-in functions
-    /// to set up and start a subtask, respectively.  `async-prepare` accepts
+    /// This uses a pair of `prepare-call` and `start-call` built-in functions
+    /// to set up and start a subtask, respectively.  `prepare-call` accepts
     /// `start` and `return_` functions which copy the parameters and results,
-    /// respectively; the host will call the former when the callee has cleared
-    /// its backpressure flag and the latter when the callee has called
-    /// `task.return`.
-    fn compile_async_to_async_adapter(
+    /// respectively; the host will call the former when the callee may be
+    /// entered (e.g. it has no backpressure) and the latter when the callee has
+    /// produced its result.
+    ///
+    /// For an async caller, `start-call` returns the subtask's status.  For a
+    /// sync caller, it blocks until the callee has produced its result and
+    /// returns the lowered result, if any.
+    fn compile_host_mediated_adapter(
         mut self,
         adapter: &AdapterData,
         start: FunctionId,
         return_: FunctionId,
-        param_count: i32,
         lower_sig: &Signature,
+        lift_sig: &Signature,
     ) {
-        let start_call =
-            self.module
-                .import_async_start_call(&adapter.name, adapter.lift.options.callback, None);
+        let async_caller = adapter.lower.options.async_;
+        let start_call = self.module.import_start_call(
+            &adapter.name,
+            adapter.lift.options.callback,
+            adapter.lift.post_return,
+            if async_caller {
+                &[ValType::I32]
+            } else {
+                &lower_sig.results
+            },
+        );
 
-        self.call_prepare(adapter, start, return_, lower_sig, false);
+        self.call_prepare(adapter, start, return_, lower_sig, !async_caller);
 
         // TODO: As an optimization, consider checking the backpressure flag on
         // the callee instance and, if it's unset _and_ the callee uses a
@@ -499,13 +450,18 @@ impl<'a, 'b> Compiler<'a, 'b> {
             format!("[adapter-callee]{}", adapter.name),
         ));
 
+        let mut flags = 0;
+        if async_caller {
+            flags |= START_FLAG_ASYNC_CALLER;
+        }
+        if adapter.lift.options.async_ {
+            flags |= START_FLAG_ASYNC_CALLEE;
+        }
+
         self.instruction(RefFunc(adapter.callee.as_u32()));
-        self.instruction(I32Const(param_count));
-        // The result count for an async callee is either one (if there's a
-        // callback) or zero (if there's no callback).  We conservatively use
-        // one here to ensure the host provides room for the result, if any.
-        self.instruction(I32Const(1));
-        self.instruction(I32Const(START_FLAG_ASYNC_CALLEE));
+        self.instruction(I32Const(i32::try_from(lift_sig.params.len()).unwrap()));
+        self.instruction(I32Const(i32::try_from(lift_sig.results.len()).unwrap()));
+        self.instruction(I32Const(flags));
         self.instruction(Call(start_call.as_u32()));
 
         self.finish()
@@ -531,6 +487,11 @@ impl<'a, 'b> Compiler<'a, 'b> {
         lower_sig: &Signature,
         prepare_sync: bool,
     ) {
+        // Make sure the caller can indeed leave its instance before going
+        // further.
+        let saved = self.trap_if_not_may_leave(adapter.lower.flags, Trap::CannotLeaveComponent);
+        self.free_temp_local(saved);
+
         let prepare = self.module.import_prepare_call(
             &adapter.name,
             &lower_sig.params,
@@ -597,98 +558,17 @@ impl<'a, 'b> Compiler<'a, 'b> {
         self.instruction(Call(prepare.as_u32()));
     }
 
-    /// Compile an adapter function supporting a sync-lowered import to an
-    /// async-lifted export.
-    ///
-    /// This uses a pair of `sync-prepare` and `sync-start` built-in functions
-    /// to set up and start a subtask, respectively.  `sync-prepare` accepts
-    /// `start` and `return_` functions which copy the parameters and results,
-    /// respectively; the host will call the former when the callee has cleared
-    /// its backpressure flag and the latter when the callee has called
-    /// `task.return`.
-    fn compile_sync_to_async_adapter(
-        mut self,
-        adapter: &AdapterData,
-        start: FunctionId,
-        return_: FunctionId,
-        lift_param_count: i32,
-        lower_sig: &Signature,
-    ) {
-        let start_call = self.module.import_sync_start_call(
-            &adapter.name,
-            adapter.lift.options.callback,
-            &lower_sig.results,
-        );
-
-        self.call_prepare(adapter, start, return_, lower_sig, true);
-
-        // TODO: As an optimization, consider checking the backpressure flag on
-        // the callee instance and, if it's unset _and_ the callee uses a
-        // callback, translate the params and call the callee function directly
-        // here (and make sure `start_call` knows _not_ to call it in that case).
-
-        // We export this function so we can pass a funcref to the host.
-        //
-        // TODO: Use a declarative element segment instead of exporting this.
-        self.module.exports.push((
-            adapter.callee.as_u32(),
-            format!("[adapter-callee]{}", adapter.name),
-        ));
-
-        self.instruction(RefFunc(adapter.callee.as_u32()));
-        self.instruction(I32Const(lift_param_count));
-        self.instruction(Call(start_call.as_u32()));
-
-        self.finish()
-    }
-
-    /// Compile an adapter function supporting an async-lowered import to a
-    /// sync-lifted export.
-    ///
-    /// This uses a pair of `async-prepare` and `async-start` built-in functions
-    /// to set up and start a subtask, respectively.  `async-prepare` accepts
-    /// `start` and `return_` functions which copy the parameters and results,
-    /// respectively; the host will call the former when the callee has cleared
-    /// its backpressure flag and the latter when the callee has returned its
-    /// result(s).
-    fn compile_async_to_sync_adapter(
-        mut self,
-        adapter: &AdapterData,
-        start: FunctionId,
-        return_: FunctionId,
-        param_count: i32,
-        result_count: i32,
-        lower_sig: &Signature,
-    ) {
-        let start_call =
-            self.module
-                .import_async_start_call(&adapter.name, None, adapter.lift.post_return);
-
-        self.call_prepare(adapter, start, return_, lower_sig, false);
-
-        // We export this function so we can pass a funcref to the host.
-        //
-        // TODO: Use a declarative element segment instead of exporting this.
-        self.module.exports.push((
-            adapter.callee.as_u32(),
-            format!("[adapter-callee]{}", adapter.name),
-        ));
-
-        self.instruction(RefFunc(adapter.callee.as_u32()));
-        self.instruction(I32Const(param_count));
-        self.instruction(I32Const(result_count));
-        self.instruction(I32Const(0));
-        self.instruction(Call(start_call.as_u32()));
-
-        self.finish()
-    }
-
     /// Compiles a function to be exported to the host which host to lift the
     /// parameters from the caller and lower them to the callee.
     ///
     /// This allows the host to delay copying the parameters until the callee
     /// signals readiness by clearing its backpressure flag.
     fn compile_async_start_adapter(mut self, adapter: &AdapterData, sig: &Signature) {
+        // Note that unlike `compile_sync_to_sync_adapter` no exception
+        // barrier is emitted here: this function is invoked by the host, so
+        // an exception thrown by any guest code it calls (e.g. `realloc`)
+        // unwinds to the host rather than into another component, and the
+        // host already catches it at that boundary.
         let param_locals = sig
             .params
             .iter()
@@ -696,9 +576,9 @@ impl<'a, 'b> Compiler<'a, 'b> {
             .map(|(i, ty)| (i as u32, *ty))
             .collect::<Vec<_>>();
 
-        self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, false);
+        let saved = self.clear_may_leave(adapter.lift.flags);
         self.translate_params(adapter, &param_locals);
-        self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, true);
+        self.restore_may_leave(adapter.lift.flags, saved);
 
         self.finish();
     }
@@ -712,6 +592,9 @@ impl<'a, 'b> Compiler<'a, 'b> {
     /// callee to caller when that intrinsic is called rather than when the
     /// callee task fully completes (which may happen much later).
     fn compile_async_return_adapter(mut self, adapter: &AdapterData, sig: &Signature) {
+        // As with `compile_async_start_adapter`, no exception barrier is
+        // emitted here: the host invokes this function and already catches
+        // exceptions unwinding out of it.
         let param_locals = sig
             .params
             .iter()
@@ -719,7 +602,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             .map(|(i, ty)| (i as u32, *ty))
             .collect::<Vec<_>>();
 
-        self.set_flag(adapter.lower.flags, FLAG_MAY_LEAVE, false);
+        let saved = self.clear_may_leave(adapter.lower.flags);
         // Note that we pass `param_locals` as _both_ the `param_locals` and
         // `result_locals` parameters to `translate_results`.  That's because
         // the _parameters_ to `task.return` are actually the _results_ that the
@@ -731,7 +614,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
         // the import is lowered async, in which case `translate_results` will
         // use that pointer to store the results.
         self.translate_results(adapter, &param_locals, &param_locals);
-        self.set_flag(adapter.lower.flags, FLAG_MAY_LEAVE, true);
+        self.restore_may_leave(adapter.lower.flags, saved);
 
         self.finish()
     }
@@ -748,43 +631,41 @@ impl<'a, 'b> Compiler<'a, 'b> {
         lower_sig: &Signature,
         lift_sig: &Signature,
     ) {
+        self.enter_exception_barrier(&lower_sig.results);
+
         // Check the instance flags required for this trampoline.
         //
         // This inserts the initial check required by `canon_lower` that the
         // caller instance can be left and additionally checks the
         // flags on the callee if necessary whether it can be entered.
-        self.trap_if_not_flag(
-            adapter.lower.flags,
-            FLAG_MAY_LEAVE,
-            Trap::CannotLeaveComponent,
+        //
+        // The loaded `may_leave` value is saved into `saved_lower_may_leave`
+        // so that it can be restored after results are translated below
+        // without reloading the global.
+        let saved_lower_may_leave =
+            self.trap_if_not_may_leave(adapter.lower.flags, Trap::CannotLeaveComponent);
+
+        // If nothing that this adapter can reach is able to observe or mutate
+        // the thread state that `enter-sync-call`/`exit-sync-call` maintain then
+        // none of its bookkeeping is necessary.
+        //
+        // See `crates/environ/src/component/thread_transparency.rs` for details.
+        debug_assert!(
+            !(adapter.thread_transparent && self.emit_resource_call),
+            "resources are not thread transparent",
         );
+        let needs_thread_state =
+            self.module.tunables.concurrency_support && !adapter.thread_transparent;
 
-        let old_task_may_block = if self.module.tunables.concurrency_support {
-            // Save, clear, and later restore the `may_block` field.
-            let task_may_block = self.module.import_task_may_block();
-            let old_task_may_block = if self.types[adapter.lift.ty].async_ {
-                self.instruction(GlobalGet(task_may_block.as_u32()));
-                self.instruction(I32Eqz);
-                self.instruction(If(BlockType::Empty));
-                self.trap(Trap::CannotBlockSyncTask);
-                self.instruction(End);
-                None
-            } else {
-                let task_may_block = self.module.import_task_may_block();
-                self.instruction(GlobalGet(task_may_block.as_u32()));
-                let old_task_may_block = self.local_set_new_tmp(ValType::I32);
-                self.instruction(I32Const(0));
-                self.instruction(GlobalSet(task_may_block.as_u32()));
-                Some(old_task_may_block)
-            };
-
+        if needs_thread_state {
             // Push a task onto the current task stack.
             //
-            // FIXME: Apply the optimizations described in #12311.
-
-            self.instruction(I32Const(
-                i32::try_from(adapter.lower.instance.as_u32()).unwrap(),
-            ));
+            // Note that for sync-to-sync calls, we replace this call with
+            // inline code for lazy/deferred task creation during translation to
+            // CLIF. This avoids task creation and out-of-line calls in the
+            // adapter for most sync-to-sync calls, since most sync-to-sync
+            // calls do not do anything to force the task's creation
+            // (e.g. adjust backpressure).
             self.instruction(I32Const(if self.types[adapter.lift.ty].async_ {
                 1
             } else {
@@ -795,18 +676,18 @@ impl<'a, 'b> Compiler<'a, 'b> {
             ));
             let enter_sync_call = self.module.import_enter_sync_call();
             self.instruction(Call(enter_sync_call.as_u32()));
-
-            old_task_may_block
         } else if self.emit_resource_call {
+            assert!(!self.types[adapter.lift.ty].async_);
+            self.instruction(I32Const(0));
+            self.instruction(I32Const(
+                i32::try_from(adapter.lift.instance.as_u32()).unwrap(),
+            ));
             let enter_sync_call = self.module.import_enter_sync_call();
             self.instruction(Call(enter_sync_call.as_u32()));
-            None
-        } else {
-            None
-        };
+        }
 
-        // Perform the translation of arguments. Note that `FLAG_MAY_LEAVE` is
-        // cleared around this invocation for the callee as per the
+        // Perform the translation of arguments. Note that the `may_leave` flag
+        // is cleared around this invocation for the callee as per the
         // `canon_lift` definition in the spec. Additionally note that the
         // precise ordering of traps here is not required since internal state
         // is not visible to either instance and a trap will "lock down" both
@@ -814,10 +695,32 @@ impl<'a, 'b> Compiler<'a, 'b> {
         // reorder lifts/lowers and flags and such as is necessary and
         // convenient here.
         //
-        // TODO: if translation doesn't actually call any functions in either
-        // instance then there's no need to set/clear the flag here and that can
-        // be optimized away.
-        self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, false);
+        // The clear-and-restore is structured (a constant `0` store to clear,
+        // then a store of the saved original value to restore) so that if
+        // translation doesn't actually call any functions in either instance
+        // then a future dead-store elimination pass in Cranelift can remove all
+        // the flag juggling entirely (other than trapping when `!may_leave`):
+        //
+        //     may_leave = load vmctx+MAY_LEAVE_OFFSET      ;; (0)
+        //     trapz may_leave
+        //
+        //     ...
+        //
+        //     zero = iconst 0
+        //     store zero, vmctx+MAY_LEAVE_OFFSET           ;; (1)
+        //
+        //     ...
+        //
+        //     store may_leave, vmctx+MAY_LEAVE_OFFSET      ;; (2)
+        //
+        // First, the dead-store elimination pass will see that the the store at
+        // (1) is dead and remove it. Then, the idempotent-store eliminator will
+        // recognize that the store at (2) is storing the same value that the
+        // memory location already contains and it will also be removed. The
+        // more we can reuse locals to make this idempotency obvious, rather
+        // than force Cranelift's optimizer to rediscover this information, the
+        // better.
+        let saved_lift_may_leave = self.clear_may_leave(adapter.lift.flags);
         let param_locals = lower_sig
             .params
             .iter()
@@ -825,12 +728,14 @@ impl<'a, 'b> Compiler<'a, 'b> {
             .map(|(i, ty)| (i as u32, *ty))
             .collect::<Vec<_>>();
         self.translate_params(adapter, &param_locals);
-        self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, true);
+        self.restore_may_leave(adapter.lift.flags, saved_lift_may_leave);
 
         // With all the arguments on the stack the actual target function is
         // now invoked. The core wasm results of the function are then placed
         // into locals for result translation afterwards.
+
         self.instruction(Call(adapter.callee.as_u32()));
+
         let mut result_locals = Vec::with_capacity(lift_sig.results.len());
         let mut temps = Vec::new();
         for ty in lift_sig.results.iter().rev() {
@@ -839,6 +744,15 @@ impl<'a, 'b> Compiler<'a, 'b> {
             temps.push(local);
         }
         result_locals.reverse();
+
+        // The `exit-sync-call` intrinsic below will clobber this task's context
+        // slots, but if we've got a post-return we'll want to restore them
+        // temporarily for that. Save them if it's necessary.
+        let callee_context = if adapter.lift.post_return.is_some() {
+            self.save_context()
+        } else {
+            Vec::new()
+        };
 
         // Handle a few things related to the concurrent task infrastructure
         // after the callee has finished, such as:
@@ -853,8 +767,10 @@ impl<'a, 'b> Compiler<'a, 'b> {
         // lowering below may call realloc which is in the context of the
         // caller's task, not the callee.
         //
-        // FIXME: Apply the optimizations described in #12311.
-        if self.emit_resource_call || self.module.tunables.concurrency_support {
+        // Note that for sync-to-sync calls, we will emit inline code during
+        // translation to CLIF to avoid actually calling out to a libcall when
+        // the deferred task's allocation was never forced.
+        if self.emit_resource_call || needs_thread_state {
             let exit_sync_call = self.module.import_exit_sync_call();
             self.instruction(Call(exit_sync_call.as_u32()));
         }
@@ -864,35 +780,35 @@ impl<'a, 'b> Compiler<'a, 'b> {
         // order of everything doesn't matter since intermediate states cannot
         // be witnessed, hence the setting of flags here to encapsulate both
         // liftings and lowerings.
-        //
-        // TODO: like above the management of the `MAY_LEAVE` flag can probably
-        // be elided here for "simple" results.
-        self.set_flag(adapter.lower.flags, FLAG_MAY_LEAVE, false);
+        self.set_may_leave_false(adapter.lower.flags);
         self.translate_results(adapter, &param_locals, &result_locals);
-        self.set_flag(adapter.lower.flags, FLAG_MAY_LEAVE, true);
+        self.restore_may_leave(adapter.lower.flags, saved_lower_may_leave);
 
         // And finally post-return state is handled here once all results/etc
         // are all translated.
+        //
+        // Note that for this call the callee's previous context is shuffled
+        // in-and-then-back-out after the call. Additionally the callee cannot
+        // leave its instance during post-return, so `may_leave` is cleared.
         if let Some(func) = adapter.lift.post_return {
+            let caller_context = self.save_context();
+            self.restore_context(callee_context);
+            let saved_lift_may_leave = self.clear_may_leave(adapter.lift.flags);
             for (result, _) in result_locals.iter() {
                 self.instruction(LocalGet(*result));
             }
             self.instruction(Call(func.as_u32()));
+            self.restore_may_leave(adapter.lift.flags, saved_lift_may_leave);
+            self.restore_context(caller_context);
+        } else {
+            assert!(callee_context.is_empty());
         }
 
         for tmp in temps {
             self.free_temp_local(tmp);
         }
 
-        if self.module.tunables.concurrency_support {
-            // Restore old `may_block_field`
-            if let Some(old_task_may_block) = old_task_may_block {
-                let task_may_block = self.module.import_task_may_block();
-                self.instruction(LocalGet(old_task_may_block.idx));
-                self.instruction(GlobalSet(task_may_block.as_u32()));
-                self.free_temp_local(old_task_may_block);
-            }
-        }
+        self.exit_exception_barrier();
 
         self.finish()
     }
@@ -1021,7 +937,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             let abi = CanonicalAbiInfo::record(src_tys.iter().map(|t| self.types.canonical_abi(t)));
             assert_eq!(
                 result_locals.len(),
-                if lower_opts.async_ || lift_opts.async_ {
+                if lower_opts.async_ || lift_opts.async_ || self.types[adapter.lift.ty].async_ {
                     2
                 } else {
                     1
@@ -1164,7 +1080,19 @@ impl<'a, 'b> Compiler<'a, 'b> {
             InterfaceType::FixedLengthList(i) => self.types[*i].size as usize,
         };
 
-        match self.fuel.checked_sub(cost) {
+        // If this function has the initial set of fuel then we want to be sure
+        // to translate at least one type, even if it's a huge one,
+        // unconditionally allow this type to get translate.d Here
+        // `saturating_sub` will clamp at 0 if `cost` is higher than `fuel`,
+        // which is what we want anyway where if this type is huge it just
+        // prevents other translations in this function.
+        let remaining_fuel = if self.fuel == INITIAL_FUEL {
+            Some(self.fuel.saturating_sub(cost))
+        } else {
+            self.fuel.checked_sub(cost)
+        };
+
+        match remaining_fuel {
             // This function has enough fuel to perform the layer of translation
             // necessary for this type, so the fuel is updated in-place and
             // translation continues. Note that the recursion here is bounded by
@@ -3460,7 +3388,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             _ => panic!("expected a `Future`"),
         };
         let transfer = self.module.import_future_transfer();
-        self.translate_handle(src_ty.as_u32(), src, dst_ty.as_u32(), dst, transfer);
+        self.translate_handle(src_ty.as_u32(), src, Some(dst_ty.as_u32()), dst, transfer);
     }
 
     fn translate_stream(
@@ -3475,7 +3403,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             _ => panic!("expected a `Stream`"),
         };
         let transfer = self.module.import_stream_transfer();
-        self.translate_handle(src_ty.as_u32(), src, dst_ty.as_u32(), dst, transfer);
+        self.translate_handle(src_ty.as_u32(), src, Some(dst_ty.as_u32()), dst, transfer);
     }
 
     fn translate_error_context(
@@ -3490,7 +3418,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             _ => panic!("expected an `ErrorContext`"),
         };
         let transfer = self.module.import_error_context_transfer();
-        self.translate_handle(src_ty.as_u32(), src, dst_ty.as_u32(), dst, transfer);
+        self.translate_handle(src_ty.as_u32(), src, Some(dst_ty.as_u32()), dst, transfer);
     }
 
     fn translate_own(
@@ -3505,7 +3433,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             _ => panic!("expected an `Own`"),
         };
         let transfer = self.module.import_resource_transfer_own();
-        self.translate_handle(src_ty.as_u32(), src, dst_ty.as_u32(), dst, transfer);
+        self.translate_handle(src_ty.as_u32(), src, Some(dst_ty.as_u32()), dst, transfer);
     }
 
     fn translate_borrow(
@@ -3520,8 +3448,15 @@ impl<'a, 'b> Compiler<'a, 'b> {
             _ => panic!("expected an `Borrow`"),
         };
 
-        let transfer = self.module.import_resource_transfer_borrow();
-        self.translate_handle(src_ty.as_u32(), src, dst_ty.as_u32(), dst, transfer);
+        let (transfer, dst_ty) = if self.module.resource_owned_by_own_instance(dst_ty) {
+            (self.module.import_resource_transfer_borrow_to_owner(), None)
+        } else {
+            (
+                self.module.import_resource_transfer_borrow(),
+                Some(dst_ty.as_u32()),
+            )
+        };
+        self.translate_handle(src_ty.as_u32(), src, dst_ty, dst, transfer);
     }
 
     /// Translates the index `src`, which resides in the table `src_ty`, into
@@ -3535,7 +3470,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
         &mut self,
         src_ty: u32,
         src: &Source<'_>,
-        dst_ty: u32,
+        dst_ty: Option<u32>,
         dst: &Destination,
         transfer: FuncIndex,
     ) {
@@ -3546,7 +3481,9 @@ impl<'a, 'b> Compiler<'a, 'b> {
             Source::Struct(_) | Source::Array(_) => todo!("CM+GC"),
         }
         self.instruction(I32Const(src_ty as i32));
-        self.instruction(I32Const(dst_ty as i32));
+        if let Some(dst_ty) = dst_ty {
+            self.instruction(I32Const(dst_ty as i32));
+        }
         self.instruction(Call(transfer.as_u32()));
         match dst {
             Destination::Memory(mem) => self.i32_store(mem),
@@ -3555,26 +3492,58 @@ impl<'a, 'b> Compiler<'a, 'b> {
         }
     }
 
-    fn trap_if_not_flag(&mut self, flags_global: GlobalIndex, flag_to_test: i32, trap: Trap) {
+    /// Loads the `may_leave` flag for the given instance, traps with `trap` if
+    /// it is not set, and returns a temporary local holding the loaded value
+    /// so that it can later be restored with `restore_may_leave` without
+    /// reloading the global.
+    ///
+    /// The `may_leave` flag is a boolean (0 or 1) so no masking is required.
+    fn trap_if_not_may_leave(&mut self, flags_global: GlobalIndex, trap: Trap) -> TempLocal {
+        self.instruction(Block(BlockType::Empty));
         self.instruction(GlobalGet(flags_global.as_u32()));
-        self.instruction(I32Const(flag_to_test));
-        self.instruction(I32And);
-        self.instruction(I32Eqz);
-        self.instruction(If(BlockType::Empty));
+        // Save the flag's value (known to be `true` whenever the trap below is
+        // not taken) into a temporary for later restoration.
+        let saved = self.local_tee_new_tmp(ValType::I32);
+        self.instruction(BrIf(0));
         self.trap(trap);
         self.instruction(End);
+        saved
     }
 
-    fn set_flag(&mut self, flags_global: GlobalIndex, flag_to_set: i32, value: bool) {
+    /// Saves the current value of the `may_leave` flag into a fresh temporary
+    /// local (returned) and then clears the flag to `false`.
+    fn clear_may_leave(&mut self, flags_global: GlobalIndex) -> TempLocal {
         self.instruction(GlobalGet(flags_global.as_u32()));
-        if value {
-            self.instruction(I32Const(flag_to_set));
-            self.instruction(I32Or);
-        } else {
-            self.instruction(I32Const(!flag_to_set));
-            self.instruction(I32And);
-        }
+        let saved = self.local_set_new_tmp(ValType::I32);
+        self.set_may_leave_false(flags_global);
+        saved
+    }
+
+    /// Sets the `may_leave` flag to `false` by storing a constant `0`.
+    ///
+    /// Since there is only a single flag there is no need to reload the global
+    /// and mask: storing `0` is sufficient.
+    fn set_may_leave_false(&mut self, flags_global: GlobalIndex) {
+        self.instruction(I32Const(0));
         self.instruction(GlobalSet(flags_global.as_u32()));
+    }
+
+    /// Restores the `may_leave` flag to the value previously saved in `saved`
+    /// (via `clear_may_leave` or `trap_if_not_may_leave`) and frees the
+    /// temporary local.
+    ///
+    /// Storing the previously-loaded value (rather than reloading the global
+    /// and or-ing in the flag bit) makes it clear in the generated CLIF that
+    /// the same value that was there before is being written back. Combined
+    /// with the constant `0` store in `set_may_leave_false`, this lets a future
+    /// dead-store-elimination pass remove the clear-to-`false` store which will
+    /// then allow our idempotent-store elimination to remove this restore for
+    /// adapters whose body never touches the flag (e.g. simple inlined
+    /// callees).
+    fn restore_may_leave(&mut self, flags_global: GlobalIndex, saved: TempLocal) {
+        self.instruction(LocalGet(saved.idx));
+        self.instruction(GlobalSet(flags_global.as_u32()));
+        self.free_temp_local(saved);
     }
 
     fn assert_aligned(&mut self, ty: &InterfaceType, mem: &Memory) {
@@ -3638,7 +3607,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
                 self.ptr_uconst(mem_opts, 0);
                 self.ptr_uconst(mem_opts, align);
                 self.alloc_size(mem_opts, &size);
-                self.instruction(Call(realloc.as_u32()));
+                self.call_realloc(realloc);
                 let addr = self.local_set_new_tmp(mem_opts.ptr());
                 self.memory_operand(opts, addr, size, align, oob_trap)
             }
@@ -3667,7 +3636,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
                 self.alloc_size(mem_opts, &prev_size);
                 self.ptr_uconst(mem_opts, align);
                 self.alloc_size(mem_opts, &size);
-                self.instruction(Call(realloc.as_u32()));
+                self.call_realloc(realloc);
                 self.instruction(LocalSet(ptr.idx));
                 self.validate_guest_pointer(opts, &ptr, &size, align, oob_trap)
             }
@@ -3848,15 +3817,129 @@ impl<'a, 'b> Compiler<'a, 'b> {
         local.needs_free = false;
     }
 
+    /// Reads all of the current task's `context.{get,set}` slots into fresh
+    /// temporary locals which can later be handed to `restore_context`.
+    fn save_context(&mut self) -> Vec<TempLocal> {
+        if !self.module.tunables.concurrency_support {
+            return Vec::new();
+        }
+        let mut saved = Vec::new();
+        for slot in 0..NUM_COMPONENT_CONTEXT_SLOTS {
+            let get = self.module.import_context_get(slot);
+            self.instruction(Call(get.as_u32()));
+            saved.push(self.local_set_new_tmp(ValType::I32));
+        }
+        saved
+    }
+
+    /// Stores zero into all of the current task's `context.{get,set}` slots.
+    fn clear_context(&mut self) {
+        if !self.module.tunables.concurrency_support {
+            return;
+        }
+        for slot in 0..NUM_COMPONENT_CONTEXT_SLOTS {
+            let set = self.module.import_context_set(slot);
+            self.instruction(I32Const(0));
+            self.instruction(Call(set.as_u32()));
+        }
+    }
+
+    /// Stores the slot values previously read by `save_context` back into the
+    /// current task's `context.{get,set}` slots.
+    fn restore_context(&mut self, saved: Vec<TempLocal>) {
+        for (slot, local) in saved.into_iter().enumerate() {
+            let set = self.module.import_context_set(slot);
+            self.instruction(LocalGet(local.idx));
+            self.instruction(Call(set.as_u32()));
+            self.free_temp_local(local);
+        }
+    }
+
+    /// Emits a call to a guest `realloc` function.
+    ///
+    /// Note that this has special handling of the current task's
+    /// `context.{get,set}` slots, namely they're saved/restored around this
+    /// call and zero'd out during the call.
+    fn call_realloc(&mut self, realloc: FuncIndex) {
+        let saved = self.save_context();
+        self.clear_context();
+        self.instruction(Call(realloc.as_u32()));
+        self.restore_context(saved);
+    }
+
     fn instruction(&mut self, instr: Instruction) {
         instr.encode(&mut self.code);
     }
 
     fn trap(&mut self, trap: Trap) {
-        let trap_func = self.module.import_trap();
-        self.instruction(I32Const(trap as i32));
+        let trap_func = self.module.import_trap(trap);
         self.instruction(Call(trap_func.as_u32()));
         self.instruction(Unreachable);
+    }
+
+    /// Emits the prologue of an exception barrier wrapping the body of a
+    /// function.
+    ///
+    /// An adapter is the boundary between two components, and the
+    /// component model's canonical ABI specifies that an exception
+    /// which propagates out of a component without being caught
+    /// becomes a trap rather than unwinding into the other
+    /// component. To implement that, the entire body of an adapter
+    /// function is wrapped in a `try_table` whose `catch_all` clause
+    /// traps. This catches exceptions thrown not only by the callee
+    /// itself but also by any other guest functions the adapter
+    /// invokes (e.g. `realloc`).
+    ///
+    /// The generated structure, completed by `exit_exception_barrier`,
+    /// is:
+    ///
+    /// ```wasm
+    /// block (result ...)        ;; carries results past the handler
+    ///   block                   ;; catch_all landing pad
+    ///     try_table (result ...) (catch_all 0)
+    ///       ;; ... body ...
+    ///     end
+    ///     br 1                  ;; done; carry results past the handler
+    ///   end
+    ///   ;; an exception was caught: raise a trap
+    ///   unreachable
+    /// end
+    /// ```
+    ///
+    /// This is only done when the exceptions proposal is enabled.
+    fn enter_exception_barrier(&mut self, results: &[ValType]) {
+        if !self.module.features.exceptions() {
+            return;
+        }
+        let block_ty = match results.len() {
+            0 => BlockType::Empty,
+            1 => BlockType::Result(results[0]),
+            _ => BlockType::FunctionType(self.module.core_types.function(&[], results)),
+        };
+        // Outer block: carries the body's results past the handler.
+        self.instruction(Block(block_ty));
+        // Inner block: the landing pad targeted by the `catch_all` clause.
+        self.instruction(Block(BlockType::Empty));
+        self.instruction(TryTable(block_ty, vec![Catch::All { label: 0 }].into()));
+    }
+
+    /// Emits the epilogue of an exception barrier started with
+    /// `enter_exception_barrier`: the body's results jump past the
+    /// `catch_all` landing pad, which turns a caught exception into a
+    /// trap.
+    fn exit_exception_barrier(&mut self) {
+        if !self.module.features.exceptions() {
+            return;
+        }
+        // End of the `try_table`.
+        self.instruction(End);
+        // Normal completion: jump over the handler, carrying the results.
+        self.instruction(Br(1));
+        // End of the inner block: the `catch_all` landing pad.
+        self.instruction(End);
+        self.trap(Trap::UncaughtException);
+        // End of the outer block; the body's results flow out.
+        self.instruction(End);
     }
 
     /// Flushes out the current `code` instructions into the destination

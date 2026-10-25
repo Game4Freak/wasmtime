@@ -1,7 +1,7 @@
 //! Implementation of the `wasi:http/types` interface's various body types.
 
-use crate::FieldMap;
 use crate::p2::bindings::http::types;
+use crate::{Error, FieldMap};
 use bytes::Bytes;
 use http_body::{Body, Frame};
 use http_body_util::BodyExt;
@@ -9,17 +9,17 @@ use http_body_util::combinators::UnsyncBoxBody;
 use std::future::Future;
 use std::mem;
 use std::task::{Context, Poll};
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{pin::Pin, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 use wasmtime::format_err;
 use wasmtime_wasi::p2::{InputStream, OutputStream, Pollable, StreamError};
 use wasmtime_wasi::runtime::{AbortOnDropJoinHandle, poll_noop};
 
 /// Common type for incoming bodies.
-pub type HyperIncomingBody = UnsyncBoxBody<Bytes, types::ErrorCode>;
+pub type HyperIncomingBody = UnsyncBoxBody<Bytes, Error>;
 
 /// Common type for outgoing bodies.
-pub type HyperOutgoingBody = UnsyncBoxBody<Bytes, types::ErrorCode>;
+pub type HyperOutgoingBody = UnsyncBoxBody<Bytes, Error>;
 
 /// The concrete type behind a `was:http/types.incoming-body` resource.
 #[derive(Debug)]
@@ -33,8 +33,7 @@ pub struct HostIncomingBody {
 
 impl HostIncomingBody {
     /// Create a new `HostIncomingBody` with the given `body` and a per-frame timeout
-    pub fn new(body: HyperIncomingBody, between_bytes_timeout: Duration) -> HostIncomingBody {
-        let body = BodyWithTimeout::new(body, between_bytes_timeout);
+    pub fn new(body: HyperIncomingBody) -> HostIncomingBody {
         HostIncomingBody {
             body: IncomingBodyState::Start(body),
             worker: None,
@@ -76,74 +75,12 @@ impl HostIncomingBody {
 enum IncomingBodyState {
     /// The body is stored here meaning that within `HostIncomingBody` the
     /// `take_stream` method can be called for example.
-    Start(BodyWithTimeout),
+    Start(HyperIncomingBody),
 
     /// The body is within a `HostIncomingBodyStream` meaning that it's not
     /// currently owned here. The body will be sent back over this channel when
     /// it's done, however.
     InBodyStream(oneshot::Receiver<StreamEnd>),
-}
-
-/// Small wrapper around [`HyperIncomingBody`] which adds a timeout to every frame.
-#[derive(Debug)]
-struct BodyWithTimeout {
-    /// Underlying stream that frames are coming from.
-    inner: HyperIncomingBody,
-    /// Currently active timeout that's reset between frames.
-    timeout: Pin<Box<tokio::time::Sleep>>,
-    /// Whether or not `timeout` needs to be reset on the next call to
-    /// `poll_frame`.
-    reset_sleep: bool,
-    /// Maximal duration between when a frame is first requested and when it's
-    /// allowed to arrive.
-    between_bytes_timeout: Duration,
-}
-
-impl BodyWithTimeout {
-    fn new(inner: HyperIncomingBody, between_bytes_timeout: Duration) -> BodyWithTimeout {
-        BodyWithTimeout {
-            inner,
-            between_bytes_timeout,
-            reset_sleep: true,
-            timeout: Box::pin(wasmtime_wasi::runtime::with_ambient_tokio_runtime(|| {
-                tokio::time::sleep(Duration::new(0, 0))
-            })),
-        }
-    }
-}
-
-impl Body for BodyWithTimeout {
-    type Data = Bytes;
-    type Error = types::ErrorCode;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, types::ErrorCode>>> {
-        let me = Pin::into_inner(self);
-
-        // If the timeout timer needs to be reset, do that now relative to the
-        // current instant. Otherwise test the timeout timer and see if it's
-        // fired yet and if so we've timed out and return an error.
-        if me.reset_sleep {
-            me.timeout
-                .as_mut()
-                .reset(tokio::time::Instant::now() + me.between_bytes_timeout);
-            me.reset_sleep = false;
-        }
-
-        // Register interest in this context on the sleep timer, and if the
-        // sleep elapsed that means that we've timed out.
-        if let Poll::Ready(()) = me.timeout.as_mut().poll(cx) {
-            return Poll::Ready(Some(Err(types::ErrorCode::ConnectionReadTimeout)));
-        }
-
-        // Without timeout business now handled check for the frame. If a frame
-        // arrives then the sleep timer will be reset on the next frame.
-        let result = Pin::new(&mut me.inner).poll_frame(cx);
-        me.reset_sleep = result.is_ready();
-        result
-    }
 }
 
 /// Message sent when a `HostIncomingBodyStream` is done to the
@@ -152,11 +89,15 @@ impl Body for BodyWithTimeout {
 enum StreamEnd {
     /// The body wasn't completely read and was dropped early. May still have
     /// trailers, but requires reading more frames.
-    Remaining(BodyWithTimeout),
+    Remaining(HyperIncomingBody),
 
     /// Body was completely read and trailers were read. Here are the trailers.
     /// Note that `None` means that the body finished without trailers.
     Trailers(Option<http::HeaderMap>),
+
+    /// The body finished with an error. `future-trailers` reports it as well,
+    /// so a guest that only reads the trailers still sees the failure.
+    Error(Arc<Error>),
 }
 
 /// The concrete type behind the `wasi:io/streams.input-stream` resource returned
@@ -165,11 +106,11 @@ enum StreamEnd {
 pub struct HostIncomingBodyStream {
     state: IncomingBodyStreamState,
     buffer: Bytes,
-    error: Option<wasmtime::Error>,
+    error: Option<Arc<Error>>,
 }
 
 impl HostIncomingBodyStream {
-    fn record_frame(&mut self, frame: Option<Result<Frame<Bytes>, types::ErrorCode>>) {
+    fn record_frame(&mut self, frame: Option<Result<Frame<Bytes>, Error>>) {
         match frame {
             Some(Ok(frame)) => match frame.into_data() {
                 // A data frame was received, so queue up the buffered data for
@@ -199,8 +140,17 @@ impl HostIncomingBodyStream {
             // Destroy the body to terminate the stream while enqueueing the
             // error to get returned from the next call to `read`.
             Some(Err(e)) => {
-                self.error = Some(e.into());
-                self.state = IncomingBodyStreamState::Closed;
+                // Also tell `future-trailers`. Both paths report the real
+                // error, so it's shared rather than replaced by an error-code.
+                let tx = match mem::replace(&mut self.state, IncomingBodyStreamState::Closed) {
+                    IncomingBodyStreamState::Open { tx, .. } => Some(tx),
+                    IncomingBodyStreamState::Closed => None,
+                };
+                let e = Arc::new(e);
+                if let Some(tx) = tx {
+                    let _ = tx.send(StreamEnd::Error(Arc::clone(&e)));
+                }
+                self.error = Some(e);
             }
 
             // No more frames are going to be received again, so drop the `body`
@@ -223,7 +173,7 @@ enum IncomingBodyStreamState {
     /// This state is transitioned to `Closed` when an error happens, EOF
     /// happens, or when trailers are read.
     Open {
-        body: BodyWithTimeout,
+        body: HyperIncomingBody,
         tx: oneshot::Sender<StreamEnd>,
     },
 
@@ -244,7 +194,7 @@ impl InputStream for HostIncomingBodyStream {
             }
 
             if let Some(e) = self.error.take() {
-                return Err(StreamError::LastOperationFailed(e));
+                return Err(StreamError::LastOperationFailed(e.into()));
             }
 
             // Extract the body that we're reading from. If present perform a
@@ -319,7 +269,7 @@ pub enum HostFutureTrailers {
     ///
     /// Note that `Ok(None)` means that there were no trailers for this request
     /// while `Ok(Some(_))` means that trailers were found in the request.
-    Done(Result<Option<http::HeaderMap>, types::ErrorCode>),
+    Done(Result<Option<http::HeaderMap>, Arc<Error>>),
 
     /// Trailers have been consumed by `future-trailers.get`.
     Consumed,
@@ -347,6 +297,12 @@ impl Pollable for HostFutureTrailers {
                 // were reached. It's up to us now to complete the body.
                 Ok(StreamEnd::Remaining(b)) => body.body = IncomingBodyState::Start(b),
 
+                // The body itself errored out, so report that through this
+                // future as its contract requires.
+                Ok(StreamEnd::Error(e)) => {
+                    *self = HostFutureTrailers::Done(Err(e));
+                }
+
                 // This means there were no trailers present.
                 Ok(StreamEnd::Trailers(None)) | Err(_) => {
                     *self = HostFutureTrailers::Done(Ok(None));
@@ -368,7 +324,7 @@ impl Pollable for HostFutureTrailers {
         let result = loop {
             match hyper_body.frame().await {
                 None => break Ok(None),
-                Some(Err(e)) => break Err(e),
+                Some(Err(e)) => break Err(Arc::new(e)),
                 Some(Ok(frame)) => {
                     // If this frame is a data frame ignore it as we're only
                     // interested in trailers.
@@ -440,7 +396,7 @@ impl HostOutgoingBody {
         }
         impl Body for BodyImpl {
             type Data = Bytes;
-            type Error = types::ErrorCode;
+            type Error = Error;
             fn poll_frame(
                 mut self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -463,7 +419,7 @@ impl HostOutgoingBody {
                                         Poll::Ready(Some(Ok(Frame::trailers(trailers))))
                                     }
                                     FinishMessage::Abort => {
-                                        Poll::Ready(Some(Err(types::ErrorCode::HttpProtocolError)))
+                                        Poll::Ready(Some(Err(Error::HttpProtocolError)))
                                     }
                                 },
                                 Poll::Ready(Err(RecvError { .. })) => Poll::Ready(None),
@@ -476,8 +432,11 @@ impl HostOutgoingBody {
             }
         }
 
-        // always add 1 buffer here because one empty slot is required
-        let (body_sender, body_receiver) = mpsc::channel(buffer_chunks + 1);
+        // always add 1 buffer here because one empty slot is required; the
+        // extra slot is part of the clamp since `mpsc::channel` panics above
+        // the semaphore's permit limit.
+        let capacity = channel_capacity(buffer_chunks.saturating_add(1));
+        let (body_sender, body_receiver) = mpsc::channel(capacity);
         let (finish_sender, finish_receiver) = oneshot::channel();
         let body_impl = BodyImpl {
             body_receiver,
@@ -576,6 +535,12 @@ impl StreamContext {
     }
 }
 
+/// Clamp a requested outgoing body channel capacity into the range that
+/// `tokio::sync::mpsc::channel` accepts (it panics outside of it).
+fn channel_capacity(requested: usize) -> usize {
+    requested.clamp(1, tokio::sync::Semaphore::MAX_PERMITS)
+}
+
 /// Provides a [`HostOutputStream`] impl from a [`tokio::sync::mpsc::Sender`].
 #[derive(Debug)]
 struct BodyWriteStream {
@@ -608,6 +573,9 @@ impl BodyWriteStream {
 impl OutputStream for BodyWriteStream {
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         let len = bytes.len();
+        if len > self.write_budget {
+            return Err(StreamError::Trap(format_err!("write exceeded budget")));
+        }
         match self.writer.try_send(bytes) {
             // If the message was sent then it's queued up now in hyper to get
             // received.
@@ -671,5 +639,27 @@ impl Pollable for BodyWriteStream {
         // the channel or it's already closed then this will return immediately.
         // If the channel is full this will block until capacity opens up.
         let _ = self.writer.reserve().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::channel_capacity;
+
+    /// `mpsc::channel` panics above `Semaphore::MAX_PERMITS` and at zero, so the
+    /// capacity handed to it must always be clamped - including for the huge
+    /// values an embedder or `-Shttp-outgoing-body-buffer-chunks` can supply.
+    #[test]
+    fn outgoing_body_channel_capacity_is_always_accepted() {
+        let max = tokio::sync::Semaphore::MAX_PERMITS;
+        for requested in [0, 1, 1024, max, max + 1, usize::MAX] {
+            let capacity = channel_capacity(requested);
+            assert!(
+                capacity >= 1 && capacity <= max,
+                "capacity {capacity} out of range"
+            );
+            // Not panicking is the point: that is what the clamp buys us.
+            let _ = tokio::sync::mpsc::channel::<u8>(capacity);
+        }
     }
 }

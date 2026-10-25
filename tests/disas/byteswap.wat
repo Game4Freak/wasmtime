@@ -72,29 +72,33 @@
 )
 
 ;; function u0:0(i64 vmctx, i64, i32) -> i32 tail {
+;;     region0 = 123 ""
+;;     region1 = 160 ""
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32):
 ;; @0057                               jump block1
 ;;
 ;;                                 block1:
-;;                                     v19 = bswap.i32 v2
-;; @0057                               return v19
+;;                                     v18 = bswap.i32 v2
+;; @0057                               return v18
 ;; }
 ;;
 ;; function u0:1(i64 vmctx, i64, i64) -> i64 tail {
+;;     region0 = 123 ""
+;;     region1 = 160 ""
 ;;     gv0 = vmctx
-;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1+24
+;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
+;;     gv2 = load.i64 notrap aligned region1 gv1+24
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i64):
 ;; @00ad                               jump block1
 ;;
 ;;                                 block1:
-;;                                     v39 = bswap.i64 v2
-;; @00ad                               return v39
+;;                                     v38 = bswap.i64 v2
+;; @00ad                               return v38
 ;; }

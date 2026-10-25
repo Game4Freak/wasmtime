@@ -39,9 +39,21 @@ pub unsafe fn commit_pages(addr: *mut u8, len: usize) -> io::Result<()> {
     unsafe { expose_existing_mapping(addr, len) }
 }
 
+#[expect(non_camel_case_types, reason = "matching C conventions")]
 #[cfg(feature = "pooling-allocator")]
-pub unsafe fn decommit_pages(addr: *mut u8, len: usize) -> io::Result<()> {
-    unsafe { erase_existing_mapping(addr, len) }
+pub struct iovec {
+    pub iov_base: *mut u8,
+    pub iov_len: usize,
+}
+
+#[cfg(feature = "pooling-allocator")]
+pub unsafe fn decommit_pages(iov: &[iovec]) -> io::Result<()> {
+    for iov in iov {
+        unsafe {
+            erase_existing_mapping(iov.iov_base, iov.iov_len)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn get_page_size() -> usize {
@@ -66,6 +78,15 @@ impl MemoryImageSource {
 
     pub fn from_data(_data: &[u8]) -> io::Result<Option<MemoryImageSource>> {
         Ok(None)
+    }
+
+    pub unsafe fn map_at(
+        &self,
+        _base: *mut u8,
+        _source_offset: u64,
+        _len: usize,
+    ) -> io::Result<()> {
+        match *self {}
     }
 
     pub unsafe fn remap_as_zeros_at(&self, _base: *mut u8, _len: usize) -> io::Result<()> {

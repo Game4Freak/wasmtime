@@ -2,11 +2,12 @@ use std::ops::Range;
 
 use crate::{Relocation, mach_reloc_to_reloc, mach_trap_to_trap};
 use cranelift_codegen::{
-    Final, MachBufferFinalized, MachBufferFrameLayout, MachSrcLoc, ValueLabelsRanges, ir,
+    MachBufferFinalized, MachBufferFrameLayout, MachSrcLoc, ValueLabelsRanges, ir,
     isa::unwind::CfaUnwindInfo, isa::unwind::UnwindInfo,
 };
 use wasmtime_environ::{
     FilePos, FrameStateSlotBuilder, InstructionAddressMap, ModulePC, PrimaryMap, TrapInformation,
+    Tunables,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -57,7 +58,7 @@ pub struct CompiledFunctionMetadata {
 /// Compiled function: machine code body, jump table offsets, and unwind information.
 pub struct CompiledFunction {
     /// The machine code buffer for this function.
-    pub buffer: MachBufferFinalized<Final>,
+    pub buffer: MachBufferFinalized,
     /// What names each name ref corresponds to.
     name_map: PrimaryMap<ir::UserExternalNameRef, ir::UserExternalName>,
     /// The alignment for the compiled function.
@@ -76,7 +77,7 @@ impl CompiledFunction {
     /// This function uses the information in the machine buffer to derive the traps and relocations
     /// fields. The compiled function metadata is loaded with the default values.
     pub fn new(
-        buffer: MachBufferFinalized<Final>,
+        buffer: MachBufferFinalized,
         name_map: PrimaryMap<ir::UserExternalNameRef, ir::UserExternalName>,
         alignment: u32,
     ) -> Self {
@@ -133,6 +134,13 @@ impl CompiledFunction {
             tags.next();
             patchable_callsites.next();
         }
+        // A patchable call site without debug tags at its return address
+        // would never be NOPed out, and so would always call its callee.
+        debug_assert_eq!(
+            self.breakpoint_patch_points.len(),
+            self.buffer.patchable_call_sites().count(),
+            "patchable call site without debug tags"
+        );
     }
 
     /// Returns an iterator to the function's relocation information.
@@ -144,8 +152,14 @@ impl CompiledFunction {
     }
 
     /// Returns an iterator to the function's trap information.
-    pub fn traps(&self) -> impl Iterator<Item = TrapInformation> + '_ {
-        self.buffer.traps().iter().filter_map(mach_trap_to_trap)
+    pub fn traps<'a>(
+        &'a self,
+        tunables: &'a Tunables,
+    ) -> impl Iterator<Item = TrapInformation> + 'a {
+        self.buffer
+            .traps()
+            .iter()
+            .filter_map(move |t| mach_trap_to_trap(t, tunables))
     }
 
     /// Get the function's address map from the metadata.
@@ -156,13 +170,13 @@ impl CompiledFunction {
     /// Create and return the compiled function address map from the original source offset
     /// and length.
     pub fn set_address_map(&mut self, offset: u32, length: u32, with_instruction_addresses: bool) {
-        assert!((offset + length) <= u32::max_value());
+        assert!((offset + length) <= u32::MAX);
         let len = self.buffer.data().len();
         let srclocs = self
             .buffer
             .get_srclocs_sorted()
             .into_iter()
-            .map(|&MachSrcLoc { start, end, loc }| (loc, start, (end - start)));
+            .map(|&MachSrcLoc { start, end, loc }| (loc.as_abs(), start, (end - start)));
         let instructions = if with_instruction_addresses {
             collect_address_maps(len.try_into().unwrap(), srclocs)
         } else {

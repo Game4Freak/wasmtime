@@ -156,14 +156,18 @@ impl Id {
         u32::try_from(self.0.index()).unwrap()
     }
 
-    /// Construct an `Id` from its raw underlying representation.
+    /// Construct an `Id` from a value previously returned by `into_raw`, if
+    /// that value is well-formed.
     ///
-    /// `raw` should be a value that was previously created via
-    /// `Id::into_raw`. May panic if given arbitrary values.
+    /// A well-formed `Id` is not necessarily one that any slab has handed out;
+    /// lookups are still checked.
     #[inline]
-    pub fn from_raw(raw: u32) -> Self {
-        let raw = usize::try_from(raw).unwrap();
-        Self(EntryIndex::new(raw))
+    pub fn try_from_raw(raw: u32) -> Option<Self> {
+        let raw = usize::try_from(raw).ok()?;
+        if raw > Slab::<()>::MAX_CAPACITY {
+            return None;
+        }
+        Some(Self(EntryIndex::new(raw)))
     }
 }
 
@@ -390,15 +394,11 @@ impl<T> Slab<T> {
     ///
     /// Returns `None` if the value has since been deallocated.
     ///
-    /// If `id` comes from a different `Slab` instance, this method may panic,
-    /// return `None`, or return an arbitrary value.
+    /// If `id` comes from a different `Slab` instance, this method may return
+    /// `None`, or return an arbitrary value.
     #[inline]
     pub fn get(&self, id: Id) -> Option<&T> {
-        match self
-            .entries
-            .get(id.0.index())
-            .expect("id from different slab")
-        {
+        match self.entries.get(id.0.index())? {
             Entry::Occupied(x) => Some(x),
             Entry::Free { .. } => None,
         }
@@ -408,15 +408,11 @@ impl<T> Slab<T> {
     ///
     /// Returns `None` if the value has since been deallocated.
     ///
-    /// If `id` comes from a different `Slab` instance, this method may panic,
-    /// return `None`, or return an arbitrary value.
+    /// If `id` comes from a different `Slab` instance, this method may return
+    /// `None`, or return an arbitrary value.
     #[inline]
     pub fn get_mut(&mut self, id: Id) -> Option<&mut T> {
-        match self
-            .entries
-            .get_mut(id.0.index())
-            .expect("id from different slab")
-        {
+        match self.entries.get_mut(id.0.index())? {
             Entry::Occupied(x) => Some(x),
             Entry::Free { .. } => None,
         }

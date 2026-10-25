@@ -57,7 +57,7 @@
 //! Ad hoc checking
 //!
 //! - Stack slot loads and stores must be in-bounds.
-//! - Immediate constraints for certain opcodes, like `udiv_imm v3, 0`.
+//! - Immediate constraints for certain opcodes, like `iconst.i8 1234`.
 //! - `Insertlane` and `extractlane` instructions have immediate lane numbers that must be in
 //!   range for their polymorphic type.
 //! - Swizzle and shuffle instructions take a variable number of lane arguments. The number
@@ -72,12 +72,13 @@ use crate::ir::instructions::{CallInfo, InstructionFormat, ResolvedConstraint};
 use crate::ir::{self, ArgumentExtension, BlockArg, ExceptionTable};
 use crate::ir::{
     ArgumentPurpose, Block, Constant, DynamicStackSlot, FuncRef, Function, GlobalValue, Inst,
-    JumpTable, MemFlags, Opcode, SigRef, StackSlot, Type, Value, ValueDef, ValueList, types,
+    JumpTable, MemFlags, MemFlagsData, Opcode, SigRef, StackSlot, Type, Value, ValueDef, ValueList,
+    types,
 };
 use crate::ir::{ExceptionTableItem, Signature};
 use crate::isa::{CallConv, TargetIsa};
 use crate::print_errors::pretty_verifier_error;
-use crate::settings::FlagsOrIsa;
+use crate::settings::{Flags, FlagsOrIsa, ProbestackStrategy};
 use crate::timing;
 use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
@@ -303,6 +304,7 @@ struct Verifier<'a> {
     func: &'a Function,
     expected_cfg: ControlFlowGraph,
     expected_domtree: DominatorTree,
+    flags: &'a Flags,
     isa: Option<&'a dyn TargetIsa>,
 }
 
@@ -314,6 +316,7 @@ impl<'a> Verifier<'a> {
             func,
             expected_cfg,
             expected_domtree,
+            flags: fisa.flags,
             isa: fisa.isa,
         }
     }
@@ -388,7 +391,7 @@ impl<'a> Verifier<'a> {
                         }
                     }
                 }
-                ir::GlobalValueData::Load { base, .. } => {
+                ir::GlobalValueData::Load { base, flags, .. } => {
                     if let Some(isa) = self.isa {
                         let base_type = self.func.global_values[base].global_type(isa);
                         let pointer_type = isa.pointer_type();
@@ -401,12 +404,36 @@ impl<'a> Verifier<'a> {
                             ));
                         }
                     }
+                    let flags_data = self.func.dfg.mem_flags[flags];
+                    if let Some(region) = flags_data.alias_region() {
+                        if !self.func.dfg.alias_regions.is_valid(region) {
+                            errors.report((gv, format!("undefined alias region {region}")));
+                        }
+                    }
                 }
                 _ => {}
             }
         }
 
         // Invalid global values shouldn't stop us from verifying the rest of the function
+        Ok(())
+    }
+
+    fn verify_alias_regions(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
+        let mut seen_user_ids = crate::HashMap::new();
+        for (ar, ar_data) in self.func.dfg.alias_regions.iter() {
+            if let Some(&prev) = seen_user_ids.get(&ar_data.user_id) {
+                errors.report((
+                    ar,
+                    format!(
+                        "duplicate alias region user_id {}: {} and {}",
+                        ar_data.user_id, prev, ar
+                    ),
+                ));
+            } else {
+                seen_user_ids.insert(ar_data.user_id, ar);
+            }
+        }
         Ok(())
     }
 
@@ -520,6 +547,20 @@ impl<'a> Verifier<'a> {
             self.verify_inst_result(inst, res, errors)?;
         }
 
+        // Verify alias region references in memflags.
+        if let Some(flags) = self.func.dfg.insts[inst].memflags() {
+            let flags_data = self.func.dfg.mem_flags[flags];
+            if let Some(region) = flags_data.alias_region() {
+                if !self.func.dfg.alias_regions.is_valid(region) {
+                    errors.report((
+                        inst,
+                        self.context(inst),
+                        format!("undefined alias region {region}"),
+                    ));
+                }
+            }
+        }
+
         match self.func.dfg.insts[inst] {
             MultiAry { ref args, .. } => {
                 self.verify_value_list(inst, args, errors)?;
@@ -578,13 +619,10 @@ impl<'a> Verifier<'a> {
             FuncAddr { func_ref, .. } => {
                 self.verify_func_ref(inst, func_ref, errors)?;
             }
-            StackLoad { stack_slot, .. } | StackStore { stack_slot, .. } => {
+            StackAddr { stack_slot, .. } => {
                 self.verify_stack_slot(inst, stack_slot, errors)?;
             }
-            DynamicStackLoad {
-                dynamic_stack_slot, ..
-            }
-            | DynamicStackStore {
+            DynamicStackAddr {
                 dynamic_stack_slot, ..
             } => {
                 self.verify_dynamic_stack_slot(inst, dynamic_stack_slot, errors)?;
@@ -691,6 +729,19 @@ impl<'a> Verifier<'a> {
                 self.verify_try_call_handler_index(inst, block, imm.into(), errors)?;
             }
 
+            IntAddTrap {
+                opcode: Opcode::InterruptPoll,
+                ..
+            } => {
+                if self.func.signature.call_conv != CallConv::Tail {
+                    return errors.fatal((
+                        inst,
+                        self.context(inst),
+                        "`interrupt_poll` requires the `tail` calling convention",
+                    ));
+                }
+            }
+
             // Exhaustive list so we can't forget to add new formats
             AtomicCas { .. }
             | AtomicRmw { .. }
@@ -704,13 +755,11 @@ impl<'a> Verifier<'a> {
             | UnaryIeee64 { .. }
             | Binary { .. }
             | BinaryImm8 { .. }
-            | BinaryImm64 { .. }
             | Ternary { .. }
             | TernaryImm8 { .. }
             | Shuffle { .. }
             | IntAddTrap { .. }
             | IntCompare { .. }
-            | IntCompareImm { .. }
             | FloatCompare { .. }
             | Load { .. }
             | Store { .. }
@@ -1097,6 +1146,7 @@ impl<'a> Verifier<'a> {
     ) -> VerifierStepResult {
         let typ = self.func.dfg.ctrl_typevar(inst);
         let value_type = self.func.dfg.value_type(arg);
+        let flags_data = self.func.dfg.mem_flags[flags];
 
         if typ.bits() != value_type.bits() {
             errors.fatal((
@@ -1108,15 +1158,15 @@ impl<'a> Verifier<'a> {
                     typ.bits()
                 ),
             ))
-        } else if flags != MemFlags::new()
-            && flags != MemFlags::new().with_endianness(ir::Endianness::Little)
-            && flags != MemFlags::new().with_endianness(ir::Endianness::Big)
+        } else if flags_data != MemFlagsData::new()
+            && flags_data != MemFlagsData::new().with_endianness(ir::Endianness::Little)
+            && flags_data != MemFlagsData::new().with_endianness(ir::Endianness::Big)
         {
             errors.fatal((
                 inst,
                 "The bitcast instruction only accepts the `big` or `little` memory flags",
             ))
-        } else if flags == MemFlags::new() && typ.lane_count() != value_type.lane_count() {
+        } else if flags_data == MemFlagsData::new() && typ.lane_count() != value_type.lane_count() {
             errors.fatal((
                 inst,
                 "Byte order specifier required for bitcast instruction changing lane count",
@@ -1822,7 +1872,7 @@ impl<'a> Verifier<'a> {
 
         match *inst_data {
             ir::InstructionData::Store { flags, .. } => {
-                if flags.readonly() {
+                if self.func.dfg.mem_flags[flags].readonly() {
                     errors.fatal((
                         inst,
                         self.context(inst),
@@ -2050,6 +2100,19 @@ impl<'a> Verifier<'a> {
                     ))?;
                 }
             }
+            CallConv::Tail => {
+                if sig
+                    .params
+                    .iter()
+                    .any(|p| matches!(p.purpose, ArgumentPurpose::StructArgument(_)))
+                {
+                    errors.fatal((
+                        entity,
+                        "Signature with `tail` ABI cannot have struct arguments (`sarg`)"
+                            .to_string(),
+                    ))?;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -2078,12 +2141,40 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
+    /// A `preserve_all` function must not clobber any register, but the
+    /// prologue's stack-limit check and outline stack probe run before any
+    /// registers are saved and need scratch registers (and, for the outline
+    /// probe, a call to a function with its own clobbers). Reject both.
+    fn verify_preserve_all_prologue(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
+        if self.func.signature.call_conv != CallConv::PreserveAll {
+            return Ok(());
+        }
+        if self.func.stack_limit.is_some() {
+            errors.fatal((
+                AnyEntity::Function,
+                "functions with the `preserve_all` ABI cannot have a `stack_limit`",
+            ))?;
+        }
+        if self.flags.enable_probestack()
+            && self.flags.probestack_strategy() == ProbestackStrategy::Outline
+        {
+            errors.fatal((
+                AnyEntity::Function,
+                "functions with the `preserve_all` ABI cannot use the outline stack probe \
+                 (`probestack_strategy=outline`)",
+            ))?;
+        }
+        Ok(())
+    }
+
     pub fn run(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
         self.verify_global_values(errors)?;
+        self.verify_alias_regions(errors)?;
         self.typecheck_entry_block_params(errors)?;
         self.check_entry_not_cold(errors)?;
         self.typecheck_function_signature(errors)?;
         self.verify_signatures(errors)?;
+        self.verify_preserve_all_prologue(errors)?;
 
         for block in self.func.layout.blocks() {
             if self.func.layout.first_inst(block).is_none() {

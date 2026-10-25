@@ -1,7 +1,6 @@
 ;;! component_model_async = true
 ;;! component_model_more_async_builtins = true
 ;;! reference_types = true
-;;! gc_types = true
 ;;! multi_memory = true
 
 ;; synchronous future.read; sync lift
@@ -11,7 +10,7 @@
     (core instance $libc (instantiate $libc))
 
     (type $future (future))
-    (core func $read (canon future.read $future (memory $libc "memory")))
+    (core func $read (canon future.read $future (memory (core memory $libc "memory"))))
 
     (core module $m
       (import "" "read" (func $read (param i32 i32) (result i32)))
@@ -26,7 +25,7 @@
         (export "read" (func $read))
       ))
     ))
-    (func (export "run") async (param "x" $future)
+    (func (export "run") (param "x" $future)
       (canon lift (core func $i "run")))
   )
   (instance $child (instantiate $child))
@@ -34,7 +33,7 @@
   (component $other-child
     (type $future (future))
     (import "child" (instance $child
-      (export "run" (func async (param "x" $future)))
+      (export "run" (func (param "x" $future)))
     ))
 
     (core func $new (canon future.new $future))
@@ -62,8 +61,8 @@
   (func (export "run") (alias export $other-child "run"))
 )
 
-;; We expect deadlock since the write end is leaked:
-(assert_trap (invoke "run") "deadlock detected: event loop cannot make further progress")
+;; Sync lower of this async path now traps before the leaked write end can deadlock.
+(assert_trap (invoke "run") "wasm trap: cannot block a synchronous task before returning")
 
 ;; asynchronous future.read; sync lift
 (component
@@ -72,7 +71,7 @@
     (core instance $libc (instantiate $libc))
 
     (type $future (future))
-    (core func $read (canon future.read $future (memory $libc "memory") async))
+    (core func $read (canon future.read $future (memory (core memory $libc "memory")) async))
 
     (core module $m
       (import "" "read" (func $read (param i32 i32) (result i32)))
@@ -87,7 +86,7 @@
         (export "read" (func $read))
       ))
     ))
-    (func (export "run") (param "x" $future)
+    (func (export "run") async (param "x" $future)
       (canon lift (core func $i "run")))
   )
   (instance $child (instantiate $child))
@@ -95,7 +94,7 @@
   (component $other-child
     (type $future (future))
     (import "child" (instance $child
-      (export "run" (func (param "x" $future)))
+      (export "run" (func async (param "x" $future)))
     ))
     (core func $new (canon future.new $future))
     (core func $child-run (canon lower (func $child "run")))
@@ -132,7 +131,7 @@
     (core instance $libc (instantiate $libc))
 
     (type $future (future))
-    (core func $read (canon future.read $future (memory $libc "memory")))
+    (core func $read (canon future.read $future (memory (core memory $libc "memory"))))
 
     (core module $m
       (import "" "read" (func $read (param i32 i32) (result i32)))
@@ -152,7 +151,7 @@
       ))
     ))
     (func (export "run") async (param "x" $future)
-      (canon lift (core func $i "run") async (callback (func $i "cb"))))
+      (canon lift (core func $i "run") async (callback (core func $i "cb"))))
   )
   (instance $child (instantiate $child))
 
@@ -197,7 +196,7 @@
     (core instance $libc (instantiate $libc))
 
     (type $future (future))
-    (core func $read (canon future.read $future (memory $libc "memory") async))
+    (core func $read (canon future.read $future (memory (core memory $libc "memory")) async))
     (core func $return (canon task.return))
 
     (core module $m
@@ -220,15 +219,15 @@
         (export "return" (func $return))
       ))
     ))
-    (func (export "run") (param "x" $future)
-      (canon lift (core func $i "run") async (callback (func $i "cb"))))
+    (func (export "run") async (param "x" $future)
+      (canon lift (core func $i "run") async (callback (core func $i "cb"))))
   )
   (instance $child (instantiate $child))
 
   (component $other-child
     (type $future (future))
     (import "child" (instance $child
-      (export "run" (func (param "x" $future)))
+      (export "run" (func async (param "x" $future)))
     ))
     (core func $new (canon future.new $future))
     (core func $child-run (canon lower (func $child "run")))
@@ -257,4 +256,3 @@
 )
 
 (assert_return (invoke "run"))
-

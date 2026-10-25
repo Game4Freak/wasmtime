@@ -6,9 +6,10 @@ use crate::isa::riscv64::settings as riscv_settings;
 use crate::isa::{
     Builder as IsaBuilder, FunctionAlignment, IsaFlagsHashKey, OwnedTargetIsa, TargetIsa,
 };
+use crate::machinst::CompiledCode;
 use crate::machinst::{
-    CompiledCode, CompiledCodeStencil, MachInst, MachTextSectionBuilder, Reg, SigSet,
-    TextSectionBuilder, VCode, compile,
+    CompiledCodeStencil, MachInst, MachTextSectionBuilder, Reg, SigSet, TextSectionBuilder, VCode,
+    compile,
 };
 use crate::result::CodegenResult;
 use crate::settings::{self as shared_settings, Flags};
@@ -35,6 +36,19 @@ pub struct Riscv64Backend {
 }
 
 impl Riscv64Backend {
+    fn supports_vector_element_type(&self, ty: Type) -> bool {
+        use ir::types::*;
+
+        match ty {
+            I8 | I16 | I32 | I64 => true,
+            // FP16 vector operations require Zvfh.
+            F16 => self.isa_flags.has_f() && self.isa_flags.has_zvfh(),
+            F32 => self.isa_flags.has_f(),
+            F64 => self.isa_flags.has_d(),
+            _ => false,
+        }
+    }
+
     /// Create a new riscv64 backend with the given (shared) flags.
     pub fn new_with_flags(
         triple: Triple,
@@ -54,12 +68,22 @@ impl Riscv64Backend {
         &self,
         func: &Function,
         domtree: &DominatorTree,
+        regalloc_ctx: &mut regalloc2::Ctx,
         ctrl_plane: &mut ControlPlane,
-    ) -> CodegenResult<(VCode<inst::Inst>, regalloc2::Output)> {
+    ) -> CodegenResult<VCode<inst::Inst>> {
         let emit_info = EmitInfo::new(self.flags.clone(), self.isa_flags.clone());
         let sigs = SigSet::new::<abi::Riscv64MachineDeps>(func, &self.flags)?;
         let abi = abi::Riscv64Callee::new(func, self, &self.isa_flags, &sigs)?;
-        compile::compile::<Riscv64Backend>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
+        compile::compile::<Riscv64Backend>(
+            func,
+            domtree,
+            regalloc_ctx,
+            self,
+            abi,
+            emit_info,
+            sigs,
+            ctrl_plane,
+        )
     }
 }
 
@@ -68,13 +92,14 @@ impl TargetIsa for Riscv64Backend {
         &self,
         func: &Function,
         domtree: &DominatorTree,
+        regalloc_ctx: &mut regalloc2::Ctx,
         want_disasm: bool,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<CompiledCodeStencil> {
-        let (vcode, regalloc_result) = self.compile_vcode(func, domtree, ctrl_plane)?;
+        let vcode = self.compile_vcode(func, domtree, regalloc_ctx, ctrl_plane)?;
 
         let want_disasm = want_disasm || log::log_enabled!(log::Level::Debug);
-        let emit_result = vcode.emit(&regalloc_result, want_disasm, &self.flags, ctrl_plane);
+        let emit_result = vcode.emit(&regalloc_ctx.output, want_disasm, &self.flags, ctrl_plane)?;
         let value_labels_ranges = emit_result.value_labels_ranges;
         let buffer = emit_result.buffer;
 
@@ -82,13 +107,13 @@ impl TargetIsa for Riscv64Backend {
             log::debug!("disassembly:\n{disasm}");
         }
 
-        Ok(CompiledCodeStencil {
+        Ok(CompiledCodeStencil(CompiledCode {
             buffer,
             vcode: emit_result.disasm,
             value_labels_ranges,
             bb_starts: emit_result.bb_offsets,
             bb_edges: emit_result.bb_edges,
-        })
+        }))
     }
 
     fn name(&self) -> &'static str {
@@ -199,6 +224,12 @@ impl TargetIsa for Riscv64Backend {
 
     fn has_native_fma(&self) -> bool {
         true
+    }
+
+    fn supports_vector_load_store(&self, ty: Type) -> bool {
+        ty.is_vector()
+            && u64::from(ty.bits()) <= self.isa_flags.min_vec_reg_size()
+            && self.supports_vector_element_type(ty.lane_type())
     }
 
     fn has_round(&self) -> bool {

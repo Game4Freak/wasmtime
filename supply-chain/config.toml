@@ -64,6 +64,12 @@ audit-as-crates-io = true
 [policy.cranelift-isle]
 audit-as-crates-io = true
 
+[policy.cranelift-isle-veri]
+criteria = []
+
+[policy.cranelift-isle-veri-aslp]
+criteria = []
+
 [policy.cranelift-jit]
 audit-as-crates-io = true
 
@@ -99,9 +105,6 @@ audit-as-crates-io = true
 
 [policy.uap-bench]
 criteria = []
-
-[policy.wasi-common]
-audit-as-crates-io = true
 
 [policy.wasmtime]
 audit-as-crates-io = true
@@ -196,9 +199,6 @@ audit-as-crates-io = true
 [policy.wasmtime-wasi-nn]
 audit-as-crates-io = true
 
-[policy.wasmtime-wasi-threads]
-audit-as-crates-io = true
-
 [policy.wasmtime-wasi-tls]
 audit-as-crates-io = true
 
@@ -282,16 +282,12 @@ criteria = "safe-to-deploy"
 version = "0.9.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.directories-next]]
-version = "2.0.0"
+[[exemptions.directories]]
+version = "6.0.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.dirs-sys-next]]
-version = "0.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.fallible-iterator]]
-version = "0.2.0"
+[[exemptions.dirs-sys]]
+version = "0.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.futures-task]]
@@ -336,22 +332,22 @@ criteria = "safe-to-deploy"
 version = "0.7.3"
 criteria = "safe-to-deploy"
 
-[[exemptions.listenfd]]
-version = "1.0.0"
+[[exemptions.libredox]]
+version = "0.1.25"
 criteria = "safe-to-deploy"
 
 [[exemptions.logos]]
-version = "0.14.2"
+version = "0.16.1"
 criteria = "safe-to-deploy"
 notes = "safe when forbid_unsafe feature enabled, which it is in our dep through wasm-wave"
 
 [[exemptions.logos-codegen]]
-version = "0.14.2"
+version = "0.16.1"
 criteria = "safe-to-deploy"
 notes = "safe when forbid_unsafe feature enabled, which it is in our dep through wasm-wave"
 
 [[exemptions.logos-derive]]
-version = "0.14.2"
+version = "0.16.1"
 criteria = "safe-to-deploy"
 notes = "safe when forbid_unsafe feature enabled, which it is in our dep through wasm-wave"
 
@@ -436,7 +432,7 @@ version = "0.2.13"
 criteria = "safe-to-deploy"
 
 [[exemptions.redox_users]]
-version = "0.4.3"
+version = "0.5.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.region]]
@@ -473,14 +469,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.security-framework-sys]]
 version = "2.14.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.shuffling-allocator]]
-version = "1.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.souper-ir]]
-version = "2.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tempfile]]
@@ -533,6 +521,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.winapi-x86_64-pc-windows-gnu]]
 version = "0.4.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.xed-sys]]
+version = "0.6.0+xed-2024.05.20"
 criteria = "safe-to-deploy"
 
 [[exemptions.zip]]

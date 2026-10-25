@@ -15,7 +15,7 @@
 #![warn(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use cranelift_codegen::{
-    FinalizedMachReloc, FinalizedRelocTarget, MachTrap, binemit,
+    MachReloc, MachTrap, RelocTarget, binemit,
     cursor::FuncCursor,
     ir::{self, AbiParam, ArgumentPurpose, ExternalName, InstBuilder, Signature, TrapCode},
     isa::{CallConv, TargetIsa},
@@ -25,8 +25,8 @@ use cranelift_entity::PrimaryMap;
 
 use target_lexicon::Architecture;
 use wasmtime_environ::{
-    BuiltinFunctionIndex, FlagValue, FuncKey, Trap, TrapInformation, Tunables, WasmFuncType,
-    WasmHeapTopType, WasmHeapType, WasmValType,
+    BuiltinFunctionIndex, CompiledTrap, FlagValue, FuncKey, Trap, TrapInformation, Tunables,
+    WasmFuncType, WasmHeapTopType, WasmHeapType, WasmValType,
 };
 
 pub use builder::builder;
@@ -37,9 +37,11 @@ pub use obj::*;
 mod compiled_function;
 pub use compiled_function::*;
 
+mod alias_region;
 mod bounds_checks;
 mod builder;
 mod compiler;
+mod component_sync_call;
 mod debug;
 mod func_environ;
 mod translate;
@@ -47,8 +49,23 @@ mod trap;
 
 use self::compiler::Compiler;
 
+/// Implementation limit on the number of (non-default) targets in a
+/// `br_table`.
+///
+/// The Wasm spec allows implementation-defined limits, and this
+/// matches the limit that V8 and SpiderMonkey impose (2^16 -
+/// 16).
+///
+/// wasmparser checks implementation limits during validation, but
+/// this is not a spec'd implementation limit, just a de-facto one.
+///
+/// FIXME: we should put this limit in wasmparser (and then remove the
+/// checks at this level).
+pub const MAX_BR_TABLE_TARGETS: u32 = 65520;
+
 const TRAP_INTERNAL_ASSERT: TrapCode = TrapCode::unwrap_user(1);
-const TRAP_OFFSET: u8 = 2;
+pub const TRAP_GC_HEAP_CORRUPT: TrapCode = TrapCode::unwrap_user(2);
+const TRAP_OFFSET: u8 = 3;
 pub const TRAP_CANNOT_LEAVE_COMPONENT: TrapCode =
     TrapCode::unwrap_user(Trap::CannotLeaveComponent as u8 + TRAP_OFFSET);
 pub const TRAP_INDIRECT_CALL_TO_NULL: TrapCode =
@@ -73,6 +90,18 @@ pub const TRAP_CONTINUATION_ALREADY_CONSUMED: TrapCode =
     TrapCode::unwrap_user(Trap::ContinuationAlreadyConsumed as u8 + TRAP_OFFSET);
 pub const TRAP_CAST_FAILURE: TrapCode =
     TrapCode::unwrap_user(Trap::CastFailure as u8 + TRAP_OFFSET);
+pub const TRAP_UNCAUGHT_EXCEPTION: TrapCode =
+    TrapCode::unwrap_user(Trap::UncaughtException as u8 + TRAP_OFFSET);
+
+/// The CLIF trap code for a Wasmtime trap code.
+///
+/// This is the inverse of `clif_trap_to_env_trap`'s fallback arm, and is what
+/// all of the `TRAP_*` constants above compute for their particular trap. Use
+/// it for traps that don't have a constant above, e.g. the trap named by a
+/// fused adapter's `trap` intrinsic.
+const fn env_trap_to_clif_trap(trap: Trap) -> TrapCode {
+    TrapCode::unwrap_user(trap as u8 + TRAP_OFFSET)
+}
 
 /// Creates a new cranelift `Signature` with no wasm params/results for the
 /// given calling convention.
@@ -100,7 +129,7 @@ fn blank_sig(isa: &dyn TargetIsa, call_conv: CallConv) -> ir::Signature {
 /// convention.
 fn unbarriered_store_type_at_offset(
     pos: &mut FuncCursor,
-    flags: ir::MemFlags,
+    flags: ir::MemFlagsData,
     base: ir::Value,
     offset: i32,
     value: ir::Value,
@@ -121,7 +150,7 @@ fn unbarriered_load_type_at_offset(
     isa: &dyn TargetIsa,
     pos: &mut FuncCursor,
     ty: WasmValType,
-    flags: ir::MemFlags,
+    flags: ir::MemFlagsData,
     base: ir::Value,
     offset: i32,
 ) -> ir::Value {
@@ -254,49 +283,59 @@ fn to_flag_value(v: &settings::Value) -> FlagValue<'static> {
 }
 
 /// Converts machine traps to trap information.
-pub fn mach_trap_to_trap(trap: &MachTrap) -> Option<TrapInformation> {
+pub fn mach_trap_to_trap(trap: &MachTrap, tunables: &Tunables) -> Option<TrapInformation> {
     let &MachTrap { offset, code } = trap;
     Some(TrapInformation {
         code_offset: offset,
-        trap_code: clif_trap_to_env_trap(code)?,
+        trap_code: clif_trap_to_env_trap(code, tunables)?,
     })
 }
 
-fn clif_trap_to_env_trap(trap: ir::TrapCode) -> Option<Trap> {
-    Some(match trap {
+fn clif_trap_to_env_trap(trap: ir::TrapCode, tunables: &Tunables) -> Option<CompiledTrap> {
+    Some(CompiledTrap::Normal(match trap {
         ir::TrapCode::STACK_OVERFLOW => Trap::StackOverflow,
         ir::TrapCode::HEAP_OUT_OF_BOUNDS => Trap::MemoryOutOfBounds,
         ir::TrapCode::INTEGER_OVERFLOW => Trap::IntegerOverflow,
         ir::TrapCode::INTEGER_DIVISION_BY_ZERO => Trap::IntegerDivisionByZero,
         ir::TrapCode::BAD_CONVERSION_TO_INTEGER => Trap::BadConversionToInteger,
 
-        // These do not get converted to wasmtime traps, since they
-        // shouldn't ever be hit in theory. Instead of catching and handling
-        // these, we let the signal crash the process.
-        TRAP_INTERNAL_ASSERT => return None,
+        TRAP_INTERNAL_ASSERT => {
+            return if tunables.metadata_for_internal_asserts {
+                Some(CompiledTrap::InternalAssert)
+            } else {
+                None
+            };
+        }
+        TRAP_GC_HEAP_CORRUPT => {
+            return if tunables.metadata_for_gc_heap_corruption {
+                Some(CompiledTrap::GcHeapCorrupt)
+            } else {
+                None
+            };
+        }
 
         other => Trap::from_u8(other.as_raw().get() - TRAP_OFFSET).unwrap(),
-    })
+    }))
 }
 
 /// Converts machine relocations to relocation information
 /// to perform.
 fn mach_reloc_to_reloc(
-    reloc: &FinalizedMachReloc,
+    reloc: &MachReloc,
     name_map: &PrimaryMap<ir::UserExternalNameRef, ir::UserExternalName>,
 ) -> Relocation {
-    let &FinalizedMachReloc {
+    let &MachReloc {
         offset,
         kind,
         ref target,
         addend,
     } = reloc;
     let reloc_target = match *target {
-        FinalizedRelocTarget::ExternalName(ExternalName::User(user_func_ref)) => {
+        RelocTarget::ExternalName(ExternalName::User(user_func_ref)) => {
             let name = &name_map[user_func_ref];
             FuncKey::from_raw_parts(name.namespace, name.index)
         }
-        FinalizedRelocTarget::ExternalName(ExternalName::LibCall(libcall)) => {
+        RelocTarget::ExternalName(ExternalName::LibCall(libcall)) => {
             // We should have avoided any code that needs this style of libcalls
             // in the Wasm-to-Cranelift translator.
             panic!("unexpected libcall {libcall:?}");
@@ -374,7 +413,6 @@ impl BuiltinFunctionSignatures {
         AbiParam::new(ir::types::I8)
     }
 
-    #[cfg(feature = "stack-switching")]
     fn size(&self) -> AbiParam {
         AbiParam::new(self.pointer_type)
     }

@@ -25,7 +25,7 @@ pub(crate) fn deconstruct<'a>(
     let ptr_bits = ptr_ty.bits();
 
     let contref = pos.ins().ireduce(ptr_ty, contobj);
-    let shifted = pos.ins().ushr_imm(contobj, i64::from(ptr_bits));
+    let shifted = pos.ins().ushr_imm_u(contobj, i64::from(ptr_bits));
     let revision_counter = pos.ins().ireduce(ptr_ty, shifted);
 
     (revision_counter, contref)
@@ -34,7 +34,7 @@ pub(crate) fn deconstruct<'a>(
 /// Constructs a continuation object from a given contref and revision pointer.
 /// The contref_addr may be 0, to indicate that we want to build a wasm null reference.
 pub(crate) fn construct<'a>(
-    env: &mut crate::func_environ::FuncEnvironment<'a>,
+    env: &crate::func_environ::FuncEnvironment<'a>,
     pos: &mut cranelift_codegen::cursor::FuncCursor,
     revision_counter: ir::Value,
     contref_addr: ir::Value,
@@ -48,7 +48,7 @@ pub(crate) fn construct<'a>(
 
     let contref_addr = pos.ins().uextend(fat_ptr_ty, contref_addr);
     let revision_counter = pos.ins().uextend(fat_ptr_ty, revision_counter);
-    let shifted_counter = pos.ins().ishl_imm(revision_counter, i64::from(ptr_bits));
+    let shifted_counter = pos.ins().ishl_imm_u(revision_counter, i64::from(ptr_bits));
     let contobj = pos.ins().bor(shifted_counter, contref_addr);
 
     contobj

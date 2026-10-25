@@ -1,14 +1,14 @@
 use crate::Result;
 use crate::abi::{self, LocalSlot, align_to};
-use crate::codegen::{CodeGenContext, Emission, FuncEnv};
+use crate::codegen::{CodeGenContext, Emission, FuncEnv, TailCallPlan};
 use crate::isa::{
     CallingConvention,
     reg::{Reg, RegClass, WritableReg, writable},
 };
 use cranelift_codegen::{
-    Final, MachBufferFinalized, MachLabel,
+    MachBufferFinalized, MachExceptionHandler, MachLabel,
     binemit::CodeOffset,
-    ir::{Endianness, MemFlags, RelSourceLoc, SourceLoc, UserExternalNameRef},
+    ir::{Endianness, MemFlagsData, RelSourceLoc, SourceLoc, UserExternalNameRef},
 };
 use std::{fmt::Debug, ops::Range};
 use wasmtime_environ::{PtrSize, WasmHeapType, WasmRefType, WasmValType};
@@ -198,6 +198,10 @@ impl SPOffset {
 
     pub fn as_u32(&self) -> u32 {
         self.0
+    }
+
+    pub fn checked_sub(self, rhs: Self) -> Option<Self> {
+        self.0.checked_sub(rhs.0).map(Self)
     }
 }
 
@@ -404,20 +408,6 @@ impl ExtendKind {
         match self {
             Self::Signed(_) => true,
             _ => false,
-        }
-    }
-
-    pub fn from_bits(&self) -> u8 {
-        match self {
-            Self::Signed(s) => s.from_bits(),
-            Self::Unsigned(u) => u.from_bits(),
-        }
-    }
-
-    pub fn to_bits(&self) -> u8 {
-        match self {
-            Self::Signed(s) => s.to_bits(),
-            Self::Unsigned(u) => u.to_bits(),
         }
     }
 }
@@ -1080,17 +1070,6 @@ impl OperandSize {
         }
     }
 
-    /// The binary logarithm of the number of bits in the operand.
-    pub fn log2(&self) -> u8 {
-        match self {
-            OperandSize::S8 => 3,
-            OperandSize::S16 => 4,
-            OperandSize::S32 => 5,
-            OperandSize::S64 => 6,
-            OperandSize::S128 => 7,
-        }
-    }
-
     /// Create an [`OperandSize`]  from the given number of bytes.
     pub fn from_bytes(bytes: u8) -> Self {
         use OperandSize::*;
@@ -1372,12 +1351,12 @@ pub enum RoundingMode {
 }
 
 /// Memory flags for trusted loads/stores.
-pub const TRUSTED_FLAGS: MemFlags = MemFlags::trusted();
+pub const TRUSTED_FLAGS: MemFlagsData = MemFlagsData::trusted();
 
 /// Flags used for WebAssembly loads / stores.
 /// Untrusted by default so we don't set `no_trap`.
 /// We also ensure that the endianness is the right one for WebAssembly.
-pub const UNTRUSTED_FLAGS: MemFlags = MemFlags::new().with_endianness(Endianness::Little);
+pub const UNTRUSTED_FLAGS: MemFlagsData = MemFlagsData::new().with_endianness(Endianness::Little);
 
 /// Generic MacroAssembler interface used by the code generation.
 ///
@@ -1417,14 +1396,15 @@ pub(crate) trait MacroAssembler {
     fn frame_setup(&mut self) -> Result<()>;
 
     /// Generate the frame restore sequence.
-    fn frame_restore(&mut self) -> Result<()>;
+    fn frame_restore(&mut self, stack_args_size: u32) -> Result<()>;
 
     /// Emit a stack check.
     fn check_stack(&mut self, vmctx: Reg) -> Result<()>;
 
     /// Emit the function epilogue.
-    fn epilogue(&mut self) -> Result<()> {
-        self.frame_restore()
+    fn epilogue(&mut self, locals_size: u32, stack_args_size: u32) -> Result<()> {
+        self.free_stack(locals_size)?;
+        self.frame_restore(stack_args_size)
     }
 
     /// Reserve stack space.
@@ -1433,11 +1413,23 @@ pub(crate) trait MacroAssembler {
     /// Free stack space.
     fn free_stack(&mut self, bytes: u32) -> Result<()>;
 
+    /// Reclaim stack space after the callee returns.
+    ///
+    /// `callee_pop_size` bytes have already been removed by a default-ABI
+    /// callee. The implementation must update its abstract stack accounting
+    /// for those bytes and physically free only the remaining caller-owned
+    /// space, including alignment padding and any consumed argument spills.
+    fn restore_stack_after_call(&mut self, reserved_size: u32, callee_pop_size: u32) -> Result<()>;
+
     /// Reset the stack pointer to the given offset;
     ///
     /// Used to reset the stack pointer to a given offset
     /// when dealing with unreachable code.
     fn reset_stack_pointer(&mut self, offset: SPOffset) -> Result<()>;
+
+    /// Prepare to enter an exception handler at the given stack offset and
+    /// return the register containing the exception reference.
+    fn prepare_for_exception_handler(&mut self, target_offset: SPOffset) -> Result<Reg>;
 
     /// Get the address of a local slot.
     fn local_address(&mut self, local: &LocalSlot) -> Result<Self::Address>;
@@ -1460,12 +1452,57 @@ pub(crate) trait MacroAssembler {
     /// of the given register.
     fn address_at_reg(&self, reg: Reg, offset: u32) -> Result<Self::Address>;
 
+    /// Construct an address relative to the frame pointer.
+    fn address_at_fp(&self, offset: i64) -> Result<Self::Address>;
+
     /// Emit a function call to either a local or external function.
     fn call(
         &mut self,
         stack_args_size: u32,
-        f: impl FnMut(&mut Self) -> Result<(CalleeKind, CallingConvention)>,
+        context: &mut CodeGenContext<Emission>,
+        f: impl FnMut(
+            &mut Self,
+            &mut CodeGenContext<Emission>,
+        ) -> Result<(CalleeKind, CallingConvention)>,
+        finalize: impl FnMut(&mut Self, &mut CodeGenContext<Emission>) -> Result<()>,
     ) -> Result<u32>;
+
+    /// Finish replacing a frame when the caller and tail callee have equally
+    /// sized incoming stack-argument areas.
+    fn finish_tail_call_same_size(&mut self) -> Result<()>;
+
+    /// Finish replacing a frame for a tail callee with no stack arguments.
+    fn finish_tail_call_empty(&mut self, plan: TailCallPlan) -> Result<()>;
+
+    /// Preserve the frame state that a resized argument move may overwrite,
+    /// invoke `move_args`, and then finish replacing the current frame.
+    ///
+    /// `move_args` receives the distance from the current stack pointer to the
+    /// staged argument block. A callback is used because an implementation may
+    /// need to keep scratch registers live across the argument move.
+    fn with_tail_call_resize(
+        &mut self,
+        plan: TailCallPlan,
+        move_args: impl FnOnce(&mut Self, u32) -> Result<()>,
+    ) -> Result<()>;
+
+    /// Jump to a tail callee without adding a return address.
+    fn tail_jump(&mut self, callee: CalleeKind);
+
+    /// Record a GC stack map at the current code offset, which must be the
+    /// return address of the call emitted immediately before. Each offset is
+    /// the distance from the stack pointer at the call site to a slot holding
+    /// a live GC reference.
+    fn emit_stack_map(&mut self, sp_offset: SPOffset, offsets: &[SPOffset]) -> Result<()>;
+
+    /// Record the active exception handlers for the call emitted immediately
+    /// before this point.
+    fn emit_try_call_site(
+        &mut self,
+        sp_offset: SPOffset,
+        vmctx_slot_offset: u32,
+        handlers: impl Iterator<Item = MachExceptionHandler>,
+    ) -> Result<()>;
 
     /// Acquire a scratch register and execute the given callback.
     fn with_scratch<T: ScratchType, R>(&mut self, f: impl FnOnce(&mut Self, Scratch) -> R) -> R;
@@ -1481,7 +1518,12 @@ pub(crate) trait MacroAssembler {
             WasmValType::I32
             | WasmValType::I64
             | WasmValType::Ref(WasmRefType {
-                heap_type: WasmHeapType::Func,
+                heap_type:
+                    WasmHeapType::Func
+                    | WasmHeapType::Extern
+                    | WasmHeapType::Exn
+                    | WasmHeapType::ConcreteExn(_)
+                    | WasmHeapType::NoExn,
                 ..
             }) => self.with_scratch::<IntScratch, _>(f),
             WasmValType::F32 | WasmValType::F64 | WasmValType::V128 => {
@@ -1665,7 +1707,7 @@ pub(crate) trait MacroAssembler {
         &mut self,
         dst: WritableReg,
         lhs: Reg,
-        rhs: Imm,
+        rhs: RegImm,
         size: OperandSize,
         trap: TrapCode,
     ) -> Result<()>;
@@ -1848,7 +1890,7 @@ pub(crate) trait MacroAssembler {
     fn push(&mut self, src: Reg, size: OperandSize) -> Result<StackSlot>;
 
     /// Finalize the assembly and return the result.
-    fn finalize(self, base: Option<SourceLoc>) -> Result<MachBufferFinalized<Final>>;
+    fn finalize(self, base: Option<SourceLoc>) -> Result<MachBufferFinalized>;
 
     /// Zero a particular register.
     fn zero(&mut self, reg: WritableReg) -> Result<()>;
@@ -2085,16 +2127,25 @@ pub(crate) trait MacroAssembler {
     /// Performs a swizzle between two 128-bit vectors into a 128-bit result.
     fn swizzle(&mut self, dst: WritableReg, lhs: Reg, rhs: Reg) -> Result<()>;
 
-    /// Performs the RMW `op` operation on the passed `addr`.
+    /// Performs the RMW `op` operation on the address at the top of the
+    /// context's stack.
     ///
-    /// The value *before* the operation was performed is written back to the `operand` register.
+    /// This method takes the `CodeGenContext` as an argument to accommodate
+    /// architectures that expect parameters in specific registers. The context
+    /// stack contains the `address` and the `operand` values, in that order,
+    /// and both are owned by this function. The implementer is expected to
+    /// push the value *before* the operation was performed to the context's
+    /// stack before returning.
+    ///
+    /// Note that the address is passed through the context's stack rather than
+    /// as a register to ensure that any spills can be perfomed when solving
+    /// ISA-specific constraints prior to emission.
     fn atomic_rmw(
         &mut self,
         context: &mut CodeGenContext<Emission>,
-        addr: Self::Address,
         size: OperandSize,
         op: RmwOp,
-        flags: MemFlags,
+        flags: MemFlagsData,
         extend: Option<Extend<Zero>>,
     ) -> Result<()>;
 
@@ -2116,19 +2167,23 @@ pub(crate) trait MacroAssembler {
         kind: ReplaceLaneKind,
     ) -> Result<()>;
 
-    /// Perform an atomic CAS (compare-and-swap) operation with the value at `addr`, and `expected`
-    /// and `replacement` (at the top of the context's stack).
+    /// Perform an atomic CAS (compare-and-swap) operation with the `address`, `expected` and
+    /// `replacement` values at the top of the context's stack.
     ///
     /// This method takes the `CodeGenContext` as an arguments to accommodate architectures that
-    /// expect parameters in specific registers. The context stack contains the `replacement`,
-    /// and `expected` values in that order. The implementer is expected to push the value at
-    /// `addr` before the update to the context's stack before returning.
+    /// expect parameters in specific registers. The context stack contains the `address`,
+    /// `expected` and `replacement` values in that order, and all of them are owned by this
+    /// function. The implementer is expected to push the value at `address` before the update to
+    /// the context's stack before returning.
+    ///
+    /// Like in [`MacroAssembler::atomic_rmw`], the address is passed through the context's stack
+    /// so that it can be spilled; implementations that require fixed registers must request them
+    /// *before* popping any of the values above.
     fn atomic_cas(
         &mut self,
         context: &mut CodeGenContext<Emission>,
-        addr: Self::Address,
         size: OperandSize,
-        flags: MemFlags,
+        flags: MemFlagsData,
         extend: Option<Extend<Zero>>,
     ) -> Result<()>;
 

@@ -66,24 +66,25 @@
 //! ```
 //!
 //! <div class="example-wrap" style="display:inline-block"><pre class="compile_fail" style="white-space:normal;font:inherit;">
-//!
-//!  **Warning**: In order to correctly use this interface you should always call [clear_cache].
-//!  A followup call to [pipeline_flush_mt] is required if you are running in a multi-threaded environment.
-//!
+//! **Warning**: In order to correctly use this interface you should always call [clear_cache].
+//! A followup call to [pipeline_flush_mt] is required if you are running in a multi-threaded environment.
 //! </pre></div>
 //!
 //! [ARM Community - Caches and Self-Modifying Code]: https://community.arm.com/arm-community-blogs/b/architectures-and-processors-blog/posts/caches-and-self-modifying-code
 
 use std::ffi::c_void;
+use wasmtime_core::error::Result;
 
-cfg_if::cfg_if! {
-    if #[cfg(target_os = "windows")] {
+cfg_select! {
+    target_os = "windows" => {
         mod win;
         use win as imp;
-    } else if #[cfg(miri)] {
+    }
+    miri => {
         mod miri;
         use crate::miri as imp;
-    } else {
+    }
+    _ => {
         mod libc;
         use crate::libc as imp;
     }
@@ -97,7 +98,7 @@ cfg_if::cfg_if! {
 /// after all calls to [clear_cache].
 ///
 /// If the architecture does not require a pipeline flush, this function does nothing.
-pub fn pipeline_flush_mt() -> imp::Result<()> {
+pub fn pipeline_flush_mt() -> Result<()> {
     imp::pipeline_flush_mt()
 }
 
@@ -109,6 +110,6 @@ pub fn pipeline_flush_mt() -> imp::Result<()> {
 ///
 /// It is necessary to call [pipeline_flush_mt] after this function if you are running in a multi-threaded
 /// environment.
-pub unsafe fn clear_cache(ptr: *const c_void, len: usize) -> imp::Result<()> {
+pub unsafe fn clear_cache(ptr: *const c_void, len: usize) -> Result<()> {
     imp::clear_cache(ptr, len)
 }

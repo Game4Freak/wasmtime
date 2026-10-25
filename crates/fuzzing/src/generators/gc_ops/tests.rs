@@ -1,11 +1,14 @@
 use crate::generators::gc_ops::{
     limits::GcOpsLimits,
     ops::{GcOp, GcOps, OP_NAMES},
-    types::{RecGroupId, StackType, TypeId, Types},
+    stack::StackType,
+    types::{ArrayType, CompositeType, FieldType, RecGroupId, StructField, TypeId, Types},
 };
 use mutatis;
+use mutatis::mutators as m;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use std::collections::BTreeSet;
 use wasmparser;
 use wasmprinter;
 
@@ -35,14 +38,14 @@ fn is_subtype_index(
     }
 
     let sub = match encoding_order
-        .get(usize::try_from(sub_index).expect("sub_index is out of bounds"))
+        .get(usize::try_from(sub_index).unwrap())
         .copied()
     {
         Some(t) => t,
         None => return false,
     };
     let sup = match encoding_order
-        .get(usize::try_from(sup_index).expect("sup_index is out of bounds"))
+        .get(usize::try_from(sup_index).unwrap())
         .copied()
     {
         Some(t) => t,
@@ -61,6 +64,8 @@ fn empty_test_ops() -> GcOps {
             table_size: 5,
             max_rec_groups: 5,
             max_types: 5,
+            max_fields: 10,
+            array_length: 5,
         },
         ops: vec![],
         types: Types::new(),
@@ -80,6 +85,8 @@ fn test_ops(num_params: u32, num_globals: u32, table_size: u32) -> GcOps {
             table_size,
             max_rec_groups: 7,
             max_types: 10,
+            max_fields: 10,
+            array_length: 5,
         },
         ops: vec![
             GcOp::NullExtern,
@@ -105,25 +112,28 @@ fn test_ops(num_params: u32, num_globals: u32, table_size: u32) -> GcOps {
             let is_final = false;
             let supertype = None;
             t.types
-                .insert_empty_struct(TypeId(i), gid, is_final, supertype);
+                .insert_struct(TypeId(i), gid, is_final, supertype, Vec::new());
         }
     }
 
     t
 }
 
-/// Validate that a GcOps produces a valid Wasm binary.
-fn assert_valid_wasm(ops: &mut GcOps) {
+/// Check that a `GcOps` emits a valid Wasm binary, describing the failure if
+/// not.
+fn check_valid_wasm(ops: &GcOps) -> Result<(), String> {
+    let mut ops = ops.clone();
     let wasm = ops.to_wasm_binary();
-    let feats = wasmparser::WasmFeatures::default();
-    feats.reference_types();
-    feats.gc();
+    let feats = wasmparser::WasmFeatures::default()
+        | wasmparser::WasmFeatures::REFERENCE_TYPES
+        | wasmparser::WasmFeatures::GC
+        | wasmparser::WasmFeatures::GC_TYPES;
     let mut validator = wasmparser::Validator::new_with_features(feats);
 
-    if let Err(e) = validator.validate_all(&wasm) {
+    validator.validate_all(&wasm).map(|_| ()).map_err(|e| {
         let wat =
             wasmprinter::print_bytes(&wasm).unwrap_or_else(|e| format!("<disasm failed: {e}>"));
-        panic!(
+        format!(
             "Emitted Wasm binary is not valid!\n\n\
              === Validation Error ===\n\n\
              {e}\n\n\
@@ -131,21 +141,58 @@ fn assert_valid_wasm(ops: &mut GcOps) {
              {ops:#?}\n\n\
              === Wat ===\n\n\
              {wat}"
-        );
+        )
+    })
+}
+
+/// Validate that a GcOps produces a valid Wasm binary.
+fn assert_valid_wasm(ops: &GcOps) {
+    if let Err(e) = check_valid_wasm(ops) {
+        panic!("{e}");
     }
 }
 
 #[test]
-fn mutate_gc_ops_with_default_mutator() -> mutatis::Result<()> {
+fn always_produces_valid_wasm() {
+    let _ = env_logger::try_init();
+
+    mutatis::check::Check::new()
+        .iters(2048)
+        .shrink_iters(1024)
+        .seed(0xC0FFEE)
+        .run_with(
+            m::default::<GcOps>(),
+            [test_ops(5, 5, 5), empty_test_ops(), cast_test_ops(vec![])],
+            check_valid_wasm,
+        )
+        .unwrap();
+}
+
+/// Every limit must stay inside its declared range under mutation.
+#[test]
+fn limits_stay_in_range() -> mutatis::Result<()> {
+    use crate::generators::gc_ops::limits::{
+        ARRAY_LENGTH_RANGE, MAX_FIELDS_RANGE, MAX_REC_GROUPS_RANGE, MAX_TYPES_RANGE,
+        NUM_GLOBALS_RANGE, NUM_PARAMS_RANGE, TABLE_SIZE_RANGE,
+    };
     let _ = env_logger::try_init();
 
     let mut ops = test_ops(5, 5, 5);
+    ops.limits.fixup_limits();
 
-    let mut session = mutatis::Session::new();
+    let mut session = mutatis::Session::new().seed(0xC0FFEE);
     for _ in 0..2048 {
         session.mutate(&mut ops)?;
-        assert_valid_wasm(&mut ops);
+        let l = &ops.limits;
+        assert!(NUM_PARAMS_RANGE.contains(&l.num_params), "{l:?}");
+        assert!(NUM_GLOBALS_RANGE.contains(&l.num_globals), "{l:?}");
+        assert!(TABLE_SIZE_RANGE.contains(&l.table_size), "{l:?}");
+        assert!(MAX_REC_GROUPS_RANGE.contains(&l.max_rec_groups), "{l:?}");
+        assert!(MAX_TYPES_RANGE.contains(&l.max_types), "{l:?}");
+        assert!(MAX_FIELDS_RANGE.contains(&l.max_fields), "{l:?}");
+        assert!(ARRAY_LENGTH_RANGE.contains(&l.array_length), "{l:?}");
     }
+
     Ok(())
 }
 
@@ -217,7 +264,7 @@ fn every_op_generated() -> mutatis::Result<()> {
     let mut res = empty_test_ops();
     let mut session = mutatis::Session::new().seed(0xC0FFEE);
 
-    'outer: for _ in 0..=1024 {
+    'outer: for _ in 0..=32768 {
         session.mutate(&mut res)?;
         for op in &res.ops {
             unseen_ops.remove(op.name());
@@ -232,11 +279,52 @@ fn every_op_generated() -> mutatis::Result<()> {
 }
 
 #[test]
+fn i31_and_eq_upcast_ops_validate() -> mutatis::Result<()> {
+    let _ = env_logger::try_init();
+
+    // Exercise every new i31/eqref op end-to-end through encoding + validation.
+    let mut ops = test_ops(5, 5, 5);
+    ops.ops = vec![
+        // Create i31 values and route them through locals/globals/tables.
+        GcOp::RefI31 { value: 0x4000_0001 },
+        GcOp::I31LocalSet,
+        GcOp::I31LocalGet,
+        GcOp::I31GlobalSet,
+        GcOp::I31GlobalGet,
+        GcOp::I31TableSet { elem_index: 0 },
+        GcOp::I31TableGet { elem_index: 0 },
+        // Inline i31.get_s / i31.get_u (null-guarded).
+        GcOp::I31GetS,
+        GcOp::RefI31 { value: 7 },
+        GcOp::I31GetU,
+        // Null i31, then differential host check.
+        GcOp::NullI31,
+        GcOp::TakeI31Call,
+        GcOp::RefI31 { value: 0x7fff_ffff },
+        GcOp::TakeI31Call,
+        // Upcast i31 -> eqref and hand it to the eqref-taking host function.
+        GcOp::RefI31 { value: 1 },
+        GcOp::I31RefAsEq,
+        GcOp::TakeEqCall,
+        // Upcast abstract and concrete struct refs -> eqref.
+        GcOp::NullStruct,
+        GcOp::StructRefAsEq,
+        GcOp::TakeEqCall,
+        GcOp::StructNew { type_index: 0 },
+        GcOp::TypedStructRefAsEq { type_index: 0 },
+        GcOp::TakeEqCall,
+    ];
+    assert_valid_wasm(&ops);
+
+    Ok(())
+}
+
+#[test]
 fn emits_rec_groups_and_validates() -> mutatis::Result<()> {
     let _ = env_logger::try_init();
 
     let mut ops = test_ops(5, 5, 5);
-    assert_valid_wasm(&mut ops);
+    assert_valid_wasm(&ops);
 
     let wasm = ops.to_wasm_binary();
     let wat = wasmprinter::print_bytes(&wasm).expect("to WAT");
@@ -312,7 +400,7 @@ fn fixup_check_types_and_indexes() -> mutatis::Result<()> {
     );
 
     // Verify that we generate a valid Wasm binary after calling `fixup`.
-    assert_valid_wasm(&mut ops);
+    assert_valid_wasm(&ops);
 
     Ok(())
 }
@@ -335,10 +423,10 @@ fn sort_types_by_supertype_orders_supertype_before_subtype_across_rec_groups() {
     let d = TypeId(3);
 
     // Cross-rec-group chain: C <: A <: B <: D.
-    types.insert_empty_struct(a, ga, false, Some(b)); // A <: B
-    types.insert_empty_struct(b, gb, false, Some(d)); // B <: D
-    types.insert_empty_struct(c, gc, false, Some(a)); // C <: A
-    types.insert_empty_struct(d, gd, false, None); // D
+    types.insert_struct(a, ga, false, Some(b), Vec::new()); // A <: B
+    types.insert_struct(b, gb, false, Some(d), Vec::new()); // B <: D
+    types.insert_struct(c, gc, false, Some(a), Vec::new()); // C <: A
+    types.insert_struct(d, gd, false, None, Vec::new()); // D
 
     let mut sorted = Vec::new();
     types.sort_types_topo(&mut sorted);
@@ -364,8 +452,8 @@ fn fixup_preserves_subtyping_within_same_rec_group() {
 
     // Both types are in the same rec group.
     // The second subtypes the first.
-    types.insert_empty_struct(super_ty, g, false, None);
-    types.insert_empty_struct(sub_ty, g, false, Some(super_ty));
+    types.insert_struct(super_ty, g, false, None, Vec::new());
+    types.insert_struct(sub_ty, g, false, Some(super_ty), Vec::new());
 
     let limits = GcOpsLimits {
         num_params: 0,
@@ -373,9 +461,11 @@ fn fixup_preserves_subtyping_within_same_rec_group() {
         table_size: 0,
         max_rec_groups: 10,
         max_types: 10,
+        max_fields: 10,
+        array_length: 5,
     };
 
-    types.fixup(&limits, &mut Vec::new());
+    types.fixup_types(&limits, &mut Vec::new());
 
     assert_eq!(types.rec_group_of(super_ty), Some(g));
     assert_eq!(types.rec_group_of(sub_ty), Some(g));
@@ -405,14 +495,14 @@ fn fixup_breaks_one_edge_in_multi_rec_group_type_cycle() {
     let d = TypeId(3);
 
     // Rec(a)
-    types.insert_empty_struct(a, g_a, false, Some(d));
+    types.insert_struct(a, g_a, false, Some(d), Vec::new());
 
     // Rec(b, c)
-    types.insert_empty_struct(b, g_bc, false, None);
-    types.insert_empty_struct(c, g_bc, false, Some(a));
+    types.insert_struct(b, g_bc, false, None, Vec::new());
+    types.insert_struct(c, g_bc, false, Some(a), Vec::new());
 
     // Rec(d)
-    types.insert_empty_struct(d, g_d, false, Some(c));
+    types.insert_struct(d, g_d, false, Some(c), Vec::new());
 
     let limits = GcOpsLimits {
         num_params: 0,
@@ -420,9 +510,11 @@ fn fixup_breaks_one_edge_in_multi_rec_group_type_cycle() {
         table_size: 0,
         max_rec_groups: 10,
         max_types: 10,
+        max_fields: 10,
+        array_length: 5,
     };
 
-    types.fixup(&limits, &mut Vec::new());
+    types.fixup_types(&limits, &mut Vec::new());
 
     let a_super = types.type_defs.get(&a).unwrap().supertype;
     let c_super = types.type_defs.get(&c).unwrap().supertype;
@@ -462,12 +554,12 @@ fn sort_rec_groups_topo_orders_dependencies_first() {
     let e = TypeId(4);
     let f = TypeId(5);
 
-    types.insert_empty_struct(a, g0, false, Some(b)); // g0 -> g1
-    types.insert_empty_struct(b, g1, false, Some(c)); // g1 -> g2
-    types.insert_empty_struct(c, g2, false, Some(d)); // g2 ->g3
-    types.insert_empty_struct(d, g3, false, None);
-    types.insert_empty_struct(e, g0, false, None);
-    types.insert_empty_struct(f, g2, false, None);
+    types.insert_struct(a, g0, false, Some(b), Vec::new()); // g0 -> g1
+    types.insert_struct(b, g1, false, Some(c), Vec::new()); // g1 -> g2
+    types.insert_struct(c, g2, false, Some(d), Vec::new()); // g2 ->g3
+    types.insert_struct(d, g3, false, None, Vec::new());
+    types.insert_struct(e, g0, false, None, Vec::new());
+    types.insert_struct(f, g2, false, None, Vec::new());
 
     let type_to_group = types.type_to_group_map();
     let mut sorted = Vec::new();
@@ -482,7 +574,7 @@ fn sort_rec_groups_topo_orders_dependencies_first() {
 }
 
 #[test]
-fn break_rec_group_cycles() {
+fn merge_rec_group_cycles() {
     let _ = env_logger::try_init();
 
     let mut types = Types::new();
@@ -522,24 +614,28 @@ fn break_rec_group_cycles() {
     //                 -----------| g3 |
     //                            +----+
     //
-    // After: back edges dropped, clean chain
+    // All four groups are mutually reachable (g0->g1->g2->g0 and
+    // g1->g2->g3->g1), so they form a single strongly-connected component.
     //
-    //  +----+       +----+       +----+       +----+
-    //  | g0 |------>| g1 |------>| g2 |------>| g3 |
-    //  +----+       +----+       +----+       +----+
+    // After: the whole SCC is merged into one rec group, with every supertype
+    // edge preserved (nothing is dropped).
+    //
+    //  +-------------------------+
+    //  |   g0 ∪ g1 ∪ g2 ∪ g3     |
+    //  +-------------------------+
 
-    types.insert_empty_struct(a0, g0, false, Some(b0)); // g0 -> g1
-    types.insert_empty_struct(a1, g0, false, None);
+    types.insert_struct(a0, g0, false, Some(b0), Vec::new()); // g0 -> g1
+    types.insert_struct(a1, g0, false, None, Vec::new());
 
-    types.insert_empty_struct(b0, g1, false, None);
-    types.insert_empty_struct(b1, g1, false, Some(c0)); // g1 -> g2
+    types.insert_struct(b0, g1, false, None, Vec::new());
+    types.insert_struct(b1, g1, false, Some(c0), Vec::new()); // g1 -> g2
 
-    types.insert_empty_struct(c0, g2, false, None);
-    types.insert_empty_struct(c1, g2, false, Some(a1)); // g2 -> g0 (outer back edge)
-    types.insert_empty_struct(c2, g2, false, Some(d0)); // g2 -> g3
+    types.insert_struct(c0, g2, false, None, Vec::new());
+    types.insert_struct(c1, g2, false, Some(a1), Vec::new()); // g2 -> g0 (outer back edge)
+    types.insert_struct(c2, g2, false, Some(d0), Vec::new()); // g2 -> g3
 
-    types.insert_empty_struct(d0, g3, false, None);
-    types.insert_empty_struct(d1, g3, false, Some(b0)); // g3 -> g1 (inner back edge)
+    types.insert_struct(d0, g3, false, None, Vec::new());
+    types.insert_struct(d1, g3, false, Some(b0), Vec::new()); // g3 -> g1 (inner back edge)
 
     // Type graph is acyclic — breaking supertype cycles changes nothing.
     types.break_supertype_cycles();
@@ -552,32 +648,28 @@ fn break_rec_group_cycles() {
     assert_eq!(types.rec_groups.len(), 4);
 
     let type_to_group = types.type_to_group_map();
-    types.break_rec_group_cycles(&type_to_group);
+    types.merge_rec_group_cycles(&type_to_group);
 
-    // All four groups preserved.
-    assert_eq!(types.rec_groups.len(), 4);
-    assert!(types.rec_groups.contains_key(&g0));
-    assert!(types.rec_groups.contains_key(&g1));
-    assert!(types.rec_groups.contains_key(&g2));
-    assert!(types.rec_groups.contains_key(&g3));
+    // The whole cycle collapses into a single rec group...
+    assert_eq!(types.rec_groups.len(), 1);
 
-    // Back edge (g2->g0): c1's supertype cleared.
-    assert_eq!(types.type_defs.get(&c1).unwrap().supertype, None);
+    // ...which contains every type from all four original groups.
+    let merged: BTreeSet<TypeId> = types.rec_groups.values().flatten().copied().collect();
+    let expected: BTreeSet<TypeId> = [a0, a1, b0, b1, c0, c1, c2, d0, d1].into_iter().collect();
+    assert_eq!(merged, expected);
 
-    // Back edge (g3->g1): d1's supertype cleared.
-    assert_eq!(types.type_defs.get(&d1).unwrap().supertype, None);
-
-    // All other cross-group supertypes preserved.
+    // Merging drops no edges: every supertype relationship is preserved.
     assert_eq!(types.type_defs.get(&a0).unwrap().supertype, Some(b0));
     assert_eq!(types.type_defs.get(&b1).unwrap().supertype, Some(c0));
+    assert_eq!(types.type_defs.get(&c1).unwrap().supertype, Some(a1));
     assert_eq!(types.type_defs.get(&c2).unwrap().supertype, Some(d0));
+    assert_eq!(types.type_defs.get(&d1).unwrap().supertype, Some(b0));
 
-    // Result is a clean chain: g0 -> g1 -> g2 -> g3
+    // With a single group there are no cross-group ordering constraints left.
     let type_to_group = types.type_to_group_map();
     let mut topo = Vec::new();
     types.sort_rec_groups_topo(&mut topo, &type_to_group);
-    assert_eq!(topo.len(), 4);
-    assert_eq!(topo, vec![g3, g2, g1, g0]);
+    assert_eq!(topo.len(), 1);
 }
 
 #[test]
@@ -608,10 +700,10 @@ fn is_subtype_index_accepts_chain() {
     //   0 -> TypeId(1)
     //   1 -> TypeId(2)
     //   2 -> TypeId(3)
-    types.insert_empty_struct(TypeId(1), g0, false, None);
-    types.insert_empty_struct(TypeId(2), g1, false, Some(TypeId(1)));
-    types.insert_empty_struct(TypeId(3), g2, false, Some(TypeId(2)));
-    types.insert_empty_struct(TypeId(4), g3, false, Some(TypeId(3)));
+    types.insert_struct(TypeId(1), g0, false, None, Vec::new());
+    types.insert_struct(TypeId(2), g1, false, Some(TypeId(1)), Vec::new());
+    types.insert_struct(TypeId(3), g2, false, Some(TypeId(2)), Vec::new());
+    types.insert_struct(TypeId(4), g3, false, Some(TypeId(3)), Vec::new());
 
     let order = encoding_order(&types);
 
@@ -661,8 +753,8 @@ fn is_subtype_index_encoding_order_differs_from_key_order() {
     // BTreeMap key order:  [TypeId(1), TypeId(10)]  -> dense 0=TypeId(1), 1=TypeId(10)
     // Encoding order:      [TypeId(10), TypeId(1)]  -> dense 0=TypeId(10), 1=TypeId(1)
     //   (g0 must come before g1 because g1's type has a supertype in g0)
-    types.insert_empty_struct(TypeId(10), g0, false, None);
-    types.insert_empty_struct(TypeId(1), g1, false, Some(TypeId(10)));
+    types.insert_struct(TypeId(10), g0, false, None, Vec::new());
+    types.insert_struct(TypeId(1), g1, false, Some(TypeId(10)), Vec::new());
 
     let order = encoding_order(&types);
 
@@ -693,9 +785,9 @@ fn stacktype_fixup_accepts_subtype_for_supertype_requirement() {
     //   0 -> TypeId(1)
     //   1 -> TypeId(2)
     //   2 -> TypeId(3)
-    types.insert_empty_struct(TypeId(1), g, false, None);
-    types.insert_empty_struct(TypeId(2), g, false, Some(TypeId(1)));
-    types.insert_empty_struct(TypeId(3), g, false, Some(TypeId(2)));
+    types.insert_struct(TypeId(1), g, false, None, Vec::new());
+    types.insert_struct(TypeId(2), g, false, Some(TypeId(1)), Vec::new());
+    types.insert_struct(TypeId(3), g, false, Some(TypeId(2)), Vec::new());
 
     let num_types = u32::try_from(types.type_defs.len()).unwrap();
     let order = encoding_order(&types);
@@ -704,7 +796,7 @@ fn stacktype_fixup_accepts_subtype_for_supertype_requirement() {
     let mut stack = vec![StackType::Struct(Some(2))];
     let mut out = vec![];
 
-    StackType::fixup(
+    StackType::fixup_operand(
         Some(StackType::Struct(Some(1))),
         &mut stack,
         &mut out,
@@ -726,7 +818,7 @@ fn stacktype_fixup_accepts_subtype_for_supertype_requirement() {
     let mut stack = vec![StackType::Struct(Some(2))];
     let mut out = vec![];
 
-    StackType::fixup(
+    StackType::fixup_operand(
         Some(StackType::Struct(Some(0))),
         &mut stack,
         &mut out,
@@ -745,7 +837,7 @@ fn stacktype_fixup_accepts_subtype_for_supertype_requirement() {
     let mut stack = vec![StackType::Struct(Some(0))];
     let mut out = vec![];
 
-    StackType::fixup(
+    StackType::fixup_operand(
         Some(StackType::Struct(Some(1))),
         &mut stack,
         &mut out,
@@ -772,17 +864,19 @@ fn cast_test_ops(ops: Vec<GcOp>) -> GcOps {
             table_size: 0,
             max_rec_groups: 5,
             max_types: 10,
+            max_fields: 10,
+            array_length: 5,
         },
         ops,
         types: Types::new(),
     };
     let g = RecGroupId(0);
     t.types.insert_rec_group(g);
-    t.types.insert_empty_struct(TypeId(1), g, false, None);
+    t.types.insert_struct(TypeId(1), g, false, None, Vec::new());
     t.types
-        .insert_empty_struct(TypeId(2), g, false, Some(TypeId(1)));
+        .insert_struct(TypeId(2), g, false, Some(TypeId(1)), Vec::new());
     t.types
-        .insert_empty_struct(TypeId(3), g, false, Some(TypeId(2)));
+        .insert_struct(TypeId(3), g, false, Some(TypeId(2)), Vec::new());
     t
 }
 
@@ -799,14 +893,16 @@ fn flat_cast_test_ops(ops: Vec<GcOp>) -> GcOps {
             table_size: 0,
             max_rec_groups: 5,
             max_types: 10,
+            max_fields: 10,
+            array_length: 5,
         },
         ops,
         types: Types::new(),
     };
     let g = RecGroupId(0);
     t.types.insert_rec_group(g);
-    t.types.insert_empty_struct(TypeId(1), g, false, None);
-    t.types.insert_empty_struct(TypeId(2), g, false, None);
+    t.types.insert_struct(TypeId(1), g, false, None, Vec::new());
+    t.types.insert_struct(TypeId(2), g, false, None, Vec::new());
     t
 }
 
@@ -834,7 +930,7 @@ fn upcast_valid_pair() {
         "valid upcast pair should be preserved: {:#?}",
         ops.ops
     );
-    assert_valid_wasm(&mut ops);
+    assert_valid_wasm(&ops);
 }
 
 /// Case 2: wrong pair — repaired to sub's direct supertype.
@@ -861,7 +957,7 @@ fn upcast_wrong_pair_repaired_via_supertype() {
         "upcast should be repaired to sub's direct supertype: {:#?}",
         ops.ops
     );
-    assert_valid_wasm(&mut ops);
+    assert_valid_wasm(&ops);
 }
 
 /// Case 3: sub has no supertype — falls back to self-cast.
@@ -887,7 +983,7 @@ fn upcast_no_supertype_self_cast() {
         "upcast with no supertype should become self-cast: {:#?}",
         ops.ops
     );
-    assert_valid_wasm(&mut ops);
+    assert_valid_wasm(&ops);
 }
 
 /// Case 4: flat hierarchy (no supertypes at all) — self-cast.
@@ -911,7 +1007,7 @@ fn upcast_flat_hierarchy_self_cast() {
         "upcast in flat hierarchy should become self-cast: {:#?}",
         ops.ops
     );
-    assert_valid_wasm(&mut ops);
+    assert_valid_wasm(&ops);
 }
 
 // ---- RefCastDownward tests ----
@@ -938,7 +1034,7 @@ fn downcast_valid_pair() {
         "valid downcast pair should be preserved: {:#?}",
         ops.ops
     );
-    assert_valid_wasm(&mut ops);
+    assert_valid_wasm(&ops);
 }
 
 /// Case 2: wrong pair — super (operand) is kept, sub (result) is
@@ -967,7 +1063,7 @@ fn downcast_wrong_pair_repaired_finds_subtype() {
         "downcast should keep super and find a valid sub: {:#?}",
         ops.ops
     );
-    assert_valid_wasm(&mut ops);
+    assert_valid_wasm(&ops);
 }
 
 /// Case 3: super has no subtypes — falls back to self-cast keeping
@@ -994,7 +1090,7 @@ fn downcast_no_subtype_self_cast() {
         "downcast with no subtypes should self-cast keeping super: {:#?}",
         ops.ops
     );
-    assert_valid_wasm(&mut ops);
+    assert_valid_wasm(&ops);
 }
 
 /// Case 4: flat hierarchy — self-cast.
@@ -1018,5 +1114,69 @@ fn downcast_flat_hierarchy_self_cast() {
         "downcast in flat hierarchy should become self-cast: {:#?}",
         ops.ops
     );
-    assert_valid_wasm(&mut ops);
+    assert_valid_wasm(&ops);
+}
+
+/// `Types::fixup` must re-point dangling type references at live types rather
+/// than erasing them, because a mutated type id is essentially never live and
+/// erasing would leave the fuzzer with no concrete references and no subtyping.
+#[test]
+fn fixup_repoints_dangling_references() {
+    let limits = GcOpsLimits::default();
+    let gid = RecGroupId(0);
+    let mut types = Types::new();
+    types.insert_rec_group(gid);
+
+    // A final struct and an array: neither is a legal supertype for a
+    // non-final struct, so resolution must not pick either of them.
+    types.insert_struct(TypeId(10), gid, true, None, Vec::new());
+    types.insert_type(
+        TypeId(20),
+        gid,
+        false,
+        None,
+        CompositeType::Array(ArrayType {
+            element: StructField {
+                field_type: FieldType::I32,
+                mutable: false,
+            },
+        }),
+    );
+    // The one legal supertype.
+    types.insert_struct(TypeId(30), gid, false, None, Vec::new());
+
+    // The type under test: a dangling supertype and a dangling field
+    // reference, both pointing at ids that do not exist.
+    types.insert_struct(
+        TypeId(40),
+        gid,
+        false,
+        Some(TypeId(0xdead_beef)),
+        vec![StructField {
+            field_type: FieldType::Ref {
+                nullable: true,
+                type_id: TypeId(0xfeed_face),
+            },
+            mutable: false,
+        }],
+    );
+
+    types.fixup_types(&limits, &mut Vec::new());
+
+    let def = types.type_defs.get(&TypeId(40)).unwrap();
+    assert_eq!(
+        def.supertype,
+        Some(TypeId(30)),
+        "a dangling supertype must resolve to the one non-final struct, \
+         not to the final struct, the array, or `None`"
+    );
+
+    let field = &def.composite_type.fields()[0];
+    match field.field_type {
+        FieldType::Ref { type_id, .. } => assert!(
+            types.type_defs.contains_key(&type_id),
+            "a dangling reference must resolve to a live type, got {type_id:?}"
+        ),
+        ref other => panic!("dangling reference was erased instead of re-pointed: {other:?}"),
+    }
 }

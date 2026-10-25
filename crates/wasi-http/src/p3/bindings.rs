@@ -27,11 +27,15 @@ mod generated {
             "wasi:http/types.header-error" => crate::p3::HeaderError,
             "wasi:http/types.request-options-error" => crate::p3::RequestOptionsError,
         },
+        named_imports: {
+            "wasi:http/client": wasmtime_wasi::NamedId,
+            "wasi:http/types": wasmtime_wasi::NamedId,
+        },
     });
 
     mod with {
         pub type Fields = crate::FieldMap;
-        pub type RequestOptions = crate::p3::MaybeMutable<crate::p3::RequestOptions>;
+        pub type RequestOptions = crate::p3::MaybeMutable<crate::RequestOptions>;
     }
 }
 
@@ -39,6 +43,9 @@ pub use self::generated::wasi::*;
 
 /// Raw bindings to the `wasi:http/service` exports.
 pub use self::generated::exports;
+
+/// Raw bindings to `wasi:http` interfaces when used as named imports.
+pub use self::generated::named_imports;
 
 /// Bindings to the `wasi:http/service` world.
 pub use self::generated::{Service, ServiceIndices, ServicePre};

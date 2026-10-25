@@ -1,18 +1,20 @@
 //! Implementation of the `wasi:http/outgoing-handler` interface.
 
+use crate::WasiHttpCtxView;
 use crate::p2::{
-    HttpResult, WasiHttpCtxView,
+    HttpResult,
     bindings::http::{
         outgoing_handler,
         types::{self, Scheme},
     },
     error::internal_error,
     http_request_error,
-    types::{HostFutureIncomingResponse, HostOutgoingRequest, OutgoingRequestConfig},
+    types::{HostFutureIncomingResponse, HostOutgoingRequest},
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::Method;
+use std::pin::Pin;
 use wasmtime::component::Resource;
 
 impl outgoing_handler::Host for WasiHttpCtxView<'_> {
@@ -21,19 +23,12 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
         request_id: Resource<HostOutgoingRequest>,
         options: Option<Resource<types::RequestOptions>>,
     ) -> HttpResult<Resource<HostFutureIncomingResponse>> {
-        let opts = options.and_then(|opts| self.table.get(&opts).ok());
-
-        let connect_timeout = opts
-            .and_then(|opts| opts.connect_timeout)
-            .unwrap_or(std::time::Duration::from_secs(600));
-
-        let first_byte_timeout = opts
-            .and_then(|opts| opts.first_byte_timeout)
-            .unwrap_or(std::time::Duration::from_secs(600));
-
-        let between_bytes_timeout = opts
-            .and_then(|opts| opts.between_bytes_timeout)
-            .unwrap_or(std::time::Duration::from_secs(600));
+        // `options` is an `own` parameter (`outgoing-handler.handle` takes ownership of it, per
+        // `wasi:http` types.wit), so it must be consumed from the table like `request` below.
+        let opts = match options {
+            Some(id) => Some(self.table.delete(id)?),
+            None => None,
+        };
 
         let req = self.table.delete(request_id)?;
         let mut builder = hyper::Request::builder();
@@ -54,12 +49,25 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
             },
         });
 
-        let (use_tls, scheme) = match req.scheme.unwrap_or(Scheme::Https) {
-            Scheme::Http => (false, http::uri::Scheme::HTTP),
-            Scheme::Https => (true, http::uri::Scheme::HTTPS),
-
-            // We can only support http/https
-            Scheme::Other(_) => return Err(types::ErrorCode::HttpProtocolError.into()),
+        let scheme = match req.scheme {
+            Some(scheme) => {
+                let scheme = match scheme {
+                    Scheme::Http => http::uri::Scheme::HTTP,
+                    Scheme::Https => http::uri::Scheme::HTTPS,
+                    Scheme::Other(scheme) => http::uri::Scheme::try_from(scheme.as_str())
+                        .map_err(|_| types::ErrorCode::HttpProtocolError)?,
+                };
+                if !self.hooks.is_supported_scheme(&scheme) {
+                    return Err(types::ErrorCode::HttpProtocolError.into());
+                }
+                scheme
+            }
+            // Note that a hook returning `None` here means that guests are
+            // required to specify a scheme themselves.
+            None => self
+                .hooks
+                .default_scheme()
+                .ok_or(types::ErrorCode::HttpProtocolError)?,
         };
 
         let authority = req.authority.unwrap_or_else(String::new);
@@ -74,6 +82,10 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
 
         builder = builder.uri(uri.build().map_err(http_request_error)?);
 
+        if self.hooks.set_host_header() {
+            builder = builder.header(http::header::HOST, authority.as_str());
+        }
+
         for (k, v) in req.headers.iter() {
             builder = builder.header(k, v);
         }
@@ -83,21 +95,59 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
                 .map_err(|_| unreachable!("Infallible error"))
                 .boxed_unsync()
         });
+        let body = body.map_err(Into::into).boxed_unsync();
 
         let request = builder
             .body(body)
             .map_err(|err| internal_error(err.to_string()))?;
 
-        let future = self.hooks.send_request(
-            request,
-            OutgoingRequestConfig {
-                use_tls,
-                connect_timeout,
-                first_byte_timeout,
-                between_bytes_timeout,
-            },
-        )?;
+        let future = self
+            .hooks
+            .send_request(request, opts, Box::new(async { Ok(()) }));
+        let future = wasmtime_wasi::runtime::spawn(async move {
+            let (res, io) = Pin::from(future).await?;
+            let io = wasmtime_wasi::runtime::spawn(async move {
+                match Pin::from(io).await {
+                    Ok(()) => {}
+                    // TODO: shouldn't throw away this error and ideally should
+                    // surface somewhere.
+                    Err(e) => tracing::warn!("dropping error {e}"),
+                }
+            });
+            let res = res.map(|b| b.boxed_unsync());
+            Ok((res, io))
+        });
 
-        Ok(self.table.push(future)?)
+        Ok(self
+            .table
+            .push(HostFutureIncomingResponse::Pending(future))?)
+    }
+}
+
+mod named {
+    use crate::WasiHttpNamedView;
+    use crate::p2::bindings::http::types;
+    use crate::p2::bindings::named_imports::wasi::http::outgoing_handler;
+    use crate::p2::types::{HostFutureIncomingResponse, HostOutgoingRequest};
+    use crate::p2::{HttpError, HttpResult};
+    use wasmtime::component::Resource;
+    use wasmtime_wasi::{NamedId, WasiCtxNamedView};
+
+    impl<T> outgoing_handler::Host for WasiCtxNamedView<'_, T>
+    where
+        T: WasiHttpNamedView,
+    {
+        fn handle(
+            &mut self,
+            id: NamedId,
+            request_id: Resource<HostOutgoingRequest>,
+            options: Option<Resource<types::RequestOptions>>,
+        ) -> HttpResult<Resource<HostFutureIncomingResponse>> {
+            super::outgoing_handler::Host::handle(&mut self.0.http(id), request_id, options)
+        }
+
+        fn convert_error_code(&mut self, err: HttpError) -> wasmtime::Result<types::ErrorCode> {
+            err.downcast()
+        }
     }
 }

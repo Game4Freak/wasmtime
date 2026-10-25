@@ -1,9 +1,9 @@
 use crate::error::OutOfMemory;
 use crate::prelude::*;
 use crate::runtime::vm::{
-    self, InterpreterRef, SendSyncPtr, StoreBox, VMArrayCallHostFuncContext,
+    self, InterpreterRef, SendSyncPtr, StoreBox, UncaughtException, VMArrayCallHostFuncContext,
     VMCommonStackInformation, VMContext, VMFuncRef, VMFunctionImport, VMOpaqueContext,
-    VMStoreContext,
+    VMStoreContext, VmPtr,
 };
 use crate::store::{Asyncness, AutoAssertNoGc, InstanceId, StoreId, StoreOpaque};
 use crate::type_registry::RegisteredType;
@@ -277,7 +277,7 @@ pub struct Func {
     /// Note that this field has an `unsafe_*` prefix to discourage use of it.
     /// This is only safe to read/use if `self.store` is validated to belong to
     /// an ambiently provided `StoreOpaque` or similar. Use the
-    /// `self.func_ref()` method instead of this field to perform this check.
+    /// `self.vm_func_ref()` method instead of this field to perform this check.
     unsafe_func_ref: SendSyncPtr<VMFuncRef>,
 }
 
@@ -717,7 +717,7 @@ impl Func {
     /// let instance = Instance::new(&mut store, &module, &[add.into()])?;
     /// let foo = instance.get_typed_func::<(i32, i32), i32>(&mut store, "foo")?;
     /// assert_eq!(foo.call(&mut store, (1, 2))?, 3);
-    /// assert!(foo.call(&mut store, (i32::max_value(), 1)).is_err());
+    /// assert!(foo.call(&mut store, (i32::MAX, 1)).is_err());
     /// # Ok(())
     /// # }
     /// ```
@@ -878,7 +878,7 @@ impl Func {
     /// Note that this is a somewhat expensive method since it requires taking a
     /// lock as well as cloning a type.
     pub(crate) fn load_ty(&self, store: &StoreOpaque) -> FuncType {
-        FuncType::from_shared_type_index(store.engine(), self.type_index(store))
+        FuncType::from_shared_type_index(store.engine(), self.type_index(store)).unwrap()
     }
 
     /// Does this function match the given type?
@@ -943,6 +943,7 @@ impl Func {
     ///   via [`Func::new`], for example.
     /// * The `store` provided is configured to require `call_async` to be used
     ///   instead, such as with epochs or fuel.
+    /// * The call is recursive from within e.g. a `call_async` invocation.
     ///
     /// Errors typically indicate that execution of WebAssembly was halted
     /// mid-way and did not complete after the error condition happened.
@@ -1004,6 +1005,7 @@ impl Func {
     ///   types and such.
     /// * Reference types like `externref` and `funcref` are valid at the
     ///   time of this call and for the `store` specified.
+    /// * The call is _not_ recursive from within e.g. a `call_async` invocation.
     ///
     /// These invariants are all upheld for you with [`Func::call`] and
     /// [`TypedFunc::call`].
@@ -1018,17 +1020,25 @@ impl Func {
 
         // SAFETY: the safety of this function call is the same as the contract
         // of this function.
-        unsafe { Self::call_unchecked_raw(&mut store, func_ref, params_and_returns) }
+        unsafe {
+            Self::call_unchecked_raw(
+                &mut store,
+                func_ref,
+                params_and_returns,
+                UncaughtException::Propagate,
+            )
+        }
     }
 
     pub(crate) unsafe fn call_unchecked_raw<T>(
         store: &mut StoreContextMut<'_, T>,
         func_ref: NonNull<VMFuncRef>,
         params_and_returns: NonNull<[ValRaw]>,
+        uncaught_exception: UncaughtException,
     ) -> Result<()> {
         // SAFETY: the safety of this function call is the same as the contract
         // of this function.
-        invoke_wasm_and_catch_traps(store, |caller, vm| unsafe {
+        invoke_wasm_and_catch_traps(store, uncaught_exception, |caller, vm| unsafe {
             VMFuncRef::array_call(func_ref, vm, caller, params_and_returns)
         })
     }
@@ -1405,7 +1415,7 @@ impl Func {
     /// # use wasmtime::*;
     /// # fn foo(add_with_overflow: &Func, mut store: Store<()>) -> Result<()> {
     /// let typed = add_with_overflow.typed::<(u32, u32), (u32, i32)>(&store)?;
-    /// let (result, overflow) = typed.call(&mut store, (u32::max_value(), 2))?;
+    /// let (result, overflow) = typed.call(&mut store, (u32::MAX, 2))?;
     /// assert_eq!(result, 1);
     /// assert_eq!(overflow, 1);
     /// # Ok(())
@@ -1456,6 +1466,7 @@ impl Func {
 /// can pass to the called wasm function, if desired.
 pub(crate) fn invoke_wasm_and_catch_traps<T>(
     store: &mut StoreContextMut<'_, T>,
+    uncaught_exception: crate::runtime::vm::UncaughtException,
     closure: impl FnMut(NonNull<VMContext>, Option<InterpreterRef<'_>>) -> bool,
 ) -> Result<()> {
     // The `enter_wasm` call below will reset the store context's
@@ -1472,8 +1483,12 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
         // `previous_runtime_state` implicitly dropped here
         return Err(trap);
     }
-    let result = crate::runtime::vm::catch_traps(store, &mut previous_runtime_state, closure);
-    #[cfg(feature = "component-model")]
+    let result = crate::runtime::vm::catch_traps(
+        store,
+        &mut previous_runtime_state,
+        uncaught_exception,
+        closure,
+    );
     if result.is_err() {
         store.0.set_trapped();
     }
@@ -1586,21 +1601,29 @@ impl EntryStoreContext {
 
         unsafe {
             let vm_store_context = store.0.vm_store_context();
+            let initial_stack_information = VmPtr::from(
+                NonNull::new(initial_stack_information)
+                    .expect("expected non-null stack information"),
+            );
             let new_stack_chain = VMStackChain::InitialStack(initial_stack_information);
-            *vm_store_context.stack_chain.get() = new_stack_chain;
+            let stack_chain =
+                mem::replace(&mut *vm_store_context.stack_chain.get(), new_stack_chain);
+
+            // Zero these out, rather than leave the previous activation's
+            // values behind, so that if we call into a host function callee
+            // (which never runs an entry trampoline to overwrite them) and it
+            // walks the stack, we don't see these values both while walking
+            // activations and in the saved state.
+            let take = |field: &core::cell::UnsafeCell<usize>| mem::replace(&mut *field.get(), 0);
 
             Self {
                 stack_limit,
-                last_wasm_exit_pc: *(*vm_store_context).last_wasm_exit_pc.get(),
-                last_wasm_exit_trampoline_fp: *(*vm_store_context)
-                    .last_wasm_exit_trampoline_fp
-                    .get(),
-                last_wasm_entry_fp: *(*vm_store_context).last_wasm_entry_fp.get(),
-                last_wasm_entry_sp: *(*vm_store_context).last_wasm_entry_sp.get(),
-                last_wasm_entry_trap_handler: *(*vm_store_context)
-                    .last_wasm_entry_trap_handler
-                    .get(),
-                stack_chain: (*(*vm_store_context).stack_chain.get()).clone(),
+                last_wasm_exit_pc: take(&vm_store_context.last_wasm_exit_pc),
+                last_wasm_exit_trampoline_fp: take(&vm_store_context.last_wasm_exit_trampoline_fp),
+                last_wasm_entry_fp: take(&vm_store_context.last_wasm_entry_fp),
+                last_wasm_entry_sp: take(&vm_store_context.last_wasm_entry_sp),
+                last_wasm_entry_trap_handler: take(&vm_store_context.last_wasm_entry_trap_handler),
+                stack_chain,
                 vm_store_context,
             }
         }
@@ -2157,11 +2180,11 @@ impl<T> Caller<'_, T> {
     ///
     /// Same as [`Store::gc_async`](crate::Store::gc_async).
     #[cfg(all(feature = "async", feature = "gc"))]
-    pub async fn gc_async(&mut self, why: Option<&crate::GcHeapOutOfMemory<()>>)
+    pub async fn gc_async(&mut self, why: Option<&crate::GcHeapOutOfMemory<()>>) -> Result<()>
     where
         T: Send + 'static,
     {
-        self.store.gc_async(why).await;
+        self.store.gc_async(why).await
     }
 
     /// Returns the remaining fuel in the store.
@@ -2373,10 +2396,6 @@ impl HostFunc {
             // this up.
             let mut store = unsafe { store.unchecked_context_mut() };
 
-            // Handle the entry call hook, with a corresponding exit call hook
-            // below.
-            store.0.call_hook(CallHook::CallingHost)?;
-
             // SAFETY: this function itself requires that the `vmctx` is
             // valid to use here.
             let state = unsafe {
@@ -2394,7 +2413,7 @@ impl HostFunc {
             };
 
             let (gc_lifo_scope, ret) = {
-                let gc_lifo_scope = store.0.gc_roots().enter_lifo_scope();
+                let gc_lifo_scope = store.0.enter_gc_lifo_scope();
 
                 let mut args = NonNull::slice_from_raw_parts(args.cast(), args_len);
                 // SAFETY: it's a contract of this function itself that the values
@@ -2413,10 +2432,6 @@ impl HostFunc {
             };
 
             store.0.exit_gc_lifo_scope(gc_lifo_scope);
-
-            // Note that if this returns a trap then `ret` is discarded
-            // entirely.
-            store.0.call_hook(CallHook::ReturningFromHost)?;
 
             ret
         };
@@ -2474,7 +2489,7 @@ impl HostFunc {
             Self::vmctx_sync(engine, ty.clone(), move |mut caller, values| {
                 // SAFETY: Wasmtime in general provides the guarantee that
                 // `values` matches `ty`, so this should be safe.
-                let mut vec = unsafe { Self::load_untyped_params(caller.store.0, &ty, values) };
+                let mut vec = unsafe { Self::load_untyped_params(caller.store.0, &ty, values)? };
                 let (params, results) = vec.split_at_mut(ty.params().len());
                 func(caller.sub_caller(), params, results)?;
                 Self::store_untyped_results(caller.store, &ty, vec, values)
@@ -2515,7 +2530,7 @@ impl HostFunc {
                         // SAFETY: Wasmtime in general provides the guarantee that
                         // `values` matches `ty`, so this should be safe.
                         let mut vec =
-                            unsafe { Self::load_untyped_params(caller.store.0, &ty, values) };
+                            unsafe { Self::load_untyped_params(caller.store.0, &ty, values)? };
                         let (params, results) = vec.split_at_mut(ty.params().len());
                         core::pin::Pin::from(func(caller.sub_caller(), params, results)).await?;
                         Self::store_untyped_results(caller.store, &ty, vec, values)
@@ -2538,18 +2553,22 @@ impl HostFunc {
         store: &mut StoreOpaque,
         ty: &FuncType,
         params: &mut [MaybeUninit<ValRaw>],
-    ) -> Vec<Val> {
-        let mut val_vec = store.take_hostcall_val_storage();
+    ) -> Result<Vec<Val>> {
+        let val_vec = store.take_hostcall_val_storage();
         debug_assert!(val_vec.is_empty());
+
+        let mut val_vec = TryVec::from(val_vec);
         let nparams = ty.params().len();
-        val_vec.reserve(nparams + ty.results().len());
+        let total = nparams + ty.results().len();
+        val_vec.reserve(total)?;
+
         let mut store = AutoAssertNoGc::new(store);
         for (i, ty) in ty.params().enumerate() {
-            val_vec.push(unsafe { Val::_from_raw(&mut store, params[i].assume_init(), &ty) })
+            val_vec.push(unsafe { Val::_from_raw(&mut store, params[i].assume_init(), &ty) })?;
         }
 
-        val_vec.extend((0..ty.results().len()).map(|_| Val::null_func_ref()));
-        val_vec
+        val_vec.try_extend((0..ty.results().len()).map(|_| Val::null_func_ref()))?;
+        Ok(val_vec.into())
     }
 
     /// Stores the results, at the end of `args_then_results` according to `ty`,
@@ -2752,10 +2771,6 @@ impl HostFunc {
     unsafe fn into_func(self, store: &mut StoreOpaque) -> Result<Func, OutOfMemory> {
         self.validate_store(store);
 
-        // This function could be called by a guest at any time, and it requires
-        // fibers, so the store now required async entrypoints.
-        store.set_async_required(self.asyncness);
-
         let (funcrefs, modules) = store.func_refs_and_modules();
         let funcref = funcrefs.push_box_host(try_new::<Box<_>>(self)?, modules)?;
         // SAFETY: this funcref was just pushed within `store`, so it's safe to
@@ -2772,6 +2787,14 @@ impl HostFunc {
             Engine::same(&self.engine, store.engine()),
             "cannot use a store with a different engine than a linker was created with",
         );
+
+        // This function could be called by a guest at any time, and it requires
+        // fibers, so the store now required async entrypoints.
+        store.set_async_required(self.asyncness);
+    }
+
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     pub(crate) fn sig_index(&self) -> VMSharedTypeIndex {

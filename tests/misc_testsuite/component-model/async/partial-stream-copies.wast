@@ -1,7 +1,6 @@
 ;;! component_model_async = true
 ;;! reference_types = true
 ;;! multi_memory = true
-;;! gc_types = true
 
 ;; This test has two components $C and $D, where $D imports and calls $C.transform
 ;;  $C.transform takes and returns a stream<u8>
@@ -110,12 +109,12 @@
       )
     )
     (type $ST (stream u8))
-    (canon task.return (result $ST) (memory $memory "mem") (core func $task.return))
+    (canon task.return (result $ST) (memory (core memory $memory "mem")) (core func $task.return))
     (canon waitable.join (core func $waitable.join))
     (canon waitable-set.new (core func $waitable-set.new))
     (canon stream.new $ST (core func $stream.new))
-    (canon stream.read $ST async (memory $memory "mem") (core func $stream.read))
-    (canon stream.write $ST async (memory $memory "mem") (core func $stream.write))
+    (canon stream.read $ST async (memory (core memory $memory "mem")) (core func $stream.read))
+    (canon stream.write $ST async (memory (core memory $memory "mem")) (core func $stream.write))
     (canon stream.drop-readable $ST (core func $stream.drop-readable))
     (canon stream.drop-writable $ST (core func $stream.drop-writable))
     (core instance $cm (instantiate $CM (with "" (instance
@@ -129,14 +128,14 @@
       (export "stream.drop-readable" (func $stream.drop-readable))
       (export "stream.drop-writable" (func $stream.drop-writable))
     ))))
-    (func (export "transform") (param "in" (stream u8)) (result (stream u8)) (canon lift
+    (func (export "transform") async (param "in" (stream u8)) (result (stream u8)) (canon lift
       (core func $cm "transform")
-      async (memory $memory "mem") (callback (func $cm "transform_cb"))
+      async (memory (core memory $memory "mem")) (callback (core func $cm "transform_cb"))
     ))
   )
 
   (component $D
-    (import "transform" (func $transform (param "in" (stream u8)) (result (stream u8))))
+    (import "transform" (func $transform async (param "in" (stream u8)) (result (stream u8))))
 
     (core module $Memory (memory (export "mem") 1))
     (core instance $memory (instantiate $Memory))
@@ -215,13 +214,13 @@
     (type $ST (stream u8))
     (canon waitable.join (core func $waitable.join))
     (canon waitable-set.new (core func $waitable-set.new))
-    (canon waitable-set.wait (memory $memory "mem") (core func $waitable-set.wait))
+    (canon waitable-set.wait (memory (core memory $memory "mem")) (core func $waitable-set.wait))
     (canon stream.new $ST (core func $stream.new))
-    (canon stream.read $ST async (memory $memory "mem") (core func $stream.read))
-    (canon stream.write $ST async (memory $memory "mem") (core func $stream.write))
+    (canon stream.read $ST async (memory (core memory $memory "mem")) (core func $stream.read))
+    (canon stream.write $ST async (memory (core memory $memory "mem")) (core func $stream.write))
     (canon stream.drop-readable $ST (core func $stream.drop-readable))
     (canon stream.drop-writable $ST (core func $stream.drop-writable))
-    (canon lower (func $transform) async (memory $memory "mem") (core func $transform'))
+    (canon lower (func $transform) async (memory (core memory $memory "mem")) (core func $transform'))
     (core instance $dm (instantiate $DM (with "" (instance
       (export "mem" (memory $memory "mem"))
       (export "waitable.join" (func $waitable.join))

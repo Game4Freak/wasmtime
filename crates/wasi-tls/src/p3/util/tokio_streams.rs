@@ -1,5 +1,4 @@
 use bytes::BytesMut;
-use std::io::Cursor;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -37,7 +36,7 @@ where
     IO: AsyncRead + Send + Unpin + 'static,
 {
     type Item = u8;
-    type Buffer = Cursor<BytesMut>;
+    type Buffer = BytesMut;
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
@@ -51,7 +50,7 @@ where
         };
 
         let mut dst = dst.as_direct(store, pipe::CAPACITY);
-        let remaining = dst.remaining();
+        let remaining = dst.remaining()?;
 
         // A zero-remaining destination means the guest is waiting for
         // readiness rather than requesting data. AsyncRead has no
@@ -126,7 +125,7 @@ where
         };
 
         let mut src = src.as_direct(store);
-        let remaining = src.remaining();
+        let remaining = src.remaining()?;
 
         if remaining.is_empty() {
             // Zero-length consume = readiness check. AsyncWrite has no

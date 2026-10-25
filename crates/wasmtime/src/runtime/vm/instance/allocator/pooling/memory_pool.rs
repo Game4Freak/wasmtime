@@ -54,11 +54,14 @@ use super::{
     MemoryAllocationIndex,
     index_allocator::{MemoryInModule, ModuleAffinityIndexAllocator, SlotId},
 };
+use crate::config::InstanceLimits;
+use crate::config::PoolingAllocationConfig;
 use crate::prelude::*;
 use crate::runtime::vm::{
-    CompiledModuleId, InstanceAllocationRequest, InstanceLimits, Memory, MemoryBase,
-    MemoryImageSlot, Mmap, MmapOffset, PoolingInstanceAllocatorConfig, mmap::AlignedLength,
+    CompiledModuleId, InstanceAllocationRequest, Memory, MemoryImageSlot, Mmap, MmapOffset,
+    mmap::AlignedLength,
 };
+use crate::vm::sys::vm::{decommit_pages, iovec};
 use crate::{
     Enabled,
     runtime::vm::mpk::{self, ProtectionKey, ProtectionMask},
@@ -173,7 +176,7 @@ enum ImageSlot {
 
 impl MemoryPool {
     /// Create a new `MemoryPool`.
-    pub fn new(config: &PoolingInstanceAllocatorConfig, tunables: &Tunables) -> Result<Self> {
+    pub fn new(config: &PoolingAllocationConfig, tunables: &Tunables) -> Result<Self> {
         if u64::try_from(config.limits.max_memory_size).unwrap() > tunables.memory_reservation {
             bail!(
                 "maximum memory size of {:#x} bytes exceeds the configured \
@@ -261,15 +264,17 @@ impl MemoryPool {
             let allocator = ModuleAffinityIndexAllocator::new(
                 num_slots.try_into().unwrap(),
                 config.max_unused_warm_slots,
-            );
-            Stripe {
+            )?;
+            Ok(Stripe {
                 allocator,
                 pkey: pkeys.get(i).cloned(),
-            }
+            })
         };
 
         debug_assert!(layout.num_stripes > 0);
-        let stripes: Vec<_> = (0..layout.num_stripes).map(create_stripe).collect();
+        let stripes: Vec<_> = (0..layout.num_stripes)
+            .map(create_stripe)
+            .collect::<Result<_, OutOfMemory>>()?;
 
         let pool = Self {
             stripes,
@@ -427,7 +432,7 @@ impl MemoryPool {
         let memory = Memory::new_static(
             ty,
             &memory_tunables,
-            MemoryBase::Mmap(base),
+            base,
             base_capacity.byte_count(),
             slot,
             request.limiter.as_deref_mut(),
@@ -476,13 +481,50 @@ impl MemoryPool {
         image: Option<MemoryImageSlot>,
         bytes_resident: usize,
     ) {
-        self.return_memory_image_slot(allocation_index, image);
-
-        let (stripe_index, striped_allocation_index) =
-            StripedAllocationIndex::from_unstriped_slot_index(allocation_index, self.stripes.len());
+        let (stripe_index, slot_id) = self.return_slot(allocation_index, image);
         self.stripes[stripe_index]
             .allocator
-            .free(SlotId(striped_allocation_index.0), bytes_resident);
+            .free(slot_id, bytes_resident);
+    }
+
+    /// Same as [`Self::deallocate`], but for many memories at once, returning
+    /// slot indices to each stripe's index allocator under a single lock
+    /// acquisition per stripe.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::deallocate`].
+    pub unsafe fn deallocate_many(
+        &self,
+        items: impl Iterator<Item = (MemoryAllocationIndex, Option<MemoryImageSlot>, usize)>,
+    ) {
+        let mut per_stripe: smallvec::SmallVec<[smallvec::SmallVec<[(SlotId, usize); 8]>; 16]> = (0
+            ..self.stripes.len())
+            .map(|_| Default::default())
+            .collect();
+        for (allocation_index, image, bytes_resident) in items {
+            let (stripe_index, slot_id) = self.return_slot(allocation_index, image);
+            per_stripe[stripe_index].push((slot_id, bytes_resident));
+        }
+        for (stripe, items) in self.stripes.iter().zip(per_stripe) {
+            if !items.is_empty() {
+                stripe.allocator.free_many(items);
+            }
+        }
+    }
+
+    /// Return `allocation_index`'s image slot to the pool and translate the
+    /// index to its stripe and stripe-local slot id, on behalf of
+    /// [`Self::deallocate`] and [`Self::deallocate_many`].
+    fn return_slot(
+        &self,
+        allocation_index: MemoryAllocationIndex,
+        image: Option<MemoryImageSlot>,
+    ) -> (usize, SlotId) {
+        self.return_memory_image_slot(allocation_index, image);
+        let (stripe_index, striped_allocation_index) =
+            StripedAllocationIndex::from_unstriped_slot_index(allocation_index, self.stripes.len());
+        (stripe_index, SlotId(striped_allocation_index.0))
     }
 
     /// Purging everything related to `module`.
@@ -537,6 +579,59 @@ impl MemoryPool {
         }
     }
 
+    /// Releases the memory this pool is keeping resident for unused-but-warm
+    /// slots.
+    ///
+    /// Useful when the embedder knows that load has decreased and wishes to
+    /// reduce resident memory usage at the cost of some instantiation time at
+    /// the next instantiation.
+    ///
+    /// Returns the number of bytes freed.
+    ///
+    /// Slots are taken out of the free lists before their memory is released
+    /// and returned afterwards, so nothing can allocate a slot while it is
+    /// being decommitted, the same order `DecommitQueue::flush` uses.
+    pub fn release_resident_unused_memory(&self) -> usize {
+        let mut released = 0;
+        for (stripe_index, stripe) in self.stripes.iter().enumerate() {
+            let taken = stripe.allocator.take_resident_warm_slots();
+            if taken.is_empty() {
+                continue;
+            }
+
+            let mut iov = Vec::with_capacity(taken.len());
+            for (id, bytes_resident) in &taken {
+                if *bytes_resident == 0 {
+                    continue;
+                }
+                let index = StripedAllocationIndex(id.0)
+                    .as_unstriped_slot_index(stripe_index, self.stripes.len());
+                iov.push(iovec {
+                    iov_base: self.get_base(index).as_mut_ptr().cast(),
+                    iov_len: self.layout.max_memory_bytes.byte_count(),
+                });
+            }
+
+            // SAFETY: every region here belongs to a slot this loop has taken
+            // out of the free list, so it is not in use and cannot be handed
+            // out until it is freed below.
+            let decommitted = unsafe { decommit_pages(&iov) }.is_ok();
+
+            // A failed decommit leaves the pages resident with the contents
+            // they had, which is a correct state: the slots go back reporting
+            // the same bytes as before and nothing but the reclaim is lost.
+            for (id, bytes_resident) in taken {
+                if decommitted {
+                    released += bytes_resident;
+                    stripe.allocator.free(id, 0);
+                } else {
+                    stripe.allocator.free(id, bytes_resident);
+                }
+            }
+        }
+        released
+    }
+
     fn get_base(&self, allocation_index: MemoryAllocationIndex) -> MmapOffset {
         assert!(allocation_index.index() < self.layout.num_slots);
         let offset = self
@@ -546,6 +641,19 @@ impl MemoryPool {
             .and_then(|c| c.checked_add(self.layout.pre_slab_guard_bytes))
             .expect("slot_bytes * index + pre_slab_guard_bytes overflows");
         self.mapping.offset(offset).expect("offset is in bounds")
+    }
+
+    /// Return the protection key that this slot's memory was striped with when
+    /// the pool was created, if any.
+    ///
+    /// This mirrors the striping performed in `new`: memory is only colored
+    /// when there are at least two stripes, and slot `i` is colored with the
+    /// `i % num_stripes`th key.
+    fn pkey_for_slot(&self, allocation_index: MemoryAllocationIndex) -> Option<ProtectionKey> {
+        if self.stripes.len() < 2 {
+            return None;
+        }
+        self.stripes[allocation_index.index() % self.stripes.len()].pkey
     }
 
     /// Take ownership of the given image slot.
@@ -579,6 +687,7 @@ impl MemoryPool {
                 self.get_base(allocation_index),
                 HostAlignedByteCount::ZERO,
                 self.layout.max_memory_bytes.byte_count(),
+                self.pkey_for_slot(allocation_index),
             )
         });
 
@@ -894,7 +1003,7 @@ mod tests {
     #[test]
     fn test_memory_pool() -> Result<()> {
         let pool = MemoryPool::new(
-            &PoolingInstanceAllocatorConfig {
+            &PoolingAllocationConfig {
                 limits: InstanceLimits {
                     total_memories: 5,
                     max_tables_per_module: 0,
@@ -939,9 +1048,9 @@ mod tests {
         }
 
         // Force the use of MPK.
-        let config = PoolingInstanceAllocatorConfig {
+        let config = PoolingAllocationConfig {
             memory_protection_keys: Enabled::Yes,
-            ..PoolingInstanceAllocatorConfig::default()
+            ..PoolingAllocationConfig::default()
         };
         let pool = MemoryPool::new(&config, &Tunables::default_host()).unwrap();
         assert!(pool.stripes.len() >= 2);

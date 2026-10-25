@@ -1,7 +1,7 @@
 use wasmtime::Result;
-use wasmtime::component::types::ComponentItem;
+use wasmtime::component::types::{ComponentExtern, ComponentInstance, ComponentItem};
 use wasmtime::component::{Component, Linker, Type};
-use wasmtime::{Engine, Module, Precompiled, Store};
+use wasmtime::{Config, Engine, Module, Precompiled, Store};
 
 #[test]
 fn module_component_mismatch() -> Result<()> {
@@ -152,11 +152,11 @@ fn reflect_resource_import() -> Result<()> {
     let mut imports = ty.imports(&engine);
     let (_, x) = imports.next().unwrap();
     let (_, y) = imports.next().unwrap();
-    let x = match x {
+    let x = match x.ty {
         ComponentItem::Resource(t) => t,
         _ => unreachable!(),
     };
-    let y = match y {
+    let y = match y.ty {
         ComponentItem::ComponentFunc(t) => t,
         _ => unreachable!(),
     };
@@ -206,5 +206,208 @@ fn truncated_component_binaries_dont_panic() -> Result<()> {
         let _ = Component::from_binary(&engine, &binary[0..i]);
     }
 
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn implements_shows_up() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_implements(true);
+    let engine = Engine::new(&config)?;
+    let component = Component::new(
+        &engine,
+        r#"
+            (component
+                (import "a" (implements "a1:b1/c1") (instance $a))
+                (export "b" (implements "a2:b2/c2") (instance $a))
+
+                (import "v" (implements "a:b/c@1.2.0") (instance))
+            )
+        "#,
+    )?;
+
+    let ty = component.component_type();
+    let mut imports = ty.imports(&engine);
+    let (_, a) = imports.next().unwrap();
+    assert_eq!(a.implements.as_deref(), Some("a1:b1/c1"));
+    assert!(a.is_implements("a1:b1/c1"));
+    assert!(!a.is_implements("a:b/c"));
+    assert!(!a.is_implements("a1:b1/c1@1.0.0"));
+    let mut exports = ty.exports(&engine);
+    let (_, b) = exports.next().unwrap();
+    assert_eq!(b.implements.as_deref(), Some("a2:b2/c2"));
+
+    let (_, a) = imports.next().unwrap();
+    assert_eq!(a.implements.as_deref(), Some("a:b/c@1.2.0"));
+    assert!(!a.is_implements("a:b/c"));
+    assert!(a.is_implements("a:b/c@1.2.0"));
+    assert!(a.is_implements("a:b/c@1.3.0"));
+    assert!(a.is_implements("a:b/c@1.0.0"));
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn implements_with_canonical_names() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_implements(true);
+    config.wasm_component_model_canonical_names(true);
+    let engine = Engine::new(&config)?;
+    let component = Component::new(
+        &engine,
+        r#"(component
+            (import "p" (implements "a:b/c@1") (version-suffix ".2.3") (instance))
+        )"#,
+    )?;
+
+    let ty = component.component_type();
+    let (_, p) = ty.imports(&engine).next().unwrap();
+    assert_eq!(p.implements.as_deref(), Some("a:b/c@1"));
+    assert!(p.is_implements("a:b/c@1.2.3"));
+    assert!(p.is_implements("a:b/c@1.0.0"));
+    assert!(!p.is_implements("a:b/c@2.0.0"));
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn external_id_shows_up() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_implements(true);
+    let engine = Engine::new(&config)?;
+    let component = Component::new(
+        &engine,
+        r#"
+            (component
+                (import "a" (implements "a1:b1/c1") (external-id "user-db-prod:region-a") (instance $a))
+                (import "b" (external-id "user-db-prod:region-b") (instance $b
+                    (export "f" (external-id "func-b-f") (func))
+                ))
+                (import "c" (instance $c))
+                (export "d" (external-id "queue-1") (instance $a))
+            )
+        "#,
+    )?;
+
+    let assert_reflection = |component: &Component| {
+        let ty = component.component_type();
+        let mut imports = ty.imports(&engine);
+        let (_, a) = imports.next().unwrap();
+        assert_eq!(a.implements.as_deref(), Some("a1:b1/c1"));
+        assert_eq!(a.external_id.as_deref(), Some("user-db-prod:region-a"));
+        let (_, b) = imports.next().unwrap();
+        assert_eq!(b.implements.as_deref(), None);
+        assert_eq!(b.external_id.as_deref(), Some("user-db-prod:region-b"));
+        let ComponentItem::ComponentInstance(instance) = &b.ty else {
+            panic!("expected an instance import");
+        };
+        let (name, f) = instance.exports(&engine).next().unwrap();
+        assert_eq!(name, "f");
+        assert_eq!(f.external_id.as_deref(), Some("func-b-f"));
+        let (_, c) = imports.next().unwrap();
+        assert_eq!(c.external_id.as_deref(), None);
+        let mut exports = ty.exports(&engine);
+        let (_, d) = exports.next().unwrap();
+        assert_eq!(d.external_id.as_deref(), Some("queue-1"));
+    };
+
+    assert_reflection(&component);
+    let bytes = component.serialize()?;
+    let component = unsafe { Component::deserialize(&engine, &bytes)? };
+    assert_reflection(&component);
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn attributes_from_export_ascription() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_implements(true);
+    let engine = Engine::new(&config)?;
+    let component = Component::new(
+        &engine,
+        r#"
+            (component
+                (instance $n)
+                (instance $b (export "n" (implements "x:y/z") (instance $n)))
+                (export "out" (instance $b) (instance
+                    (export "n" (implements "a:b/c") (external-id "asc") (instance))
+                ))
+
+                (component $c
+                    (instance $n)
+                    (instance $b (export "n" (implements "x:y/z") (instance $n)))
+                    (export "x" (instance $b) (instance
+                        (export "n" (implements "a:b/c") (external-id "asc") (instance))
+                    ))
+                )
+                (instance $c (instantiate $c))
+                (export "whole" (instance $c))
+                (export "alias" (instance $c "x"))
+            )
+        "#,
+    )?;
+
+    fn instance(item: ComponentExtern<'_>) -> ComponentInstance {
+        match item.ty {
+            ComponentItem::ComponentInstance(i) => i,
+            _ => panic!("expected an instance"),
+        }
+    }
+
+    let assert_reflection = |component: &Component| {
+        let ty = component.component_type();
+        let out = instance(ty.get_export(&engine, "out").unwrap());
+        let whole = instance(ty.get_export(&engine, "whole").unwrap());
+        let whole = instance(whole.get_export(&engine, "x").unwrap());
+        let alias = instance(ty.get_export(&engine, "alias").unwrap());
+        for i in [out, whole, alias] {
+            let n = i.get_export(&engine, "n").unwrap();
+            assert_eq!(n.implements, Some("a:b/c"));
+            assert_eq!(n.external_id, Some("asc"));
+        }
+    };
+
+    assert_reflection(&component);
+    let bytes = component.serialize()?;
+    let component = unsafe { Component::deserialize(&engine, &bytes)? };
+    assert_reflection(&component);
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn issue_13540_resources_in_adapter_no_concurrency() -> Result<()> {
+    let mut config = Config::new();
+    config.concurrency_support(false);
+    let engine = Engine::new(&config)?;
+    engine.precompile_component(
+        br#"
+(component
+  (component $A
+    (type $t' (resource (rep i32)))
+    (export $t "t" (type $t'))
+
+    (core module $m (func (export "r") (param i32)))
+    (core instance $i (instantiate $m))
+    (func (export "r") (param "a" (borrow $t)) (canon lift (core func $i "r")))
+  )
+  (component $B
+    (import "a" (instance $a
+      (export "t" (type $t (sub resource)))
+      (export "r" (func (param "a" (borrow $t))))
+    ))
+
+    (core func $r (canon lower (func $a "r")))
+  )
+  (instance $a (instantiate $A))
+  (instance $b (instantiate $B (with "a" (instance $a))))
+)
+    "#,
+    )?;
     Ok(())
 }

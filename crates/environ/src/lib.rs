@@ -11,7 +11,7 @@
 #![warn(clippy::cast_sign_loss)]
 #![no_std]
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", test))]
 #[macro_use]
 extern crate std;
 extern crate alloc;
@@ -24,6 +24,7 @@ mod address_map;
 mod frame_table;
 #[macro_use]
 mod builtin;
+pub mod bytes;
 mod demangling;
 mod ext;
 mod gc;
@@ -41,6 +42,12 @@ mod string_pool;
 mod trap_encoding;
 mod tunables;
 mod types;
+#[cfg(all(feature = "component-model", feature = "compile"))]
+mod union_find;
+#[macro_use]
+mod vmctxtypes;
+#[macro_use]
+mod vmtypes;
 mod vmoffsets;
 mod wasm_error;
 
@@ -63,6 +70,7 @@ pub use crate::string_pool::{Atom, StringPool};
 pub use crate::trap_encoding::*;
 pub use crate::tunables::*;
 pub use crate::types::*;
+pub use crate::vmctxtypes::{ArrayOffsets, VmctxArrayIndex};
 pub use crate::vmoffsets::*;
 pub use crate::wasm_error::*;
 pub use object;
@@ -98,3 +106,14 @@ pub use anyhow;
 
 /// Version number of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A `mutatis` check pre-configured with a MIRI-aware number of iterations to
+/// run.
+#[cfg(all(test, feature = "component-model", feature = "compile"))]
+fn property_check() -> mutatis::check::Check {
+    let mut check = mutatis::check::Check::new();
+    if cfg!(miri) {
+        check.iters(2).shrink_iters(0);
+    }
+    check
+}

@@ -9,6 +9,8 @@ use wasmtime_environ::DefinedTagIndex;
 
 #[cfg(feature = "gc")]
 use crate::store::InstanceId;
+#[cfg(feature = "gc")]
+use wasmtime_environ::EntityRef;
 
 /// A WebAssembly `tag`.
 #[derive(Copy, Clone, Debug)]
@@ -26,6 +28,9 @@ impl Tag {
     /// Create a new tag instance from a given TagType.
     ///
     /// # Errors
+    ///
+    /// Returns an error if `ty` was not created with the same
+    /// [`Engine`](crate::Engine) as `store`.
     ///
     /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
     /// memory allocation fails. See the `OutOfMemory` type's documentation for
@@ -93,27 +98,36 @@ impl Tag {
 
     /// Get the "index coordinates" for this `Tag`: the raw instance
     /// ID and defined-tag index within that instance. This can be
-    /// used to "serialize" the tag as safe (tamper-proof,
-    /// bounds-checked) values, e.g. within the GC store for an
-    /// exception object.
+    /// used to "serialize" the tag as a pair of plain integers, e.g.
+    /// within the GC store for an exception object. Nothing keeps those
+    /// integers from being tampered with, so `from_raw_indices`
+    /// re-validates them.
     #[cfg(feature = "gc")]
     pub(crate) fn to_raw_indices(&self) -> (InstanceId, DefinedTagIndex) {
         (self.instance.instance(), self.index)
     }
 
-    /// Create a new `Tag` from known raw indices as produced by
-    /// `to_raw_indices()`.
+    /// Create a new `Tag` from raw indices as produced by `to_raw_indices()`,
+    /// if those indices are in bounds for the given store.
     ///
-    /// # Panics
-    ///
-    /// Panics if the indices are out-of-bounds in the given store.
+    /// Returns `None` if either index is out-of-bounds, which can happen when
+    /// they were round-tripped through somewhere untrusted, such as the GC
+    /// heap.
     #[cfg(feature = "gc")]
     pub(crate) fn from_raw_indices(
         store: &StoreOpaque,
         instance: InstanceId,
         index: DefinedTagIndex,
-    ) -> Tag {
+    ) -> Option<Tag> {
+        let num_defined_tags = store
+            .try_instance(instance)?
+            .env_module()
+            .num_defined_tags();
+        if index.index() >= num_defined_tags {
+            return None;
+        }
+
         let instance = StoreInstanceId::new(store.id(), instance);
-        Tag { instance, index }
+        Some(Tag { instance, index })
     }
 }

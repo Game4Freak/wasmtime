@@ -305,6 +305,14 @@ WASMTIME_CONFIG_PROP(void, wasm_memory64, bool)
  */
 WASMTIME_CONFIG_PROP(void, wasm_wide_arithmetic, bool)
 
+/**
+ * \brief Configures whether the WebAssembly branch-hinting proposal is
+ * enabled.
+ *
+ * This setting is `false` by default.
+ */
+WASMTIME_CONFIG_PROP(void, wasm_branch_hinting, bool)
+
 #ifdef WASMTIME_FEATURE_GC
 
 /**
@@ -323,6 +331,14 @@ WASMTIME_CONFIG_PROP(void, wasm_exceptions, bool)
  * This setting is `false` by default.
  */
 WASMTIME_CONFIG_PROP(void, wasm_custom_page_sizes, bool)
+
+/**
+ * \brief Configures whether the WebAssembly compact imports proposal is
+ * enabled.
+ *
+ * This setting is `false` by default.
+ */
+WASMTIME_CONFIG_PROP(void, wasm_compact_imports, bool)
 
 #ifdef WASMTIME_FEATURE_COMPILER
 
@@ -898,6 +914,34 @@ WASMTIME_CONFIG_PROP(void, concurrency_support, bool)
  * https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.wasm_component_model_map.
  */
 WASMTIME_CONFIG_PROP(void, wasm_component_model_map, bool)
+
+/**
+ * \brief Configures whether the WebAssembly component-model `(implements
+ * "...")` and `(external-id "...")` annotations will be enabled for
+ * compilation.
+ *
+ * For more information see the Rust documentation at
+ * https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.wasm_component_model_implements.
+ */
+WASMTIME_CONFIG_PROP(void, wasm_component_model_implements, bool)
+
+/**
+ * \brief Configures whether the WebAssembly component-model canonical names
+ * support will be enabled for compilation.
+ *
+ * For more information see the Rust documentation at
+ * https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.wasm_component_model_canonical_names.
+ */
+WASMTIME_CONFIG_PROP(void, wasm_component_model_canonical_names, bool)
+
+/**
+ * \brief Configures whether the WebAssembly component-model accessors
+ * (`[get]` and `[set]`) support will be enabled for compilation.
+ *
+ * For more information see the Rust documentation at
+ * https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.wasm_component_model_accessors.
+ */
+WASMTIME_CONFIG_PROP(void, wasm_component_model_accessors, bool)
 
 #endif // WASMTIME_FEATURE_COMPONENT_MODEL
 

@@ -56,6 +56,10 @@ const DEFAULT_KEEP_INIT_FUNC: bool = false;
 pub struct Wizer {
     /// The Wasm export name of the function that should be executed to
     /// initialize the Wasm module.
+    ///
+    /// When used with components, this can be either the item name of a
+    /// function (e.g. `wasi:cli/run.run`) or a complete wave-encoded function
+    /// call (e.g. `your:package/iface.func("hello world")`)
     #[cfg_attr(
         feature = "clap",
         arg(short = 'f', long, default_value = "wizer-initialize")
@@ -228,14 +232,14 @@ impl Wizer {
     /// pre-initialized.
     pub async fn snapshot(
         &self,
-        mut cx: ModuleContext<'_>,
+        cx: &ModuleContext<'_>,
         instance: &mut impl InstanceState,
     ) -> Result<Vec<u8>> {
         // Parse rename spec.
         let renames = FuncRenames::parse(&self.func_renames)?;
 
-        let snapshot = snapshot::snapshot(&cx, instance).await;
-        let rewritten_wasm = self.rewrite(&mut cx, &snapshot, &renames, true);
+        let snapshot = snapshot::snapshot(cx, instance).await;
+        let rewritten_wasm = self.rewrite(cx, &snapshot, &renames, true);
 
         self.debug_assert_valid_wasm(&rewritten_wasm, "rewritten module");
 

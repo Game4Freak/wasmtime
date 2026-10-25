@@ -16,14 +16,14 @@ pub mod non_concurrent_export_bindings {
         path: "wit",
         world: "round-trip-many",
         additional_derives: [ Eq, PartialEq ],
-        exports: { default: ignore_wit | async },
+        exports: { default: async },
     });
 }
 
 use bindings::local::local::many::Stuff;
 
-impl bindings::local::local::many::HostWithStore for Ctx {
-    async fn foo<T>(
+impl<T> bindings::local::local::many::HostWithStore<T> for Ctx {
+    async fn foo(
         _: &Accessor<T, Self>,
         a: String,
         b: u32,

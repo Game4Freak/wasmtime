@@ -1,15 +1,19 @@
-//! Contains the common Wasmtime command line interface (CLI) flags.
+//! A utility crate for managing Wasmtime configuration options in a
+//! serializable format.
+//!
+//! This crate primarily provides a [`CommonOptions`] structure which can be
+//! parsed from CLI flags via [`clap`] or with [`serde::Deserialize`]. This
+//! structure can additionally be created from a [`wasmtime::Engine`] to
+//! serialize some of the significant configuration options affecting an engine.
+//!
+//! This is intended to be a shared way for embedders to configure Wasmtime with
+//! serializable configuration. The source of truth for Wasmtime's configuration
+//! is the [`Config`] type but this additionally serves as a means of creating
+//! that type.
 
-use clap::Parser;
-use serde::Deserialize;
 use std::num::NonZeroUsize;
-use std::{
-    fmt, fs,
-    num::NonZeroU32,
-    path::{Path, PathBuf},
-    time::Duration,
-};
-use wasmtime::{Config, Result, WasmBacktraceDetails, bail, error::Context as _};
+use std::{fmt, num::NonZeroU32, path::PathBuf, time::Duration};
+use wasmtime::{Config, Engine, Result, WasmBacktraceDetails, WasmFeatures, bail};
 
 pub mod opt;
 
@@ -43,17 +47,18 @@ fn init_file_per_thread_logger(prefix: &'static str) {
 }
 
 wasmtime_option_group! {
-    #[derive(PartialEq, Clone, Deserialize)]
-    #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+    #[env = "OPTIMIZE"]
     pub struct OptimizeOptions {
         /// Optimization level of generated code (0-2, s; default: 2)
         #[serde(default)]
-        #[serde(deserialize_with = "crate::opt::cli_parse_wrapper")]
+        #[serde(deserialize_with = "crate::opt::deserialize_cli_parse_wrapper")]
+        #[serde(serialize_with = "crate::opt::serialize_cli_parse_wrapper")]
         pub opt_level: Option<wasmtime::OptLevel>,
 
         /// Register allocator algorithm choice.
         #[serde(default)]
-        #[serde(deserialize_with = "crate::opt::cli_parse_wrapper")]
+        #[serde(deserialize_with = "crate::opt::deserialize_cli_parse_wrapper")]
+        #[serde(serialize_with = "crate::opt::serialize_cli_parse_wrapper")]
         pub regalloc_algorithm: Option<wasmtime::RegallocAlgorithm>,
 
         /// Do not allow Wasm linear memories to move in the host process's
@@ -81,6 +86,9 @@ wasmtime_option_group! {
 
         /// Size, in bytes, of guard pages for the GC heap.
         pub gc_heap_guard_size: Option<u64>,
+
+        /// Initial allocated size for the GC heap.
+        pub gc_heap_initial_size: Option<u64>,
 
         /// Indicates whether an unmapped region of memory is placed before all
         /// linear memories.
@@ -110,7 +118,8 @@ wasmtime_option_group! {
         /// Enable memory protection keys for the pooling allocator; this can
         /// optimize the size of memory slots.
         #[serde(default)]
-        #[serde(deserialize_with = "crate::opt::cli_parse_wrapper")]
+        #[serde(deserialize_with = "crate::opt::deserialize_cli_parse_wrapper")]
+        #[serde(serialize_with = "crate::opt::serialize_cli_parse_wrapper")]
         pub pooling_memory_protection_keys: Option<wasmtime::Enabled>,
 
         /// Sets an upper limit on how many memory protection keys (MPK) Wasmtime
@@ -211,7 +220,8 @@ wasmtime_option_group! {
         /// Whether or not `PAGEMAP_SCAN` ioctls are used to reset linear
         /// memory.
         #[serde(default)]
-        #[serde(deserialize_with = "crate::opt::cli_parse_wrapper")]
+        #[serde(deserialize_with = "crate::opt::deserialize_cli_parse_wrapper")]
+        #[serde(serialize_with = "crate::opt::serialize_cli_parse_wrapper")]
         pub pooling_pagemap_scan: Option<wasmtime::Enabled>,
 
         /// XXX: For internal fuzzing and debugging use only!
@@ -225,15 +235,15 @@ wasmtime_option_group! {
 }
 
 wasmtime_option_group! {
-    #[derive(PartialEq, Clone, Deserialize)]
-    #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+    #[env = "CODEGEN"]
     pub struct CodegenOptions {
         /// Either `cranelift` or `winch`.
         ///
         /// Currently only `cranelift` and `winch` are supported, but not all
         /// builds of Wasmtime have both built in.
         #[serde(default)]
-        #[serde(deserialize_with = "crate::opt::cli_parse_wrapper")]
+        #[serde(deserialize_with = "crate::opt::deserialize_cli_parse_wrapper")]
+        #[serde(serialize_with = "crate::opt::serialize_cli_parse_wrapper")]
         pub compiler: Option<wasmtime::Strategy>,
         /// Which garbage collector to use: `drc`, `null`, or `copying`.
         ///
@@ -247,7 +257,8 @@ wasmtime_option_group! {
         /// Note that not all builds of Wasmtime will have support for garbage
         /// collection included.
         #[serde(default)]
-        #[serde(deserialize_with = "crate::opt::cli_parse_wrapper")]
+        #[serde(deserialize_with = "crate::opt::deserialize_cli_parse_wrapper")]
+        #[serde(serialize_with = "crate::opt::serialize_cli_parse_wrapper")]
         pub collector: Option<wasmtime::Collector>,
         /// Enable Cranelift's internal debug verifier (expensive)
         pub cranelift_debug_verifier: Option<bool>,
@@ -262,7 +273,66 @@ wasmtime_option_group! {
         pub native_unwind_info: Option<bool>,
 
         /// Whether to perform function inlining during compilation.
-        pub inlining: Option<bool>,
+        #[serde(default)]
+        #[serde(deserialize_with = "crate::opt::deserialize_cli_parse_wrapper")]
+        #[serde(serialize_with = "crate::opt::serialize_cli_parse_wrapper")]
+        pub inlining: Option<wasmtime::Inlining>,
+
+        /// Whether or not trap metadata is present for wasm internal assertions
+        /// in compiled code.
+        pub metadata_for_internal_asserts: Option<bool>,
+        /// Whether or not trap metadata is present for detection of gc
+        /// corruption in compiled code.
+        pub metadata_for_gc_heap_corruption: Option<bool>,
+
+        /// Expose Wasmtime's unsafe intrinsics to the Wasm being compiled under
+        /// the given instance import name, which defaults to
+        /// `unsafe-intrinsics` when the name is omitted.
+        ///
+        /// The unsafe intrinsics are a set of raw, unchecked load and store
+        /// operations on the host's address space, along with the address of
+        /// the store's data. They may only be used with components, not core
+        /// Wasm modules.
+        ///
+        /// This is wildly unsafe: the Wasm is given the ability to read and
+        /// write arbitrary host memory. Only use this with Wasm that you trust
+        /// as much as you trust the CLI itself.
+        ///
+        /// When `-C compile-time-builtin` is also given, the intrinsics are
+        /// exposed only to the compile-time builtins and not to the main Wasm
+        /// program.
+        ///
+        /// See the API documentation for
+        /// `CodeBuilder::expose_unsafe_intrinsics` for more details.
+        #[serde(default)]
+        #[serde(deserialize_with = "crate::opt::deserialize_cli_parse_wrapper")]
+        #[serde(serialize_with = "crate::opt::serialize_cli_parse_wrapper")]
+        pub unsafe_intrinsics: Option<UnsafeIntrinsicsImport>,
+
+        /// Define a compile-time builtin: satisfy the `<name>` instance import
+        /// of the main component with the component at `<path>` at compile
+        /// time, rather than with a host-defined import at instantiation time.
+        ///
+        /// May be specified multiple times, once per builtin. Compile-time
+        /// builtins may only be used with components, not core Wasm modules,
+        /// and require `-C unsafe-intrinsics`.
+        ///
+        /// The `<name>=` prefix may be omitted, in which case `<name>` defaults
+        /// to the file name of `<path>` without its extension. For example
+        /// `-C compile-time-builtin=path/to/my-host-api.wat` satisfies the
+        /// `my-host-api` import. Note that a `<path>` which itself contains an
+        /// `=` is interpreted as the `<name>=<path>` form; pass the explicit
+        /// form to disambiguate.
+        ///
+        /// Compile-time builtins are part of your trusted compute base: they
+        /// are given access to the unsafe intrinsics described above. Calls
+        /// into them become direct calls, so pass `-C inlining=y` to let them
+        /// be inlined into their callers.
+        ///
+        /// See the API documentation for
+        /// `CodeBuilder::compile_time_builtin_binary` for more details.
+        #[serde(skip)]
+        pub compile_time_builtin: Vec<CompileTimeBuiltin>,
 
         #[prefixed = "cranelift"]
         #[serde(default)]
@@ -277,8 +347,7 @@ wasmtime_option_group! {
 }
 
 wasmtime_option_group! {
-    #[derive(PartialEq, Clone, Deserialize)]
-    #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+    #[env = "DEBUG"]
     pub struct DebugOptions {
         /// Enable generation of DWARF debug information in compiled code.
         pub debug_info: Option<bool>,
@@ -310,6 +379,8 @@ wasmtime_option_group! {
         pub inherit_stderr: Option<bool>,
         /// Maximum number of frames to capture in backtraces.
         pub max_backtrace: Option<usize>,
+        /// Whether or not `*.cwasm` files have symbols in them.
+        pub symbols: Option<bool>,
     }
 
     enum Debug {
@@ -318,8 +389,7 @@ wasmtime_option_group! {
 }
 
 wasmtime_option_group! {
-    #[derive(PartialEq, Clone, Deserialize)]
-    #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+    #[env = "WASM"]
     pub struct WasmOptions {
         /// Enable canonicalization of all NaN values.
         pub nan_canonicalization: Option<bool>,
@@ -430,8 +500,12 @@ wasmtime_option_group! {
         /// GC support in the component model: this corresponds to the 🛸 emoji
         /// in the component model specification.
         pub component_model_gc: Option<bool>,
-        /// Map support in the component model.
+        /// Map support in the component model: this corresponds to the 🗺️
+        /// emoji in the component model specification.
         pub component_model_map: Option<bool>,
+        /// Component model support for `memory64`: this corresponds
+        /// to the 🐘 emoji in the component model specification.
+        pub component_model_memory64: Option<bool>,
         /// Configure support for the function-references proposal.
         pub function_references: Option<bool>,
         /// Configure support for the stack-switching proposal.
@@ -442,6 +516,10 @@ wasmtime_option_group! {
         pub custom_page_sizes: Option<bool>,
         /// Configure support for the wide-arithmetic proposal.
         pub wide_arithmetic: Option<bool>,
+        /// Configure support for the branch-hinting proposal.
+        pub branch_hinting: Option<bool>,
+        /// Configure support for compact imports.
+        pub compact_imports: Option<bool>,
         /// Configure support for the extended-const proposal.
         pub extended_const: Option<bool>,
         /// Configure support for the exceptions proposal.
@@ -451,6 +529,16 @@ wasmtime_option_group! {
         /// Component model support for fixed-length lists: this corresponds
         /// to the 🔧 emoji in the component model specification
         pub component_model_fixed_length_lists: Option<bool>,
+        /// Component model support for `(implements ...)` and
+        /// `(external-id ...)`, corresponds to the 🏷️ emoji in the upstream
+        /// spec.
+        pub component_model_implements: Option<bool>,
+        /// Component model support for canonical names, corresponds to the
+        /// 🔗 emoji in the upstream spec.
+        pub component_model_canonical_names: Option<bool>,
+        /// Component model support for `[get]` and `[set]` accessors,
+        /// corresponds to the 📡 emoji in the upstream spec.
+        pub component_model_accessors: Option<bool>,
         /// Whether or not any concurrency infrastructure in Wasmtime is
         /// enabled or not.
         pub concurrency_support: Option<bool>,
@@ -462,8 +550,7 @@ wasmtime_option_group! {
 }
 
 wasmtime_option_group! {
-    #[derive(PartialEq, Clone, Deserialize)]
-    #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+    #[env = "WASI"]
     pub struct WasiOptions {
         /// Enable support for WASI CLI APIs, including filesystems, sockets, clocks, and random.
         pub cli: Option<bool>,
@@ -480,18 +567,14 @@ wasmtime_option_group! {
         /// Number of distinct write calls to the outgoing body's output-stream
         /// that the implementation will buffer.
         /// Default: 1.
-        pub http_outgoing_body_buffer_chunks: Option<usize>,
+        pub http_outgoing_body_buffer_chunks: Option<NonZeroUsize>,
         /// Maximum size allowed in a write call to the outgoing body's output-stream.
         /// Default: 1024 * 1024.
-        pub http_outgoing_body_chunk_size: Option<usize>,
+        pub http_outgoing_body_chunk_size: Option<NonZeroUsize>,
         /// Enable support for WASI config imports (experimental)
         pub config: Option<bool>,
         /// Enable support for WASI key-value imports (experimental)
         pub keyvalue: Option<bool>,
-        /// Inherit environment variables and file descriptors following the
-        /// systemd listen fd specification (UNIX only) (legacy wasip1
-        /// implementation only)
-        pub listenfd: Option<bool>,
         /// Grant access to the given TCP listen socket (experimental, legacy
         /// wasip1 implementation only)
         #[serde(default)]
@@ -522,7 +605,7 @@ wasmtime_option_group! {
         pub udp: Option<bool>,
         /// Enable WASI APIs marked as: @unstable(feature = network-error-code)
         pub network_error_code: Option<bool>,
-        /// Allows imports from the `wasi_unstable` core wasm module.
+        /// Allows imports from the `wasi_unstable` core wasm module. Disabled by default.
         pub preview0: Option<bool>,
         /// Inherit all environment variables from the parent process.
         ///
@@ -534,6 +617,8 @@ wasmtime_option_group! {
         pub inherit_stdout: Option<bool>,
         /// Inherit stderr from the parent process. On by default.
         pub inherit_stderr: Option<bool>,
+        /// Initial current working directory reported through `wasi:cli/environment`.
+        pub cwd: Option<String>,
         /// Pass a wasi config variable to the program.
         #[serde(skip)]
         pub config_var: Vec<KeyValuePair>,
@@ -546,6 +631,12 @@ wasmtime_option_group! {
         pub max_resources: Option<usize>,
         /// Fuel to use for all hostcalls to limit guest<->host data transfer.
         pub hostcall_fuel: Option<usize>,
+        /// Maximum number of simultaneously-live component-model handles (e.g.
+        /// resources, streams, futures) per store; allocating past it traps.
+        /// (default: 100000)
+        pub max_component_handles: Option<usize>,
+        /// Maximum number of simultaneously-live fibers per store.
+        pub max_fibers: Option<u32>,
         /// Maximum value, in bytes, for a wasi-random 0.2
         /// `get{,-insecure}-random-bytes` `len` parameter. Calls with a value
         /// exceeding this limit will trap.
@@ -562,8 +653,7 @@ wasmtime_option_group! {
 }
 
 wasmtime_option_group! {
-    #[derive(PartialEq, Clone, Deserialize)]
-    #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+    #[env = "RECORD"]
     pub struct RecordOptions {
         /// Filename for the recorded execution trace (or empty string to skip writing a file).
         pub path: Option<String>,
@@ -592,9 +682,28 @@ pub struct KeyValuePair {
     pub value: String,
 }
 
+/// The instance import name under which Wasmtime's unsafe intrinsics are
+/// exposed to the Wasm being compiled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsafeIntrinsicsImport(pub String);
+
+/// A compile-time builtin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompileTimeBuiltin {
+    /// The instance import name that this satisfies in the main component.
+    pub name: String,
+    /// The path to the component that implements this builtin.
+    pub path: PathBuf,
+}
+
 /// Common options for commands that translate WebAssembly modules
-#[derive(Parser, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
+#[cfg_attr(feature = "clap", derive(clap::Parser))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_derive::Deserialize, serde_derive::Serialize)
+)]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct CommonOptions {
     // These options groups are used to parse `-O` and such options but aren't
     // the raw form consumed by the CLI. Instead they're pushed into the `pub`
@@ -605,29 +714,44 @@ pub struct CommonOptions {
     // now.
     /// Optimization and tuning related options for wasm performance, `-O help` to
     /// see all.
-    #[arg(short = 'O', long = "optimize", value_name = "KEY[=VAL[,..]]")]
-    #[serde(skip)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(short = 'O', long = "optimize", value_name = "KEY[=VAL[,..]]")
+    )]
+    #[cfg_attr(feature = "serde", serde(skip))]
     opts_raw: Vec<opt::CommaSeparated<Optimize>>,
 
     /// Codegen-related configuration options, `-C help` to see all.
-    #[arg(short = 'C', long = "codegen", value_name = "KEY[=VAL[,..]]")]
-    #[serde(skip)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(short = 'C', long = "codegen", value_name = "KEY[=VAL[,..]]")
+    )]
+    #[cfg_attr(feature = "serde", serde(skip))]
     codegen_raw: Vec<opt::CommaSeparated<Codegen>>,
 
     /// Debug-related configuration options, `-D help` to see all.
-    #[arg(short = 'D', long = "debug", value_name = "KEY[=VAL[,..]]")]
-    #[serde(skip)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(short = 'D', long = "debug", value_name = "KEY[=VAL[,..]]")
+    )]
+    #[cfg_attr(feature = "serde", serde(skip))]
     debug_raw: Vec<opt::CommaSeparated<Debug>>,
 
     /// Options for configuring semantic execution of WebAssembly, `-W help` to see
     /// all.
-    #[arg(short = 'W', long = "wasm", value_name = "KEY[=VAL[,..]]")]
-    #[serde(skip)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(short = 'W', long = "wasm", value_name = "KEY[=VAL[,..]]")
+    )]
+    #[cfg_attr(feature = "serde", serde(skip))]
     wasm_raw: Vec<opt::CommaSeparated<Wasm>>,
 
     /// Options for configuring WASI and its proposals, `-S help` to see all.
-    #[arg(short = 'S', long = "wasi", value_name = "KEY[=VAL[,..]]")]
-    #[serde(skip)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(short = 'S', long = "wasi", value_name = "KEY[=VAL[,..]]")
+    )]
+    #[cfg_attr(feature = "serde", serde(skip))]
     wasi_raw: Vec<opt::CommaSeparated<Wasi>>,
 
     /// Options to enable and configure execution recording, `-R help` to see all.
@@ -638,43 +762,46 @@ pub struct CommonOptions {
     ///
     /// Note: Minimal configuration options for deterministic Wasm semantics will be
     /// enforced during recording by default (NaN canonicalization, deterministic relaxed SIMD).
-    #[arg(short = 'R', long = "record", value_name = "KEY[=VAL[,..]]")]
-    #[serde(skip)]
+    #[cfg_attr(
+        feature = "clap",
+        arg(short = 'R', long = "record", value_name = "KEY[=VAL[,..]]")
+    )]
+    #[cfg_attr(feature = "serde", serde(skip))]
     record_raw: Vec<opt::CommaSeparated<Record>>,
 
     // These fields are filled in by the `configure` method below via the
     // options parsed from the CLI above. This is what the CLI should use.
-    #[arg(skip)]
-    #[serde(skip)]
+    #[cfg_attr(feature = "clap", arg(skip))]
+    #[cfg_attr(feature = "serde", serde(skip))]
     configured: bool,
 
-    #[arg(skip)]
-    #[serde(rename = "optimize", default)]
+    #[cfg_attr(feature = "clap", arg(skip))]
+    #[cfg_attr(feature = "serde", serde(rename = "optimize", default))]
     pub opts: OptimizeOptions,
 
-    #[arg(skip)]
-    #[serde(rename = "codegen", default)]
+    #[cfg_attr(feature = "clap", arg(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub codegen: CodegenOptions,
 
-    #[arg(skip)]
-    #[serde(rename = "debug", default)]
+    #[cfg_attr(feature = "clap", arg(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub debug: DebugOptions,
 
-    #[arg(skip)]
-    #[serde(rename = "wasm", default)]
+    #[cfg_attr(feature = "clap", arg(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub wasm: WasmOptions,
 
-    #[arg(skip)]
-    #[serde(rename = "wasi", default)]
+    #[cfg_attr(feature = "clap", arg(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub wasi: WasiOptions,
 
-    #[arg(skip)]
-    #[serde(rename = "record", default)]
+    #[cfg_attr(feature = "clap", arg(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub record: RecordOptions,
 
     /// The target triple; default is the host triple
-    #[arg(long, value_name = "TARGET")]
-    #[serde(skip)]
+    #[cfg_attr(feature = "clap", arg(long, value_name = "TARGET"))]
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub target: Option<String>,
 
     /// Use the specified TOML configuration file.
@@ -683,8 +810,8 @@ pub struct CommonOptions {
     ///
     /// Additional options specified on the command line will take precedent over options loaded from
     /// this TOML file.
-    #[arg(long = "config", value_name = "FILE")]
-    #[serde(skip)]
+    #[cfg_attr(feature = "clap", arg(long = "config", value_name = "FILE"))]
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub config: Option<PathBuf>,
 }
 
@@ -737,20 +864,30 @@ impl CommonOptions {
         }
         self.configured = true;
         if let Some(toml_config_path) = &self.config {
-            let toml_options = CommonOptions::from_file(toml_config_path)?;
-            self.opts = toml_options.opts;
-            self.codegen = toml_options.codegen;
-            self.debug = toml_options.debug;
-            self.wasm = toml_options.wasm;
-            self.wasi = toml_options.wasi;
-            self.record = toml_options.record;
+            #[cfg(feature = "toml")]
+            {
+                let toml_options = CommonOptions::from_file(toml_config_path)?;
+                self.opts = toml_options.opts;
+                self.codegen = toml_options.codegen;
+                self.debug = toml_options.debug;
+                self.wasm = toml_options.wasm;
+                self.wasi = toml_options.wasi;
+                self.record = toml_options.record;
+            }
+            #[cfg(not(feature = "toml"))]
+            {
+                bail!(
+                    "support for loading a configuration file from \
+                     {toml_config_path:?} disabled at compile time"
+                );
+            }
         }
-        self.opts.configure_with(&self.opts_raw);
-        self.codegen.configure_with(&self.codegen_raw);
-        self.debug.configure_with(&self.debug_raw);
-        self.wasm.configure_with(&self.wasm_raw);
-        self.wasi.configure_with(&self.wasi_raw);
-        self.record.configure_with(&self.record_raw);
+        self.opts.configure_with(&self.opts_raw)?;
+        self.codegen.configure_with(&self.codegen_raw)?;
+        self.debug.configure_with(&self.debug_raw)?;
+        self.wasm.configure_with(&self.wasm_raw)?;
+        self.wasi.configure_with(&self.wasi_raw)?;
+        self.record.configure_with(&self.record_raw)?;
         Ok(())
     }
 
@@ -864,7 +1001,7 @@ impl CommonOptions {
         if self.codegen.cache != Some(false) {
             use wasmtime::Cache;
             let cache = match &self.codegen.cache_config {
-                Some(path) => Cache::from_file(Some(Path::new(path)))?,
+                Some(path) => Cache::from_file(Some(std::path::Path::new(path)))?,
                 None => Cache::from_file(None)?,
             };
             config.cache(Some(cache));
@@ -927,6 +1064,11 @@ impl CommonOptions {
         if let Some(size) = self.opts.gc_heap_reservation_for_growth {
             config.gc_heap_reservation_for_growth(size);
         }
+
+        if let Some(size) = self.opts.gc_heap_initial_size {
+            config.gc_heap_initial_size(size);
+        }
+
         if let Some(enable) = self.opts.table_lazy_init {
             config.table_lazy_init(enable);
         }
@@ -958,6 +1100,9 @@ impl CommonOptions {
                 }
             }
         }
+        if let Some(enable) = self.debug.symbols {
+            config.debug_symbols(enable);
+        }
         if let Some(enable) = self.opts.memory_init_cow {
             config.memory_init_cow(enable);
         }
@@ -972,6 +1117,12 @@ impl CommonOptions {
         }
         if let Some(enable) = self.codegen.inlining {
             config.compiler_inlining(enable);
+        }
+        if let Some(enable) = self.codegen.metadata_for_internal_asserts {
+            config.metadata_for_internal_asserts(enable);
+        }
+        if let Some(enable) = self.codegen.metadata_for_gc_heap_corruption {
+            config.metadata_for_gc_heap_corruption(enable);
         }
 
         // async_stack_size enabled by either async or stack-switching, so
@@ -1112,7 +1263,7 @@ impl CommonOptions {
             #[cfg(any(feature = "async", feature = "stack-switching"))]
             if self.wasm.async_stack_size.is_none() {
                 const DEFAULT_HOST_STACK: usize = 512 << 10;
-                config.async_stack_size(max + DEFAULT_HOST_STACK);
+                config.async_stack_size(max.saturating_add(DEFAULT_HOST_STACK));
             }
         }
 
@@ -1182,6 +1333,14 @@ impl CommonOptions {
         if let Some(enable) = self.wasm.wide_arithmetic.or(all) {
             config.wasm_wide_arithmetic(enable);
         }
+        // Not included in `all_proposals`: off by default until fuzzed.
+        if let Some(enable) = self.wasm.branch_hinting {
+            config.wasm_branch_hinting(enable);
+        }
+        // Not included in `all_proposals`: off by default until fuzzed.
+        if let Some(enable) = self.wasm.compact_imports {
+            config.wasm_compact_imports(enable);
+        }
         if let Some(enable) = self.wasm.extended_const.or(all) {
             config.wasm_extended_const(enable);
         }
@@ -1208,6 +1367,10 @@ impl CommonOptions {
             ("component-model", component_model_error_context, wasm_component_model_error_context)
             ("component-model", component_model_map, wasm_component_model_map)
             ("component-model", component_model_fixed_length_lists, wasm_component_model_fixed_length_lists)
+            ("component-model", component_model_implements, wasm_component_model_implements)
+            ("component-model", component_model_canonical_names, wasm_component_model_canonical_names)
+            ("component-model", component_model_accessors, wasm_component_model_accessors)
+            ("component-model", component_model_memory64, wasm_component_model_memory64)
             ("threads", threads, wasm_threads)
             ("gc", gc, wasm_gc)
             ("gc", reference_types, wasm_reference_types)
@@ -1228,12 +1391,241 @@ impl CommonOptions {
         Ok(())
     }
 
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+    #[cfg(feature = "toml")]
+    pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        use wasmtime::error::Context;
+
         let path_ref = path.as_ref();
-        let file_contents = fs::read_to_string(path_ref)
+        let file_contents = std::fs::read_to_string(path_ref)
             .with_context(|| format!("failed to read config file: {path_ref:?}"))?;
         toml::from_str::<CommonOptions>(&file_contents)
             .with_context(|| format!("failed to parse TOML config file {path_ref:?}"))
+    }
+
+    /// Creates an instance of [`CommonOptions`] by reflecting on the
+    /// configuration present in the provided [`Engine`].
+    ///
+    /// This will extract all configuration values that can be set by this
+    /// [`CommonOptions`] into a [`Config`] into the returned structure to the
+    /// best of its ability. Not all configuration options present on [`Engine`]
+    /// can be reflected back into [`CommonOptions`], and not all options on
+    /// [`CommonOptions`] can be set on an [`Engine`]. This means that this
+    /// is a lossy operation that doesn't fully capture 100% of the
+    /// configuration of [`Engine`]. That being said, however, it can capture
+    /// almost all of the configuration related to codegen and major other
+    /// configuration options.
+    pub fn from_engine(engine: &Engine) -> Self {
+        let features = engine.get_wasm_features();
+        let pooling = engine.get_pooling_config();
+        CommonOptions {
+            target: engine.get_target(),
+            opts: OptimizeOptions {
+                memory_may_move: Some(engine.get_memory_may_move()),
+                memory_reservation: Some(engine.get_memory_reservation()),
+                memory_reservation_for_growth: Some(engine.get_memory_reservation_for_growth()),
+                memory_guard_size: Some(engine.get_memory_guard_size()),
+                gc_heap_may_move: Some(engine.get_gc_heap_may_move()),
+                gc_heap_reservation: Some(engine.get_gc_heap_reservation()),
+                gc_heap_reservation_for_growth: Some(engine.get_gc_heap_reservation_for_growth()),
+                gc_heap_guard_size: Some(engine.get_gc_heap_guard_size()),
+                gc_heap_initial_size: Some(engine.get_gc_heap_initial_size()),
+                guard_before_linear_memory: Some(engine.get_guard_before_linear_memory()),
+                table_lazy_init: Some(engine.get_table_lazy_init()),
+                memory_init_cow: Some(engine.get_memory_init_cow()),
+                memory_guaranteed_dense_image_size: Some(
+                    engine.get_memory_guaranteed_dense_image_size(),
+                ),
+                signals_based_traps: Some(engine.get_signals_based_traps()),
+                gc_zeal_alloc_counter: engine.get_gc_zeal_alloc_counter(),
+                opt_level: engine.get_cranelift_opt_level(),
+                regalloc_algorithm: engine.get_cranelift_regalloc_algorithm(),
+                pooling_allocator: Some(pooling.is_some()),
+                pooling_decommit_batch_size: pooling.map(|c| c.get_decommit_batch_size()),
+                pooling_memory_keep_resident: pooling.map(|c| c.get_memory_keep_resident()),
+                pooling_table_keep_resident: pooling.map(|c| c.get_table_keep_resident()),
+                pooling_max_unused_warm_slots: pooling.map(|c| c.get_max_unused_warm_slots()),
+                pooling_pagemap_scan: pooling.map(|c| c.get_pagemap_scan()),
+                pooling_total_core_instances: pooling.map(|c| c.get_total_core_instances()),
+                pooling_total_component_instances: pooling
+                    .map(|c| c.get_total_component_instances()),
+                pooling_total_memories: pooling.map(|c| c.get_total_memories()),
+                pooling_total_tables: pooling.map(|c| c.get_total_tables()),
+                pooling_max_memory_size: pooling.map(|c| c.get_max_memory_size()),
+                pooling_table_elements: pooling.map(|c| c.get_table_elements()),
+                pooling_max_core_instance_size: pooling.map(|c| c.get_max_core_instance_size()),
+                pooling_max_component_instance_size: pooling
+                    .map(|c| c.get_max_component_instance_size()),
+                pooling_max_core_instances_per_component: pooling
+                    .map(|c| c.get_max_core_instances_per_component()),
+                pooling_max_memories_per_component: pooling
+                    .map(|c| c.get_max_memories_per_component()),
+                pooling_max_tables_per_component: pooling.map(|c| c.get_max_tables_per_component()),
+                pooling_max_tables_per_module: pooling.map(|c| c.get_max_tables_per_module()),
+                pooling_max_memories_per_module: pooling.map(|c| c.get_max_memories_per_module()),
+                pooling_async_stack_keep_resident: pooling
+                    .map(|c| c.get_async_stack_keep_resident()),
+                pooling_total_stacks: pooling.map(|c| c.get_total_stacks()),
+                pooling_total_gc_heaps: pooling.map(|c| c.get_total_gc_heaps()),
+                pooling_memory_protection_keys: pooling.map(|c| c.get_memory_protection_keys()),
+                pooling_max_memory_protection_keys: pooling
+                    .map(|c| c.get_max_memory_protection_keys()),
+                // Deprecated aliases for the above options; intentionally left
+                // unset in favor of their replacements.
+                dynamic_memory_guard_size: None,
+                static_memory_guard_size: None,
+                static_memory_forced: None,
+                static_memory_maximum_size: None,
+                dynamic_memory_reserved_for_growth: None,
+            },
+            codegen: CodegenOptions {
+                compiler: engine.get_strategy(),
+                collector: engine.get_collector(),
+                cranelift_debug_verifier: engine.get_cranelift_debug_verifier(),
+                inlining: Some(engine.get_compiler_inlining()),
+                native_unwind_info: engine.get_native_unwind_info(),
+                parallel_compilation: Some(engine.get_parallel_compilation()),
+                metadata_for_internal_asserts: Some(engine.get_metadata_for_internal_asserts()),
+                metadata_for_gc_heap_corruption: Some(engine.get_metadata_for_gc_heap_corruption()),
+                cranelift: engine
+                    .get_cranelift_flags_set()
+                    .map(|(k, v)| (k.to_string(), Some(v.to_string())))
+                    .chain(
+                        engine
+                            .get_cranelift_flags_enabled()
+                            .map(|k| (k.to_string(), None)),
+                    )
+                    .collect(),
+
+                // not easily extractable from `Engine` since that supports
+                // arbitrary code-defined caches.
+                cache: None,
+                cache_config: None,
+
+                // These are configured per-`CodeBuilder`, so they cannot be
+                // recovered here.
+                unsafe_intrinsics: None,
+                compile_time_builtin: Vec::new(),
+            },
+            debug: DebugOptions {
+                address_map: Some(engine.get_generate_address_map()),
+                debug_info: Some(engine.get_debug_info()),
+                guest_debug: Some(engine.get_guest_debug()),
+                symbols: Some(engine.get_debug_symbols()),
+                max_backtrace: Some(engine.get_wasm_backtrace_max_frames()),
+
+                // Can't infer a path to emit a core dump to from engine
+                // configuration.
+                coredump: None,
+                // debugger configuration not part of engine config
+                debugger: None,
+                arg: Vec::new(),
+                inherit_stderr: None,
+                inherit_stdout: None,
+                inherit_stdin: None,
+                // logging not part of engine config
+                log_to_files: None,
+                logging: None,
+            },
+            wasm: WasmOptions {
+                async_stack_size: Some(engine.get_async_stack_size()),
+                async_stack_zeroing: Some(engine.get_async_stack_zeroing()),
+                branch_hinting: Some(engine.get_wasm_branch_hinting()),
+                compact_imports: Some(features.contains(WasmFeatures::COMPACT_IMPORTS)),
+                bulk_memory: Some(features.contains(WasmFeatures::BULK_MEMORY)),
+                component_model: Some(features.contains(WasmFeatures::COMPONENT_MODEL)),
+                component_model_async: Some(features.contains(WasmFeatures::CM_ASYNC)),
+                component_model_async_stackful: Some(
+                    features.contains(WasmFeatures::CM_ASYNC_STACKFUL),
+                ),
+                component_model_error_context: Some(
+                    features.contains(WasmFeatures::CM_ERROR_CONTEXT),
+                ),
+                component_model_gc: Some(features.contains(WasmFeatures::CM_GC)),
+                component_model_fixed_length_lists: Some(
+                    features.contains(WasmFeatures::CM_FIXED_LENGTH_LISTS),
+                ),
+                component_model_implements: Some(features.contains(WasmFeatures::CM_IMPLEMENTS)),
+                component_model_canonical_names: Some(
+                    features.contains(WasmFeatures::CM_CANON_NAMES),
+                ),
+                component_model_accessors: Some(features.contains(WasmFeatures::CM_ACCESSORS)),
+                component_model_map: Some(features.contains(WasmFeatures::CM_MAP)),
+                component_model_memory64: Some(features.contains(WasmFeatures::CM64)),
+                component_model_more_async_builtins: Some(
+                    features.contains(WasmFeatures::CM_MORE_ASYNC_BUILTINS),
+                ),
+                component_model_threading: Some(features.contains(WasmFeatures::CM_THREADING)),
+                custom_page_sizes: Some(features.contains(WasmFeatures::CUSTOM_PAGE_SIZES)),
+                exceptions: Some(features.contains(WasmFeatures::EXCEPTIONS)),
+                extended_const: Some(features.contains(WasmFeatures::EXTENDED_CONST)),
+                function_references: Some(features.contains(WasmFeatures::FUNCTION_REFERENCES)),
+                gc: Some(features.contains(WasmFeatures::GC)),
+                gc_support: Some(features.contains(WasmFeatures::GC_TYPES)),
+                memory64: Some(features.contains(WasmFeatures::MEMORY64)),
+                multi_memory: Some(features.contains(WasmFeatures::MULTI_MEMORY)),
+                multi_value: Some(features.contains(WasmFeatures::MULTI_VALUE)),
+                reference_types: Some(features.contains(WasmFeatures::REFERENCE_TYPES)),
+                relaxed_simd: Some(features.contains(WasmFeatures::RELAXED_SIMD)),
+                shared_everything_threads: Some(
+                    features.contains(WasmFeatures::SHARED_EVERYTHING_THREADS),
+                ),
+                simd: Some(features.contains(WasmFeatures::SIMD)),
+                stack_switching: Some(features.contains(WasmFeatures::STACK_SWITCHING)),
+                tail_call: Some(features.contains(WasmFeatures::TAIL_CALL)),
+                threads: Some(features.contains(WasmFeatures::THREADS)),
+                wide_arithmetic: Some(features.contains(WasmFeatures::WIDE_ARITHMETIC)),
+                concurrency_support: Some(engine.get_concurrency_support()),
+                epoch_interruption: Some(engine.get_epoch_interruption()),
+                fuel: if engine.get_consume_fuel() {
+                    Some(1)
+                } else {
+                    None
+                },
+                max_wasm_stack: Some(engine.get_max_wasm_stack()),
+                nan_canonicalization: engine.get_cranelift_nan_canonicalization(),
+                relaxed_simd_deterministic: Some(engine.get_relaxed_simd_deterministic()),
+                shared_memory: Some(engine.get_shared_memory()),
+
+                // This is covered by individual `WasmFeatures::*` flags above.
+                all_proposals: None,
+                // These aren't set in `Config` any more, they're just
+                // historical
+                max_instances: None,
+                max_memories: None,
+                max_memory_size: None,
+                max_table_elements: None,
+                max_tables: None,
+                // not part of engine config, specific to `run` command
+                timeout: None,
+                trap_on_grow_failure: None,
+                unknown_exports_allow: None,
+                unknown_imports_default: None,
+                unknown_imports_trap: None,
+                wmemcheck: None,
+            },
+
+            // Not currently reflected in `Engine`.
+            record: RecordOptions::default(),
+
+            // WASI options aren't reflected in an `Engine`.
+            wasi: Default::default(),
+
+            // CLI flags are represented above, they have default values here.
+            configured: true,
+            codegen_raw: Default::default(),
+            debug_raw: Default::default(),
+            opts_raw: Default::default(),
+            record_raw: Default::default(),
+            wasi_raw: Default::default(),
+            wasm_raw: Default::default(),
+
+            // No external configuration file, it's all above.
+            config: None,
+            //
+            // Note that an exhaustive listing is explicitly used to avoid
+            // forgetting to configure a field. Please don't add `..something`
+            // here at the end.
+        }
     }
 }
 

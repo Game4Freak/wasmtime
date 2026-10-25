@@ -35,6 +35,7 @@ pub struct WastContext {
 
     modules_by_filename: Arc<HashMap<String, Vec<u8>>>,
     configure_store: Arc<dyn Fn(&mut Store<()>) + Send + Sync>,
+    ignore_error_messages: bool,
 }
 
 enum Outcome<T = Results> {
@@ -65,7 +66,7 @@ enum Results {
     Component(Vec<component::Val>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum ModuleKind {
     Core(Module),
     #[cfg(feature = "component-model")]
@@ -145,11 +146,19 @@ impl WastContext {
             precompile_load: None,
             modules_by_filename: Arc::default(),
             configure_store: Arc::new(configure),
+            ignore_error_messages: false,
         }
     }
 
     fn engine(&self) -> &Engine {
         self.core_linker.engine()
+    }
+
+    /// Configures whether or not error messages are ignored in directives like
+    /// `assert_invalid`.
+    pub fn ignore_error_messages(&mut self, ignore: bool) -> &mut Self {
+        self.ignore_error_messages = ignore;
+        self
     }
 
     /// Saves precompiled modules/components into `path` instead of executing
@@ -258,6 +267,10 @@ impl WastContext {
                     Ok(())
                 },
             )?;
+            i.func_wrap("gc", |mut store, (): ()| {
+                store.as_context_mut().gc(None)?;
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -371,7 +384,7 @@ impl WastContext {
                     let engine = self.engine().clone();
                     let mut linker = self.component_linker.instance(name)?;
                     for (name, item) in ty.exports(&engine) {
-                        match item {
+                        match item.ty {
                             component::types::ComponentItem::Module(_) => {
                                 let module = instance.get_module(&mut store, name).unwrap();
                                 linker.module(name, &module)?;
@@ -402,10 +415,7 @@ impl WastContext {
     /// This will not register the name within `self.modules`.
     fn module_definition(&mut self, file: &WasmFile) -> Result<ModuleKind> {
         let name = match file.module_type {
-            WasmFileType::Text => file
-                .binary_filename
-                .as_ref()
-                .ok_or_else(|| format_err!("cannot compile module that isn't a valid binary"))?,
+            WasmFileType::Text => file.binary_filename.as_ref().unwrap_or(&file.filename),
             WasmFileType::Binary => &file.filename,
         };
 
@@ -538,10 +548,6 @@ impl WastContext {
             || (expected.contains("null function") && (actual.contains("uninitialized element") || actual.contains("null reference")))
             // GC tests say "null $kind reference" but we just say "null reference".
             || (expected.contains("null") && expected.contains("reference") && actual.contains("null reference"))
-            // upstream component model tests expect slightly different error
-            // messages than we generate.
-            || (expected.contains("cannot write") && actual.contains("cannot write"))
-            || (expected.contains("cannot read") && actual.contains("cannot read"))
         {
             return Ok(());
         }
@@ -560,6 +566,14 @@ impl WastContext {
                 Ok(())
             }
             Outcome::Trap(err) => bail!("expected exception, got {err:?}"),
+        }
+    }
+
+    fn assert_suspension(&self, result: Outcome, _expected: &str) -> Result<()> {
+        match result {
+            Outcome::Ok(values) => bail!("expected suspension, got {values:?}"),
+            Outcome::Trap(err) if err.downcast_ref::<Trap>() == Some(&Trap::UnhandledTag) => Ok(()),
+            Outcome::Trap(err) => bail!("expected suspension, got {err:?}"),
         }
     }
 
@@ -728,24 +742,17 @@ impl WastContext {
                 file,
                 text,
                 line: _,
+            }
+            | AssertMalformed {
+                file,
+                text,
+                line: _,
             } => {
                 let err = match self.module_definition(&file) {
                     Ok(_) => bail!("expected module to fail to build"),
                     Err(e) => e,
                 };
-                let error_message = format!("{err:?}");
-                if !is_matching_assert_invalid_error_message(filename, &text, &error_message) {
-                    bail!("assert_invalid: expected \"{text}\", got \"{error_message}\"",)
-                }
-            }
-            AssertMalformed {
-                file,
-                text: _,
-                line: _,
-            } => {
-                if let Ok(_) = self.module_definition(&file) {
-                    bail!("expected malformed module to fail to instantiate");
-                }
+                self.match_error_message(&text, err)?;
             }
             AssertUnlinkable {
                 file,
@@ -757,14 +764,19 @@ impl WastContext {
                     Ok(_) => bail!("expected module to fail to link"),
                     Err(e) => e,
                 };
-                let error_message = format!("{err:?}");
-                if !is_matching_assert_invalid_error_message(filename, &text, &error_message) {
-                    bail!("assert_unlinkable: expected {text}, got {error_message}",)
-                }
+                self.match_error_message(&text, err)?;
             }
             AssertException { line: _, action } => {
                 let result = self.perform_action(&action)?;
                 self.assert_exception(result)?;
+            }
+            AssertSuspension {
+                line: _,
+                action,
+                text,
+            } => {
+                let result = self.perform_action(&action)?;
+                self.assert_suspension(result, &text)?;
             }
 
             Thread {
@@ -805,6 +817,7 @@ impl WastContext {
                     precompile_load: self.precompile_load.clone(),
                     precompile_save: self.precompile_save.clone(),
                     configure_store: self.configure_store.clone(),
+                    ignore_error_messages: self.ignore_error_messages,
                 };
                 let child = scope.spawn(move || child_cx.run_directives(commands, filename));
                 threads.insert(name.to_string(), child);
@@ -815,10 +828,6 @@ impl WastContext {
                     .ok_or_else(|| format_err!("no thread named `{thread}`"))?
                     .join()
                     .unwrap()?;
-            }
-
-            AssertSuspension { .. } => {
-                bail!("unimplemented wast directive");
             }
 
             AssertMalformedCustom {
@@ -862,25 +871,15 @@ impl WastContext {
         self.generate_dwarf = enable;
         self
     }
-}
 
-fn is_matching_assert_invalid_error_message(test: &str, expected: &str, actual: &str) -> bool {
-    if actual.contains(expected) {
-        return true;
+    fn match_error_message(&self, expected: &str, err: wasmtime::Error) -> Result<()> {
+        if self.ignore_error_messages {
+            return Ok(());
+        }
+        let actual = format!("{err:?}");
+        if actual.contains(expected) {
+            return Ok(());
+        }
+        bail!("assert_invalid: expected \"{expected}\", got \"{actual}\"",)
     }
-
-    // Historically wasmtime/wasm-tools tried to match the upstream error
-    // message. This generally led to a large sequence of matches here which is
-    // not easy to maintain and is particularly difficult when test suites and
-    // proposals conflict with each other (e.g. one asserts one error message
-    // and another asserts a different error message). Overall we didn't benefit
-    // a whole lot from trying to match errors so just assume the error is
-    // roughly the same and otherwise don't try to match it.
-    if test.contains("spec_testsuite") {
-        return true;
-    }
-
-    // we are in control over all non-spec tests so all the error messages
-    // there should exactly match the `assert_invalid` or such
-    false
 }

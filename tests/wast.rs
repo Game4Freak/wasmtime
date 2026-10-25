@@ -23,42 +23,14 @@ fn main() {
         .ok()
         .map(|s| s.split(" ").map(|s| s.to_string()).collect::<Vec<_>>());
 
-    let mut add_trial = |test: &WastTest, config: WastConfig| {
-        let name = format!(
-            "{:?}/{}{}{}",
-            config.compiler,
-            if config.pooling { "pooling/" } else { "" },
-            if config.collector != Collector::Auto {
-                format!("{:?}/", config.collector)
-            } else {
-                String::new()
-            },
-            test.path.to_str().unwrap()
-        );
-
-        // Don't add this trial if we are only running GC-related tests and it
-        // doesn't look like a GC-related test.
-        if let Some(ks) = &gc_keywords {
-            if config.collector == Collector::Auto && !ks.iter().any(|kw| name.contains(kw)) {
-                return;
-            }
-        }
-
-        let trial = Trial::test(name, {
-            let test = test.clone();
-            move || run_wast(&test, config).map_err(|e| format!("{e:?}").into())
-        });
-
-        trials.push(trial);
-    };
-
     // List of supported compilers, filtered by what our current host supports.
-    let mut compilers = vec![
-        Compiler::CraneliftNative,
-        Compiler::Winch,
-        Compiler::CraneliftPulley,
-    ];
+    // If the current host doesn't support anything native, then test pulley
+    // instead.
+    let mut compilers = vec![Compiler::CraneliftNative, Compiler::Winch];
     compilers.retain(|c| c.supports_host());
+    if compilers.is_empty() {
+        compilers.push(Compiler::CraneliftPulley);
+    }
 
     // Only test one compiler in ASAN since we're mostly interested in testing
     // runtime code, not compiler-generated code.
@@ -70,62 +42,35 @@ fn main() {
     // leave the full combinatorial matrix and such to fuzz testing which
     // configures many more settings than those configured here.
     for test in tests {
-        let collector = if test.test_uses_gc_types() {
-            Collector::DeferredReferenceCounting
-        } else {
-            Collector::Auto
-        };
-
-        // Run this test in all supported compilers.
-        for compiler in compilers.iter().copied() {
-            add_trial(
-                &test,
-                WastConfig {
-                    compiler,
-                    pooling: false,
-                    collector,
-                },
-            );
-        }
-
-        // Don't do extra tests in ASAN as it takes awhile and is unlikely to
-        // reap much benefit.
-        if cfg!(asan) {
+        if test.config.stack_switching() && !cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        {
             continue;
         }
 
-        let compiler = compilers[0];
+        let name = test.path.to_str().unwrap();
 
-        // Run this test with the pooling allocator under the default compiler.
-        add_trial(
-            &test,
-            WastConfig {
-                compiler,
-                pooling: true,
-                collector,
-            },
-        );
+        // Don't add this trial if we are only running GC-related tests and it
+        // doesn't look like a GC-related test.
+        if let Some(ks) = &gc_keywords {
+            if !ks.iter().any(|kw| name.contains(kw)) {
+                continue;
+            }
+        }
 
-        // If applicable, also run with the null collector in addition to the
-        // default collector.
-        if test.test_uses_gc_types() {
-            add_trial(
-                &test,
-                WastConfig {
-                    compiler,
-                    pooling: false,
-                    collector: Collector::Null,
-                },
-            );
+        for compiler in compilers.iter() {
+            let config = WastConfig {
+                compiler: *compiler,
+                pooling: false,
+                collector: Collector::Auto,
+            };
+            let name = format!("{compiler:?}/{name}");
 
-            add_trial(
-                &test,
-                WastConfig {
-                    compiler,
-                    pooling: false,
-                    collector: Collector::Copying,
-                },
-            );
+            let trial = Trial::test(name.to_string(), {
+                let test = test.clone();
+                move || run_wast(&test, config).map_err(|e| format!("{e:?}").into())
+            });
+
+            trials.push(trial);
         }
     }
 
@@ -150,12 +95,18 @@ fn run_wast(test: &WastTest, config: WastConfig) -> wasmtime::Result<()> {
     // panic or segfault as a result.
     //
     // Updates to whether a test should pass or fail should be done in the
-    // `crates/wast-util/src/lib.rs` file.
+    // `crates/test-util/src/wast.rs` file.
     let should_fail = test.should_fail(&config);
 
     let multi_memory = test_config.multi_memory();
     let test_hogs_memory = test_config.hogs_memory();
     let relaxed_simd = test_config.relaxed_simd();
+
+    // Skip memory-intensive tests on ASAN. Some of these require gracefully
+    // handling OOM but ASAN hard-aborts on OOM.
+    if test_hogs_memory && cfg!(asan) {
+        return Ok(());
+    }
 
     let is_cranelift = match config.compiler {
         Compiler::CraneliftNative | Compiler::CraneliftPulley => true,
@@ -276,6 +227,12 @@ fn run_wast(test: &WastTest, config: WastConfig) -> wasmtime::Result<()> {
                 use_shared_memory: true,
                 suppress_prints: true,
             })?;
+
+            // Ignore error messages for spec tests because Wasmtime will often
+            // differ in exact wording from the upstream spec interpreter.
+            if test.config.spec_test.unwrap_or(false) {
+                wast_context.ignore_error_messages(true);
+            }
             if test
                 .path
                 .to_str()

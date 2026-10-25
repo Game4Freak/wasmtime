@@ -6,7 +6,8 @@ target x86_64
 
 function %callee_i64(i64) -> i64 tail {
 block0(v0: i64):
-    v1 = iadd_imm.i64 v0, 10
+    v2 = iconst.i64 10
+    v1 = iadd v0, v2
     return v1
 }
 
@@ -78,7 +79,7 @@ block0(v0: i64):
 ;   pushq %rbp
 ;   movq %rsp, %rbp
 ; block1: ; offset 0x4
-;   leaq (%rip), %r10 ; reloc_external CallPCRel4 %callee_i64 -4
+;   leaq (%rip), %r10 ; reloc_external PCRel4 %callee_i64 -4
 ;   movq %rbp, %rsp
 ;   popq %rbp
 ;   jmpq *%r10
@@ -248,11 +249,11 @@ block0:
 ;   pushq %rbp
 ;   movq %rsp, %rbp
 ;   subq $0xa0, %rsp
-;   movq %rsp, %rbp
 ;   movq 0xa0(%rsp), %r11
 ;   movq %r11, (%rsp)
 ;   movq 0xa8(%rsp), %r11
 ;   movq %r11, 8(%rsp)
+;   movq %rsp, %rbp
 ;   subq $0xa0, %rsp
 ;   movq %rbx, 0x70(%rsp)
 ;   movq %r12, 0x78(%rsp)
@@ -342,11 +343,11 @@ block0:
 ;   pushq %rbp
 ;   movq %rsp, %rbp
 ;   subq $0xa0, %rsp
-;   movq %rsp, %rbp
 ;   movq 0xa0(%rsp), %r11
 ;   movq %r11, (%rsp)
 ;   movq 0xa8(%rsp), %r11
 ;   movq %r11, 8(%rsp)
+;   movq %rsp, %rbp
 ;   subq $0xa0, %rsp
 ;   movq %rbx, 0x70(%rsp)
 ;   movq %r12, 0x78(%rsp)

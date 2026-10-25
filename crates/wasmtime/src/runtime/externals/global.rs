@@ -2,11 +2,10 @@ use crate::prelude::*;
 use crate::runtime::vm::{self, VMGlobalDefinition, VMGlobalKind, VMOpaqueContext};
 use crate::{
     AnyRef, AsContext, AsContextMut, ExnRef, ExternRef, Func, GlobalType, HeapType, Mutability,
-    Ref, RootedGcRefImpl, Val, ValType,
+    Ref, Val, ValType,
     store::{AutoAssertNoGc, InstanceId, StoreId, StoreInstanceId, StoreOpaque},
     trampoline::generate_global_export,
 };
-use core::ptr;
 use core::ptr::NonNull;
 use wasmtime_environ::DefinedGlobalIndex;
 
@@ -58,6 +57,9 @@ impl Global {
     ///
     /// Returns an error if the `ty` provided does not match the type of the
     /// value `val`, or if `val` comes from a different store than `store`.
+    ///
+    /// Returns an error if the content type of `ty` was not created with the
+    /// same [`Engine`](crate::Engine) as `store`.
     ///
     /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
     /// memory allocation fails. See the `OutOfMemory` type's documentation for
@@ -151,16 +153,18 @@ impl Global {
         unsafe {
             let definition = self.definition(store).as_ref();
             match self._ty(&store).content() {
-                ValType::I32 => Val::from(*definition.as_i32()),
-                ValType::I64 => Val::from(*definition.as_i64()),
-                ValType::F32 => Val::F32(*definition.as_u32()),
-                ValType::F64 => Val::F64(*definition.as_u64()),
+                ValType::I32 => Val::from(definition.get_i32()),
+                ValType::I64 => Val::from(definition.get_i64()),
+                ValType::F32 => Val::F32(definition.get_f32_bits()),
+                ValType::F64 => Val::F64(definition.get_f64_bits()),
                 ValType::V128 => Val::V128(definition.get_u128().into()),
                 ValType::Ref(ref_ty) => {
                     let reference: Ref = match ref_ty.heap_type() {
-                        HeapType::Func | HeapType::ConcreteFunc(_) => {
-                            Func::_from_raw(store, definition.as_func_ref().cast()).into()
-                        }
+                        HeapType::Func | HeapType::ConcreteFunc(_) => Ref::Func(
+                            definition
+                                .get_func_ref()
+                                .map(|f| Func::from_vm_func_ref(store.id(), f)),
+                        ),
 
                         HeapType::NoFunc => Ref::Func(None),
 
@@ -255,14 +259,13 @@ impl Global {
         unsafe {
             let definition = self.definition(&store).as_mut();
             match val {
-                Val::I32(i) => *definition.as_i32_mut() = *i,
-                Val::I64(i) => *definition.as_i64_mut() = *i,
-                Val::F32(f) => *definition.as_u32_mut() = *f,
-                Val::F64(f) => *definition.as_u64_mut() = *f,
+                Val::I32(i) => definition.set_i32(*i),
+                Val::I64(i) => definition.set_i64(*i),
+                Val::F32(f) => definition.set_f32_bits(*f),
+                Val::F64(f) => definition.set_f64_bits(*f),
                 Val::V128(i) => definition.set_u128((*i).into()),
                 Val::FuncRef(f) => {
-                    *definition.as_func_ref_mut() =
-                        f.map_or(ptr::null_mut(), |f| f.vm_func_ref(&store).as_ptr().cast());
+                    definition.set_func_ref(f.map(|f| f.vm_func_ref(&store)));
                 }
                 Val::ExternRef(e) => {
                     let new = match e {
@@ -270,7 +273,7 @@ impl Global {
                         Some(e) => Some(e.try_gc_ref(&store)?.unchecked_copy()),
                     };
                     let new = new.as_ref();
-                    definition.write_gc_ref(&mut store, new);
+                    definition.write_gc_ref(&mut store, new)?;
                 }
                 Val::AnyRef(a) => {
                     let new = match a {
@@ -278,7 +281,7 @@ impl Global {
                         Some(a) => Some(a.try_gc_ref(&store)?.unchecked_copy()),
                     };
                     let new = new.as_ref();
-                    definition.write_gc_ref(&mut store, new);
+                    definition.write_gc_ref(&mut store, new)?;
                 }
                 Val::ExnRef(e) => {
                     let new = match e {
@@ -286,11 +289,11 @@ impl Global {
                         Some(e) => Some(e.try_gc_ref(&store)?.unchecked_copy()),
                     };
                     let new = new.as_ref();
-                    definition.write_gc_ref(&mut store, new);
+                    definition.write_gc_ref(&mut store, new)?;
                 }
                 Val::ContRef(None) => {
                     // Allow null continuation references for globals - these are just placeholders
-                    definition.write_gc_ref(&mut store, None);
+                    definition.write_gc_ref(&mut store, None)?;
                 }
                 Val::ContRef(Some(_)) => {
                     // TODO(#10248): Implement non-null global continuation reference handling
@@ -310,7 +313,7 @@ impl Global {
                 return;
             }
 
-            if let Some(gc_ref) = unsafe { self.definition(store).as_ref().as_gc_ref() } {
+            if let Some(gc_ref) = unsafe { self.definition(store).as_mut().as_gc_ref_mut() } {
                 unsafe {
                     gc_roots_list.add_vmgcref_root(gc_ref.into(), "Wasm global");
                 }
@@ -346,17 +349,6 @@ impl Global {
         }
     }
 
-    #[cfg(feature = "component-model")]
-    pub(crate) fn from_task_may_block(
-        instance: crate::component::store::StoreComponentInstanceId,
-    ) -> Global {
-        Global {
-            store: instance.store_id(),
-            instance: instance.instance().as_u32(),
-            kind: VMGlobalKind::TaskMayBlock,
-        }
-    }
-
     pub(crate) fn wasmtime_ty<'a>(&self, store: &'a StoreOpaque) -> &'a wasmtime_environ::Global {
         self.store.assert_belongs_to(store.id());
         match self.kind {
@@ -368,7 +360,7 @@ impl Global {
             }
             VMGlobalKind::Host(index) => unsafe { &store.host_globals()[index].get().as_ref().ty },
             #[cfg(feature = "component-model")]
-            VMGlobalKind::ComponentFlags(_) | VMGlobalKind::TaskMayBlock => {
+            VMGlobalKind::ComponentFlags(_) => {
                 const TY: wasmtime_environ::Global = wasmtime_environ::Global {
                     mutability: true,
                     wasm_ty: wasmtime_environ::WasmValType::I32,
@@ -386,7 +378,7 @@ impl Global {
             }
             VMGlobalKind::Host(_) => None,
             #[cfg(feature = "component-model")]
-            VMGlobalKind::ComponentFlags(_) | VMGlobalKind::TaskMayBlock => {
+            VMGlobalKind::ComponentFlags(_) => {
                 let instance = crate::component::ComponentInstanceId::from_u32(self.instance);
                 Some(
                     VMOpaqueContext::from_vmcomponent(store.component_instance(instance).vmctx())
@@ -418,8 +410,6 @@ impl Global {
             VMGlobalKind::ComponentFlags(idx) => {
                 u64::from(self.instance) << 32 | u64::from(idx.as_u32())
             }
-            #[cfg(feature = "component-model")]
-            VMGlobalKind::TaskMayBlock => u64::from(self.instance) << 32 | u64::from(u32::MAX),
         }
     }
 
@@ -451,12 +441,6 @@ impl Global {
                     .instance_flags(index)
                     .as_raw()
             }
-            #[cfg(feature = "component-model")]
-            VMGlobalKind::TaskMayBlock => store
-                .component_instance(crate::component::ComponentInstanceId::from_u32(
-                    self.instance,
-                ))
-                .task_may_block(),
         }
     }
 }

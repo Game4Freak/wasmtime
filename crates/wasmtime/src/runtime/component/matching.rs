@@ -143,7 +143,7 @@ impl TypeChecker<'_> {
             // TODO: shouldn't need a `.to_string()` here ideally
             let expected = expected
                 .imports
-                .get(&(module.to_string(), name.to_string()))
+                .get(&(module.to_string().into(), name.to_string().into()))
                 .ok_or_else(|| format_err!("module import `{module}::{name}` not defined"))?;
             matching::entity_ty(self.engine, &actual, expected)
                 .with_context(|| format!("module import `{module}::{name}` has the wrong type"))?;
@@ -163,11 +163,11 @@ impl TypeChecker<'_> {
             // Interface types may be exported from a component in order to give them a name, but
             // they don't have a definition in the sense that this search is interested in, so
             // ignore them.
-            if let TypeDef::Interface(_) = expected {
+            if let TypeDef::Interface(_) = expected.ty {
                 continue;
             }
             let actual = actual.and_then(|actual| actual.get(name, self.strings));
-            self.definition(expected, actual)
+            self.definition(&expected.ty, actual)
                 .with_context(|| format!("instance export `{name}` has the wrong type"))?;
         }
         Ok(())
@@ -205,7 +205,7 @@ impl<'a> InstanceType<'a> {
         match self.types[index] {
             TypeResourceTable::Concrete { ty, .. } => self
                 .resources
-                .map(|t| t[ty])
+                .and_then(|t| t.get(ty).copied())
                 .unwrap_or_else(|| ResourceType::uninstantiated(&self.types, ty)),
             TypeResourceTable::Abstract(ty) => ResourceType::abstract_(&self.types, ty),
         }

@@ -270,6 +270,17 @@ pub enum ArgsOrRets {
     Rets,
 }
 
+/// Whether an ABI argument slot lives in a register or on the stack.
+/// Passed to `get_ext_mode` so backends can apply different extension
+/// rules depending on the argument's location.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ABIArgLocation {
+    /// The argument is passed in a register.
+    Reg,
+    /// The argument is passed on the stack.
+    Stack,
+}
+
 /// Abstract location for a machine-specific ABI impl to translate into the
 /// appropriate addressing mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -498,6 +509,12 @@ pub trait ABIMachineSpec {
         outgoing_args_size: u32,
     ) -> FrameLayout;
 
+    /// Defaults to a conservative 1GiB
+    /// across all backends.
+    fn maximum_frame_size() -> u32 {
+        1 << 30 // 1 GiB
+    }
+
     /// Generate the usual frame-setup sequence for this architecture: e.g.,
     /// `push rbp / mov rbp, rsp` on x86-64, or `stp fp, lr, [sp, #-16]!` on
     /// AArch64.
@@ -588,9 +605,12 @@ pub trait ABIMachineSpec {
     /// the signature) specifies what extension type should be done *if* the ABI
     /// requires extension to the full register; this method's return value
     /// indicates whether the extension actually *will* be done.
+    /// The `location` parameter indicates whether the argument is in a register
+    /// or on the stack, allowing backends to apply different rules per location.
     fn get_ext_mode(
         call_conv: isa::CallConv,
         specified: ir::ArgumentExtension,
+        location: ABIArgLocation,
     ) -> ir::ArgumentExtension;
 
     /// Get a temporary register that is available to use after a call
@@ -1203,6 +1223,19 @@ fn checked_round_up(val: u32, mask: u32) -> Option<u32> {
     Some(val.checked_add(mask)? & !mask)
 }
 
+/// Returns `slot_offset + offset` as an offset into the stack slot area, if
+/// its magnitude is less than the maximum frame size. Since the whole frame is
+/// also limited to that size, adding the rest of the frame (e.g. the outgoing
+/// argument area) to such an offset can't overflow an `i32`.
+fn stackslot_area_offset<M: ABIMachineSpec>(slot_offset: u32, offset: i64) -> Option<i32> {
+    let offset = i64::from(slot_offset).checked_add(offset)?;
+    if offset.unsigned_abs() < u64::from(M::maximum_frame_size()) {
+        i32::try_from(offset).ok()
+    } else {
+        None
+    }
+}
+
 impl<M: ABIMachineSpec> Callee<M> {
     /// Create a new body ABI instance.
     pub fn new(
@@ -1244,7 +1277,17 @@ impl<M: ABIMachineSpec> Callee<M> {
             // We always at least machine-word-align slots, but also
             // satisfy the user's requested alignment.
             debug_assert!(data.align_shift < 32);
-            let align = core::cmp::max(M::word_bytes(), 1u32 << data.align_shift);
+            // The frame is only as aligned as the ABI's stack alignment, so a
+            // slot can't be more aligned than that.
+            let requested_align = 1u32 << data.align_shift;
+            if requested_align > M::stack_align(call_conv) {
+                return Err(CodegenError::Unsupported(format!(
+                    "stack slot alignment of {requested_align} bytes is larger than the \
+                     stack alignment of {} bytes",
+                    M::stack_align(call_conv)
+                )));
+            }
+            let align = core::cmp::max(M::word_bytes(), requested_align);
             let mask = align - 1;
             let start_offset = checked_round_up(unaligned_start_offset, mask)
                 .ok_or(CodegenError::ImplLimitExceeded)?;
@@ -1285,6 +1328,13 @@ impl<M: ABIMachineSpec> Callee<M> {
         // The size of the stackslots needs to be word aligned
         let stackslots_size = checked_round_up(end_offset, M::word_bytes() - 1)
             .ok_or(CodegenError::ImplLimitExceeded)?;
+
+        // The whole frame must fit in `maximum_frame_size` (checked with the
+        // final layout in `compute_frame_layout`), so reject oversized stack
+        // slots now.
+        if stackslots_size > M::maximum_frame_size() {
+            return Err(CodegenError::ImplLimitExceeded);
+        }
 
         let mut dynamic_type_sizes = HashMap::with_capacity(f.dfg.dynamic_types.len());
         for (dyn_ty, _data) in f.dfg.dynamic_types.iter() {
@@ -1584,7 +1634,8 @@ impl<M: ABIMachineSpec> Callee<M> {
                 } => {
                     // However, we have to respect the extension mode for stack
                     // slots, or else we grab the wrong bytes on big-endian.
-                    let ext = M::get_ext_mode(sigs[self.sig].call_conv, extension);
+                    let ext =
+                        M::get_ext_mode(sigs[self.sig].call_conv, extension, ABIArgLocation::Stack);
                     let ty =
                         if ext != ArgumentExtension::None && M::word_bits() > ty_bits(ty) as u32 {
                             M::word_type()
@@ -1665,7 +1716,11 @@ impl<M: ABIMachineSpec> Callee<M> {
                             reg, ty, extension, ..
                         } => {
                             let from_bits = ty_bits(ty) as u8;
-                            let ext = M::get_ext_mode(sigs[self.sig].call_conv, extension);
+                            let ext = M::get_ext_mode(
+                                sigs[self.sig].call_conv,
+                                extension,
+                                ABIArgLocation::Reg,
+                            );
                             let vreg = match (ext, from_bits) {
                                 (ir::ArgumentExtension::Uext, n)
                                 | (ir::ArgumentExtension::Sext, n)
@@ -1707,7 +1762,11 @@ impl<M: ABIMachineSpec> Callee<M> {
                             let off = i32::try_from(offset).expect(
                                 "Argument stack offset greater than 2GB; should hit impl limit first",
                                 );
-                            let ext = M::get_ext_mode(sigs[self.sig].call_conv, extension);
+                            let ext = M::get_ext_mode(
+                                sigs[self.sig].call_conv,
+                                extension,
+                                ABIArgLocation::Stack,
+                            );
                             // Trash the from_reg; it should be its last use.
                             match (ext, from_bits) {
                                 (ir::ArgumentExtension::Uext, n)
@@ -1849,6 +1908,12 @@ impl<M: ABIMachineSpec> Callee<M> {
             match &sigs.args(sig)[idx] {
                 &ABIArg::Slots { .. } | &ABIArg::ImplicitPtrArg { .. } => {}
                 &ABIArg::StructArg { offset, size, .. } => {
+                    // The `tail` calling convention doesn't support
+                    // struct arguments, because doing so would be
+                    // complex: the copies would go to the caller's
+                    // own incoming argument area, which may also be
+                    // where their sources are.
+                    debug_assert!(!is_tail_call);
                     let tmp = vregs.alloc_with_deferred_error(word_ty).only_reg().unwrap();
                     insts.push(M::gen_get_stack_addr(
                         stack_arg(offset),
@@ -1877,11 +1942,15 @@ impl<M: ABIMachineSpec> Callee<M> {
                     for (slot, from_reg) in slots.iter().zip(from_regs.regs().iter()) {
                         // Load argument slot value from `from_reg`, and perform any zero-
                         // or sign-extension that is required by the ABI.
-                        let (ty, extension) = match *slot {
-                            ABIArgSlot::Reg { ty, extension, .. } => (ty, extension),
-                            ABIArgSlot::Stack { ty, extension, .. } => (ty, extension),
+                        let (ty, extension, arg_loc) = match *slot {
+                            ABIArgSlot::Reg { ty, extension, .. } => {
+                                (ty, extension, ABIArgLocation::Reg)
+                            }
+                            ABIArgSlot::Stack { ty, extension, .. } => {
+                                (ty, extension, ABIArgLocation::Stack)
+                            }
                         };
-                        let ext = M::get_ext_mode(call_conv, extension);
+                        let ext = M::get_ext_mode(call_conv, extension, arg_loc);
                         let (vreg, ty) = if ext != ir::ArgumentExtension::None
                             && ty_bits(ty) < word_bits
                         {
@@ -1994,11 +2063,15 @@ impl<M: ABIMachineSpec> Callee<M> {
                         // and we ignore high bits in our own registers by convention.  However,
                         // we still need to use the proper extended type to access stack slots
                         // (this is critical on big-endian systems).
-                        let (ty, extension) = match *slot {
-                            ABIArgSlot::Reg { ty, extension, .. } => (ty, extension),
-                            ABIArgSlot::Stack { ty, extension, .. } => (ty, extension),
+                        let (ty, extension, arg_loc) = match *slot {
+                            ABIArgSlot::Reg { ty, extension, .. } => {
+                                (ty, extension, ABIArgLocation::Reg)
+                            }
+                            ABIArgSlot::Stack { ty, extension, .. } => {
+                                (ty, extension, ABIArgLocation::Stack)
+                            }
                         };
-                        let ext = M::get_ext_mode(callee_conv, extension);
+                        let ext = M::get_ext_mode(callee_conv, extension, arg_loc);
                         let ty = if ext != ir::ArgumentExtension::None && ty_bits(ty) < word_bits {
                             word_ty
                         } else {
@@ -2131,8 +2204,9 @@ impl<M: ABIMachineSpec> Callee<M> {
         // after the register allocator has run and thus cannot have register allocator-inserted
         // references to SP offsets.)
 
-        let callee_pop_size = if callee_conv == isa::CallConv::Tail {
-            // The tail calling convention has callees pop stack arguments.
+        let callee_pop_size = if matches!(callee_conv, isa::CallConv::Tail | isa::CallConv::Winch) {
+            // The tail and Winch calling conventions have callees pop stack
+            // arguments.
             stack_arg_space
         } else {
             0
@@ -2156,17 +2230,29 @@ impl<M: ABIMachineSpec> Callee<M> {
         self.sized_stackslots[slot]
     }
 
+    /// The offset of `offset` bytes into a sized stackslot, relative to the
+    /// start of the stackslot area, if it is small enough to address directly
+    /// (see `stackslot_area_offset`).
+    pub fn sized_stackslot_area_offset(&self, slot: StackSlot, offset: i64) -> Option<i32> {
+        stackslot_area_offset::<M>(self.sized_stackslots[slot], offset)
+    }
+
     /// Produce an instruction that computes a sized stackslot address.
+    ///
+    /// The offset must be small enough to address directly (see
+    /// `sized_stackslot_area_offset`); larger offsets must be added to the
+    /// stackslot's address separately.
     pub fn sized_stackslot_addr(
         &self,
         slot: StackSlot,
-        offset: u32,
+        offset: i32,
         into_reg: Writable<Reg>,
     ) -> M::I {
         // Offset from beginning of stackslot area.
-        let stack_off = self.sized_stackslots[slot] as i64;
-        let sp_off: i64 = stack_off + (offset as i64);
-        M::gen_get_stack_addr(StackAMode::Slot(sp_off), into_reg)
+        let sp_off = self
+            .sized_stackslot_area_offset(slot, i64::from(offset))
+            .expect("stackslot offset too large to address directly");
+        M::gen_get_stack_addr(StackAMode::Slot(i64::from(sp_off)), into_reg)
     }
 
     /// Produce an instruction that computes a dynamic stackslot address.
@@ -2204,12 +2290,17 @@ impl<M: ABIMachineSpec> Callee<M> {
         spillslots: usize,
         clobbered: Vec<Writable<RealReg>>,
         function_calls: FunctionCalls,
-    ) {
+    ) -> CodegenResult<()> {
         let bytes = M::word_bytes();
-        let total_stacksize = self.stackslots_size + bytes * spillslots as u32;
         let mask = M::stack_align(self.call_conv) - 1;
-        let total_stacksize = (total_stacksize + mask) & !mask; // 16-align the stack.
-        self.frame_layout = Some(M::compute_frame_layout(
+        let total_stacksize = u32::try_from(spillslots)
+            .ok()
+            .and_then(|spillslots| spillslots.checked_mul(bytes))
+            .and_then(|spillslot_bytes| self.stackslots_size.checked_add(spillslot_bytes))
+            // Align the stack.
+            .and_then(|size| checked_round_up(size, mask))
+            .ok_or(CodegenError::ImplLimitExceeded)?;
+        let frame_layout = M::compute_frame_layout(
             self.call_conv,
             &self.flags,
             self.signature(),
@@ -2220,7 +2311,28 @@ impl<M: ABIMachineSpec> Callee<M> {
             self.stackslots_size,
             total_stacksize,
             self.outgoing_args_size,
-        ));
+        );
+
+        if Self::frame_layout_exceeds_limit(&frame_layout, M::maximum_frame_size()) {
+            return Err(CodegenError::ImplLimitExceeded);
+        }
+
+        self.frame_layout = Some(frame_layout);
+        Ok(())
+    }
+
+    /// Pulled out so that it can be used directly in tests without constructing a full `Callee`.
+    pub(crate) fn frame_layout_exceeds_limit(
+        frame_layout: &FrameLayout,
+        max_frame_size: u32,
+    ) -> bool {
+        let total: u64 = frame_layout.incoming_args_size as u64
+            + frame_layout.tail_args_size as u64
+            + frame_layout.setup_area_size as u64
+            + frame_layout.clobber_size as u64
+            + frame_layout.fixed_frame_storage_size as u64
+            + frame_layout.outgoing_args_size as u64;
+        total > max_frame_size as u64
     }
 
     /// Generate a prologue, post-regalloc.
@@ -2389,7 +2501,7 @@ impl<M: ABIMachineSpec> Callee<M> {
     /// Generate a spill.
     pub fn gen_spill(&self, to_slot: SpillSlot, from_reg: RealReg) -> M::I {
         let ty = M::I::canonical_type_for_rc(from_reg.class());
-        debug_assert_eq!(<M>::I::rc_for_type(ty).unwrap().1, &[ty]);
+        debug_assert_eq!(<M>::I::rc_for_type(&ty).unwrap().1, &[ty]);
 
         let sp_off = self.get_spillslot_offset(to_slot);
         trace!("gen_spill: {from_reg:?} into slot {to_slot:?} at offset {sp_off}");
@@ -2401,7 +2513,7 @@ impl<M: ABIMachineSpec> Callee<M> {
     /// Generate a reload (fill).
     pub fn gen_reload(&self, to_reg: Writable<RealReg>, from_slot: SpillSlot) -> M::I {
         let ty = M::I::canonical_type_for_rc(to_reg.to_reg().class());
-        debug_assert_eq!(<M>::I::rc_for_type(ty).unwrap().1, &[ty]);
+        debug_assert_eq!(<M>::I::rc_for_type(&ty).unwrap().1, &[ty]);
 
         let sp_off = self.get_spillslot_offset(from_slot);
         trace!("gen_reload: {to_reg:?} from slot {from_slot:?} at offset {sp_off}");
@@ -2562,8 +2674,8 @@ impl TryCallInfo {
         layout: &FrameLayout,
     ) -> impl Iterator<Item = MachExceptionHandler> {
         self.exception_handlers.iter().map(|handler| match handler {
-            TryCallHandler::Tag(tag, label) => MachExceptionHandler::Tag(*tag, *label),
-            TryCallHandler::Default(label) => MachExceptionHandler::Default(*label),
+            TryCallHandler::Tag(tag, label) => MachExceptionHandler::Tag(*tag, LabelOrOffset::from(*label)),
+            TryCallHandler::Default(label) => MachExceptionHandler::Default(LabelOrOffset::from(*label)),
             TryCallHandler::Context(reg) => {
                 let loc = if let Some(spillslot) = reg.to_spillslot() {
                     // The spillslot offset is relative to the "fixed

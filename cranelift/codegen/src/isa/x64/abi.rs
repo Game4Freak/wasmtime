@@ -1,12 +1,12 @@
 //! Implementation of the standard x64 ABI.
 
 use crate::CodegenResult;
-use crate::ir::{self, LibCall, MemFlags, Signature, TrapCode, types};
+use crate::ir::MemFlagsData;
+use crate::ir::{self, LibCall, Signature, TrapCode, types};
 use crate::ir::{ExternalName, types::*};
 use crate::isa;
 use crate::isa::winch;
 use crate::isa::{CallConv, unwind::UnwindInst, x64::inst::*, x64::settings as x64_settings};
-use crate::machinst::abi::*;
 use crate::machinst::*;
 use crate::settings;
 use alloc::borrow::ToOwned;
@@ -154,6 +154,11 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             let last_param = ix == params.len() - 1;
 
             if let ir::ArgumentPurpose::StructArgument(size) = param.purpose {
+                if is_tail {
+                    return Err(crate::CodegenError::Unsupported(
+                        "struct arguments (`sarg`) in `tail` signatures".to_owned(),
+                    ));
+                }
                 let offset = next_stack as i64;
                 let size = size;
                 assert!(size % 8 == 0, "StructArgument size is not properly aligned");
@@ -167,7 +172,7 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             }
 
             // Find regclass(es) of the register(s) used to store a value of this type.
-            let (rcs, reg_tys) = Inst::rc_for_type(param.value_type)?;
+            let (rcs, reg_tys) = Inst::rc_for_type(&param.value_type)?;
 
             // Now assign ABIArgSlots for each register-sized part.
             //
@@ -408,6 +413,13 @@ impl ABIMachineSpec for X64ABIMachineSpec {
 
         next_stack = align_to(next_stack, 16);
 
+        if args_or_rets == ArgsOrRets::Args
+            && matches!(call_conv, CallConv::Tail | CallConv::Winch)
+            && next_stack > u32::from(u16::MAX)
+        {
+            return Err(crate::CodegenError::ImplLimitExceeded);
+        }
+
         Ok((next_stack, extra_arg_idx))
     }
 
@@ -595,10 +607,10 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         frame_layout: &FrameLayout,
     ) -> SmallInstVec<Self::I> {
         // Emit return instruction.
-        let stack_bytes_to_pop = if call_conv == CallConv::Tail {
-            frame_layout.tail_args_size
-        } else {
-            0
+        let stack_bytes_to_pop = match call_conv {
+            CallConv::Tail => frame_layout.tail_args_size,
+            CallConv::Winch => frame_layout.incoming_args_size,
+            _ => 0,
         };
         let inst = if stack_bytes_to_pop == 0 {
             asm::inst::retq_zo::new().into()
@@ -642,7 +654,11 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         let probe_count = frame_size / guard_size;
         if probe_count == 0 {
             // No probe necessary
-        } else if probe_count <= PROBE_MAX_UNROLL {
+        } else if probe_count <= PROBE_MAX_UNROLL || call_conv == isa::CallConv::PreserveAll {
+            // The probe loop needs a temporary register, but probes run
+            // before any registers are saved, and a `preserve_all` function
+            // must not clobber any register. The unrolled probes don't use
+            // any registers, so always use them for `preserve_all`.
             Self::gen_probestack_unroll(insts, guard_size, probe_count)
         } else {
             Self::gen_probestack_loop(insts, call_conv, frame_size, guard_size)
@@ -656,6 +672,26 @@ impl ABIMachineSpec for X64ABIMachineSpec {
     ) -> SmallVec<[Self::I; 16]> {
         let mut insts = SmallVec::new();
 
+        // Emit unwind info: start the frame. The frame (from unwind consumers'
+        // point of view) starts at clobbers, just below the FP and return
+        // address. Spill slots and stack slots are part of our actual frame but
+        // do not concern the unwinder.
+        //
+        // This is emitted before the incoming argument area is resized below so
+        // that the CFA is defined in terms of RBP while the saved RBP and return
+        // address are being moved: RBP keeps pointing at the original copies
+        // until both have been moved, and then points at the new copies. In both
+        // cases the caller's frame is `setup_area_size` above RBP, and the
+        // clobbers are just below RBP.
+        if flags.unwind_info() && frame_layout.setup_area_size > 0 {
+            insts.push(Inst::Unwind {
+                inst: UnwindInst::DefineNewFrame {
+                    offset_downward_to_clobbers: frame_layout.clobber_size,
+                    offset_upward_to_caller_sp: frame_layout.setup_area_size,
+                },
+            });
+        }
+
         // When a return_call within this function required more stack arguments than we have
         // present, resize the incoming argument area of the frame to accommodate those arguments.
         let incoming_args_diff = frame_layout.tail_args_size - frame_layout.incoming_args_size;
@@ -667,14 +703,6 @@ impl ABIMachineSpec for X64ABIMachineSpec {
                 i32::try_from(incoming_args_diff)
                     .expect("`incoming_args_diff` is too large to fit in a 32-bit immediate"),
             ));
-
-            // Make sure to keep the frame pointer and stack pointer in sync at
-            // this point.
-            let rbp = Gpr::RBP;
-            let rsp = Gpr::RSP;
-            insts.push(Inst::External {
-                inst: asm::inst::movq_mr::new(Writable::from_reg(rbp), rsp).into(),
-            });
 
             let incoming_args_diff = i32::try_from(incoming_args_diff).unwrap();
 
@@ -692,22 +720,13 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             insts.push(Inst::External { inst });
             let inst = asm::inst::movq_mr::new(Amode::imm_reg(8, regs::rsp()), r11.to_reg()).into();
             insts.push(Inst::External { inst });
-        }
 
-        // We need to factor `incoming_args_diff` into the offset upward here, as we have grown
-        // the argument area -- `setup_area_size` alone will not be the correct offset up to the
-        // original caller's SP.
-        let offset_upward_to_caller_sp = frame_layout.setup_area_size + incoming_args_diff;
-        if flags.unwind_info() && offset_upward_to_caller_sp > 0 {
-            // Emit unwind info: start the frame. The frame (from unwind
-            // consumers' point of view) starts at clobbbers, just below
-            // the FP and return address. Spill slots and stack slots are
-            // part of our actual frame but do not concern the unwinder.
-            insts.push(Inst::Unwind {
-                inst: UnwindInst::DefineNewFrame {
-                    offset_downward_to_clobbers: frame_layout.clobber_size,
-                    offset_upward_to_caller_sp,
-                },
+            // Now that the saved frame pointer and return address have been
+            // moved, point the frame pointer at the new frame record.
+            let rbp = Gpr::RBP;
+            let rsp = Gpr::RSP;
+            insts.push(Inst::External {
+                inst: asm::inst::movq_mr::new(Writable::from_reg(rbp), rsp).into(),
             });
         }
 
@@ -906,6 +925,7 @@ impl ABIMachineSpec for X64ABIMachineSpec {
     fn get_ext_mode(
         _call_conv: isa::CallConv,
         specified: ir::ArgumentExtension,
+        _location: ABIArgLocation,
     ) -> ir::ArgumentExtension {
         specified
     }
@@ -1011,7 +1031,7 @@ impl From<StackAMode> for SyntheticAmode {
                 SyntheticAmode::Real(Amode::ImmReg {
                     simm32: off,
                     base: regs::rsp(),
-                    flags: MemFlags::trusted(),
+                    flags: MemFlagsData::trusted(),
                 })
             }
         }
@@ -1121,6 +1141,7 @@ fn get_fltreg_for_retval(call_conv: CallConv, fltreg_idx: usize, is_last: bool) 
         },
         CallConv::WindowsFastcall => match fltreg_idx {
             0 => Some(regs::xmm0()),
+            1 => Some(regs::xmm1()), // The Rust ABI for float scalar pairs needs this.
             _ => None,
         },
         CallConv::Winch => is_last.then(|| regs::xmm0()),
@@ -1341,4 +1362,52 @@ const fn create_reg_env_systemv(enable_pinned_reg: bool) -> MachineEnv {
     }
 
     env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::machinst::abi::Callee;
+    use alloc::vec::Vec;
+
+    fn make_frame_layout(total_relevant_fields_sum: u32) -> FrameLayout {
+        FrameLayout {
+            word_bytes: 8,
+            incoming_args_size: 0,
+            tail_args_size: 0,
+            setup_area_size: 0,
+            clobber_size: 0,
+            fixed_frame_storage_size: total_relevant_fields_sum,
+            stackslots_size: 0,
+            outgoing_args_size: 0,
+            clobbered_callee_saves: Vec::new(),
+            function_calls: crate::machinst::FunctionCalls::None,
+        }
+    }
+
+    const ONE_GIB: u32 = 1 << 30;
+
+    #[test]
+    fn frame_layout_under_limit_is_accepted() {
+        let layout = make_frame_layout(ONE_GIB - 1);
+        assert!(!Callee::<X64ABIMachineSpec>::frame_layout_exceeds_limit(
+            &layout, ONE_GIB
+        ));
+    }
+
+    #[test]
+    fn frame_layout_at_exact_limit_is_accepted() {
+        let layout = make_frame_layout(ONE_GIB);
+        assert!(!Callee::<X64ABIMachineSpec>::frame_layout_exceeds_limit(
+            &layout, ONE_GIB
+        ));
+    }
+
+    #[test]
+    fn frame_layout_over_limit_is_rejected() {
+        let layout = make_frame_layout(ONE_GIB + 1);
+        assert!(Callee::<X64ABIMachineSpec>::frame_layout_exceeds_limit(
+            &layout, ONE_GIB
+        ));
+    }
 }

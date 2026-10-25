@@ -5,19 +5,13 @@ use crate::p3::bindings::http::types::{
     HostRequestOptions, HostRequestWithStore, HostResponse, HostResponseWithStore, Method, Request,
     RequestOptions, RequestOptionsError, Response, Scheme, StatusCode, Trailers,
 };
-use crate::p3::body::{Body, HostBodyStreamProducer};
-use crate::p3::{HeaderResult, HttpError, RequestOptionsResult, WasiHttp, WasiHttpCtxView};
-use core::mem;
-use core::pin::Pin;
-use core::task::{Context, Poll, ready};
-use http::header::CONTENT_LENGTH;
+use crate::p3::body::Body;
+use crate::p3::{HeaderResult, HttpError, RequestOptionsResult};
+use crate::{WasiHttp, WasiHttpCtxView};
 use std::sync::Arc;
-use tokio::sync::oneshot;
-use wasmtime::component::{
-    Access, FutureProducer, FutureReader, Resource, ResourceTable, StreamReader,
-};
+use wasmtime::AsContextMut;
+use wasmtime::component::{Access, FutureReader, Resource, ResourceTable, StreamReader};
 use wasmtime::error::Context as _;
-use wasmtime::{AsContextMut, StoreContextMut};
 
 fn get_fields<'a>(
     table: &'a ResourceTable,
@@ -123,67 +117,6 @@ fn delete_request_options(
         .context("failed to delete request options from table")
 }
 
-fn parse_header_value(
-    name: &http::HeaderName,
-    value: impl AsRef<[u8]>,
-) -> Result<http::HeaderValue, HeaderError> {
-    if name == CONTENT_LENGTH {
-        let s = str::from_utf8(value.as_ref()).or(Err(HeaderError::InvalidSyntax))?;
-        let v: u64 = s.parse().or(Err(HeaderError::InvalidSyntax))?;
-        Ok(v.into())
-    } else {
-        http::HeaderValue::from_bytes(value.as_ref()).or(Err(HeaderError::InvalidSyntax))
-    }
-}
-
-enum GuestBodyResultProducer {
-    Receiver(oneshot::Receiver<Box<dyn Future<Output = Result<(), ErrorCode>> + Send>>),
-    Future(Pin<Box<dyn Future<Output = Result<(), ErrorCode>> + Send>>),
-}
-
-fn poll_future<T>(
-    cx: &mut Context<'_>,
-    fut: Pin<&mut (impl Future<Output = T> + ?Sized)>,
-    finish: bool,
-) -> Poll<Option<T>> {
-    match fut.poll(cx) {
-        Poll::Ready(v) => Poll::Ready(Some(v)),
-        Poll::Pending if finish => Poll::Ready(None),
-        Poll::Pending => Poll::Pending,
-    }
-}
-
-impl<D> FutureProducer<D> for GuestBodyResultProducer {
-    type Item = Result<(), ErrorCode>;
-
-    fn poll_produce(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        _: StoreContextMut<D>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<Option<Self::Item>>> {
-        match &mut *self {
-            Self::Receiver(rx) => {
-                match ready!(poll_future(cx, Pin::new(rx), finish)) {
-                    Some(Ok(fut)) => {
-                        let mut fut = Box::into_pin(fut);
-                        // poll the received future once and update state
-                        let res = poll_future(cx, fut.as_mut(), finish);
-                        *self = Self::Future(fut);
-                        res.map(Ok)
-                    }
-                    Some(Err(..)) => {
-                        // oneshot sender dropped, treat as success
-                        Poll::Ready(Ok(Some(Ok(()))))
-                    }
-                    None => Poll::Ready(Ok(None)),
-                }
-            }
-            Self::Future(fut) => poll_future(cx, fut.as_mut(), finish).map(Ok),
-        }
-    }
-}
-
 impl HostFields for WasiHttpCtxView<'_> {
     fn new(&mut self) -> wasmtime::Result<Resource<Fields>> {
         push_fields(self.table, FieldMap::new_mutable(self.ctx.field_size_limit))
@@ -195,12 +128,7 @@ impl HostFields for WasiHttpCtxView<'_> {
     ) -> HeaderResult<Resource<Fields>> {
         let mut fields = FieldMap::new_mutable(self.ctx.field_size_limit);
         for (name, value) in entries {
-            let name = name.parse().or(Err(HeaderError::InvalidSyntax))?;
-            if self.hooks.is_forbidden_header(&name) {
-                return Err(HeaderError::Forbidden.into());
-            }
-            let value = parse_header_value(&name, value)?;
-            fields.append(name, value)?;
+            fields.append(self.hooks, name, value)?;
         }
         let fields = push_fields(self.table, fields).map_err(crate::p3::HeaderError::trap)?;
         Ok(fields)
@@ -228,27 +156,14 @@ impl HostFields for WasiHttpCtxView<'_> {
         &mut self,
         fields: Resource<Fields>,
         name: FieldName,
-        value: Vec<FieldValue>,
+        values: Vec<FieldValue>,
     ) -> HeaderResult<()> {
-        let name = name.parse().map_err(|_| HeaderError::InvalidSyntax)?;
-        if self.hooks.is_forbidden_header(&name) {
-            return Err(HeaderError::Forbidden.into());
-        }
-        let mut values = Vec::with_capacity(value.len());
-        for value in value {
-            let value = parse_header_value(&name, value)?;
-            values.push(value);
-        }
-        get_fields_mut(self.table, &fields)?.set(name, values)?;
+        get_fields_mut(self.table, &fields)?.set(self.hooks, name, values)?;
         Ok(())
     }
 
     fn delete(&mut self, fields: Resource<Fields>, name: FieldName) -> HeaderResult<()> {
-        let name = name.parse().map_err(|_| HeaderError::InvalidSyntax)?;
-        if self.hooks.is_forbidden_header(&name) {
-            return Err(HeaderError::Forbidden.into());
-        }
-        get_fields_mut(self.table, &fields)?.remove_all(name)?;
+        get_fields_mut(self.table, &fields)?.remove_all(self.hooks, name)?;
         Ok(())
     }
 
@@ -258,11 +173,8 @@ impl HostFields for WasiHttpCtxView<'_> {
         name: FieldName,
     ) -> HeaderResult<Vec<FieldValue>> {
         let name = name.parse().or(Err(HeaderError::InvalidSyntax))?;
-        if self.hooks.is_forbidden_header(&name) {
-            return Err(HeaderError::Forbidden.into());
-        }
         let values = get_fields_mut(self.table, &fields)?
-            .remove_all(name)?
+            .remove_all(self.hooks, name)?
             .into_iter();
         Ok(values.map(|value| value.as_bytes().into()).collect())
     }
@@ -273,12 +185,7 @@ impl HostFields for WasiHttpCtxView<'_> {
         name: FieldName,
         value: FieldValue,
     ) -> HeaderResult<()> {
-        let name = name.parse().or(Err(HeaderError::InvalidSyntax))?;
-        if self.hooks.is_forbidden_header(&name) {
-            return Err(HeaderError::Forbidden.into());
-        }
-        let value = parse_header_value(&name, value)?;
-        get_fields_mut(self.table, &fields)?.append(name, value)?;
+        get_fields_mut(self.table, &fields)?.append(self.hooks, name, value)?;
         Ok(())
     }
 
@@ -306,55 +213,53 @@ impl HostFields for WasiHttpCtxView<'_> {
     }
 }
 
-impl HostRequestWithStore for WasiHttp {
-    fn new<T>(
-        mut store: Access<T, Self>,
+fn new_request<S>(
+    mut store: S,
+    mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Copy + Send + 'static,
+    headers: Resource<Headers>,
+    contents: Option<StreamReader<u8>>,
+    trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+    options: Option<Resource<RequestOptions>>,
+) -> wasmtime::Result<(Resource<Request>, FutureReader<Result<(), ErrorCode>>)>
+where
+    S: AsContextMut,
+{
+    let mut store = store.as_context_mut();
+    let (body, body_result) = Body::new_guest(&mut store, getter, contents, trailers)?;
+    let cx = getter(store.data_mut());
+    let headers = delete_fields(cx.table, headers)?;
+    let options = options
+        .map(|options| delete_request_options(cx.table, options))
+        .transpose()?;
+    let req = Request {
+        method: http::Method::GET,
+        scheme: None,
+        authority: None,
+        path_with_query: None,
+        headers,
+        options: options.map(Into::into),
+        body,
+    };
+    let req = cx
+        .table
+        .push(req)
+        .context("failed to push request to table")?;
+    Ok((req, body_result))
+}
+
+impl<T> HostRequestWithStore<T> for WasiHttp {
+    fn new(
+        store: Access<T, Self>,
         headers: Resource<Headers>,
         contents: Option<StreamReader<u8>>,
         trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
         options: Option<Resource<RequestOptions>>,
     ) -> wasmtime::Result<(Resource<Request>, FutureReader<Result<(), ErrorCode>>)> {
-        let (result_tx, result_rx) = oneshot::channel();
-        let body = match contents
-            .map(|rx| rx.try_into::<HostBodyStreamProducer<T>>(store.as_context_mut()))
-        {
-            Some(Ok(mut producer)) => Body::Host {
-                body: mem::take(&mut producer.body),
-                result_tx,
-            },
-            Some(Err(rx)) => Body::Guest {
-                contents_rx: Some(rx),
-                trailers_rx: trailers,
-                result_tx,
-            },
-            None => Body::Guest {
-                contents_rx: None,
-                trailers_rx: trailers,
-                result_tx,
-            },
-        };
-        let WasiHttpCtxView { table, .. } = store.get();
-        let headers = delete_fields(table, headers)?;
-        let options = options
-            .map(|options| delete_request_options(table, options))
-            .transpose()?;
-        let req = Request {
-            method: http::Method::GET,
-            scheme: None,
-            authority: None,
-            path_with_query: None,
-            headers,
-            options: options.map(Into::into),
-            body,
-        };
-        let req = table.push(req).context("failed to push request to table")?;
-        Ok((
-            req,
-            FutureReader::new(&mut store, GuestBodyResultProducer::Receiver(result_rx))?,
-        ))
+        let getter = store.getter();
+        new_request(store, getter, headers, contents, trailers, options)
     }
 
-    fn consume_body<T>(
+    fn consume_body(
         mut store: Access<T, Self>,
         req: Resource<Request>,
         fut: FutureReader<Result<(), ErrorCode>>,
@@ -363,20 +268,12 @@ impl HostRequestWithStore for WasiHttp {
         FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
     )> {
         let getter = store.getter();
-        let Request { body, .. } = store
-            .get()
-            .table
-            .delete(req)
-            .context("failed to delete request from table")?;
+        let Request { body, .. } = store.get().table.delete(req)?;
         body.consume(store, fut, getter)
     }
 
-    fn drop<T>(mut store: Access<'_, T, Self>, req: Resource<Request>) -> wasmtime::Result<()> {
-        let Request { body, .. } = store
-            .get()
-            .table
-            .delete(req)
-            .context("failed to delete request from table")?;
+    fn drop(mut store: Access<'_, T, Self>, req: Resource<Request>) -> wasmtime::Result<()> {
+        let Request { body, .. } = store.get().table.delete(req)?;
         body.drop(store)?;
         Ok(())
     }
@@ -414,11 +311,12 @@ impl HostRequest for WasiHttpCtxView<'_> {
         path_with_query: Option<String>,
     ) -> wasmtime::Result<Result<(), ()>> {
         let req = get_request_mut(self.table, &req)?;
+
         let Some(path_with_query) = path_with_query else {
             req.path_with_query = None;
             return Ok(Ok(()));
         };
-        let Ok(path_with_query) = path_with_query.try_into() else {
+        let Some(path_with_query) = crate::parse_path_with_query(&path_with_query) else {
             return Ok(Err(()));
         };
         req.path_with_query = Some(path_with_query);
@@ -462,13 +360,9 @@ impl HostRequest for WasiHttpCtxView<'_> {
             req.authority = None;
             return Ok(Ok(()));
         };
-        let has_port = authority.contains(':');
-        let Ok(authority) = http::uri::Authority::try_from(authority) else {
+        let Ok(authority) = crate::parse_authority(authority) else {
             return Ok(Err(()));
         };
-        if has_port && authority.port_u16().is_none() {
-            return Ok(Err(()));
-        }
         req.authority = Some(authority);
         Ok(Ok(()))
     }
@@ -491,7 +385,10 @@ impl HostRequest for WasiHttpCtxView<'_> {
 
     fn get_headers(&mut self, req: Resource<Request>) -> wasmtime::Result<Resource<Headers>> {
         let Request { headers, .. } = get_request(self.table, &req)?;
-        push_fields(self.table, headers.clone())
+        // `get-headers` promises immutable headers; that includes requests built with `Request::new`.
+        let mut headers = headers.clone();
+        headers.set_immutable();
+        push_fields(self.table, headers)
     }
 }
 
@@ -589,49 +486,41 @@ impl HostRequestOptions for WasiHttpCtxView<'_> {
     }
 }
 
-impl HostResponseWithStore for WasiHttp {
-    fn new<T>(
-        mut store: Access<T, Self>,
+fn new_response<S>(
+    mut store: S,
+    mut getter: impl FnMut(&mut S::Data) -> WasiHttpCtxView<'_> + Copy + Send + 'static,
+    headers: Resource<Headers>,
+    contents: Option<StreamReader<u8>>,
+    trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+) -> wasmtime::Result<(Resource<Response>, FutureReader<Result<(), ErrorCode>>)>
+where
+    S: AsContextMut,
+{
+    let mut store = store.as_context_mut();
+    let (body, body_result) = Body::new_guest(&mut store, getter, contents, trailers)?;
+    let cx = getter(store.data_mut());
+    let headers = delete_fields(cx.table, headers)?;
+    let res = Response {
+        status: http::StatusCode::OK,
+        headers,
+        body,
+    };
+    let res = cx.table.push(res)?;
+    Ok((res, body_result))
+}
+
+impl<T> HostResponseWithStore<T> for WasiHttp {
+    fn new(
+        store: Access<T, Self>,
         headers: Resource<Headers>,
         contents: Option<StreamReader<u8>>,
         trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
     ) -> wasmtime::Result<(Resource<Response>, FutureReader<Result<(), ErrorCode>>)> {
-        let (result_tx, result_rx) = oneshot::channel();
-        let body = match contents
-            .map(|rx| rx.try_into::<HostBodyStreamProducer<T>>(store.as_context_mut()))
-        {
-            Some(Ok(mut producer)) => Body::Host {
-                body: mem::take(&mut producer.body),
-                result_tx,
-            },
-            Some(Err(rx)) => Body::Guest {
-                contents_rx: Some(rx),
-                trailers_rx: trailers,
-                result_tx,
-            },
-            None => Body::Guest {
-                contents_rx: None,
-                trailers_rx: trailers,
-                result_tx,
-            },
-        };
-        let WasiHttpCtxView { table, .. } = store.get();
-        let headers = delete_fields(table, headers)?;
-        let res = Response {
-            status: http::StatusCode::OK,
-            headers,
-            body,
-        };
-        let res = table
-            .push(res)
-            .context("failed to push response to table")?;
-        Ok((
-            res,
-            FutureReader::new(&mut store, GuestBodyResultProducer::Receiver(result_rx))?,
-        ))
+        let getter = store.getter();
+        new_response(store, getter, headers, contents, trailers)
     }
 
-    fn consume_body<T>(
+    fn consume_body(
         mut store: Access<T, Self>,
         res: Resource<Response>,
         fut: FutureReader<Result<(), ErrorCode>>,
@@ -640,20 +529,12 @@ impl HostResponseWithStore for WasiHttp {
         FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
     )> {
         let getter = store.getter();
-        let Response { body, .. } = store
-            .get()
-            .table
-            .delete(res)
-            .context("failed to delete response from table")?;
+        let Response { body, .. } = store.get().table.delete(res)?;
         body.consume(store, fut, getter)
     }
 
-    fn drop<T>(mut store: Access<'_, T, Self>, res: Resource<Response>) -> wasmtime::Result<()> {
-        let Response { body, .. } = store
-            .get()
-            .table
-            .delete(res)
-            .context("failed to delete response from table")?;
+    fn drop(mut store: Access<'_, T, Self>, res: Resource<Response>) -> wasmtime::Result<()> {
+        let Response { body, .. } = store.get().table.delete(res)?;
         body.drop(store)?;
         Ok(())
     }
@@ -682,7 +563,10 @@ impl HostResponse for WasiHttpCtxView<'_> {
 
     fn get_headers(&mut self, res: Resource<Response>) -> wasmtime::Result<Resource<Headers>> {
         let Response { headers, .. } = get_response(self.table, &res)?;
-        push_fields(self.table, headers.clone())
+        // The response side makes the same promise as the request side.
+        let mut headers = headers.clone();
+        headers.set_immutable();
+        push_fields(self.table, headers)
     }
 }
 
@@ -703,5 +587,421 @@ impl Host for WasiHttpCtxView<'_> {
         error: crate::p3::RequestOptionsError,
     ) -> wasmtime::Result<RequestOptionsError> {
         error.downcast()
+    }
+}
+
+mod named {
+    use crate::p3::bindings::clocks::monotonic_clock::Duration;
+    use crate::p3::bindings::http::types::{
+        ErrorCode, FieldName, FieldValue, Fields, HeaderError, Headers, Method, Request,
+        RequestOptions, RequestOptionsError, Response, Scheme, StatusCode, Trailers,
+    };
+    use crate::p3::bindings::named_imports::wasi::http::types;
+    use crate::p3::{HeaderResult, HttpError, RequestOptionsResult};
+    use crate::{WasiHttpNamed, WasiHttpNamedView};
+    use wasmtime::component::{Access, FutureReader, Resource, StreamReader};
+    use wasmtime_wasi::{NamedId, WasiCtxNamedView};
+
+    impl<T> types::Host for WasiCtxNamedView<'_, T>
+    where
+        T: WasiHttpNamedView,
+    {
+        fn convert_error_code(&mut self, error: HttpError) -> wasmtime::Result<ErrorCode> {
+            error.downcast()
+        }
+
+        fn convert_header_error(
+            &mut self,
+            error: crate::p3::HeaderError,
+        ) -> wasmtime::Result<HeaderError> {
+            error.downcast()
+        }
+
+        fn convert_request_options_error(
+            &mut self,
+            error: crate::p3::RequestOptionsError,
+        ) -> wasmtime::Result<RequestOptionsError> {
+            error.downcast()
+        }
+    }
+
+    impl<T> types::HostFields for WasiCtxNamedView<'_, T>
+    where
+        T: WasiHttpNamedView,
+    {
+        fn new(&mut self, id: NamedId) -> wasmtime::Result<Resource<Fields>> {
+            super::HostFields::new(&mut self.0.http(id))
+        }
+
+        fn from_list(
+            &mut self,
+            id: NamedId,
+            entries: Vec<(FieldName, FieldValue)>,
+        ) -> HeaderResult<Resource<Fields>> {
+            super::HostFields::from_list(&mut self.0.http(id), entries)
+        }
+
+        fn get(
+            &mut self,
+            id: NamedId,
+            fields: Resource<Fields>,
+            name: FieldName,
+        ) -> wasmtime::Result<Vec<FieldValue>> {
+            super::HostFields::get(&mut self.0.http(id), fields, name)
+        }
+
+        fn has(
+            &mut self,
+            id: NamedId,
+            fields: Resource<Fields>,
+            name: FieldName,
+        ) -> wasmtime::Result<bool> {
+            super::HostFields::has(&mut self.0.http(id), fields, name)
+        }
+
+        fn set(
+            &mut self,
+            id: NamedId,
+            fields: Resource<Fields>,
+            name: FieldName,
+            values: Vec<FieldValue>,
+        ) -> HeaderResult<()> {
+            super::HostFields::set(&mut self.0.http(id), fields, name, values)
+        }
+
+        fn delete(
+            &mut self,
+            id: NamedId,
+            fields: Resource<Fields>,
+            name: FieldName,
+        ) -> HeaderResult<()> {
+            super::HostFields::delete(&mut self.0.http(id), fields, name)
+        }
+
+        fn get_and_delete(
+            &mut self,
+            id: NamedId,
+            fields: Resource<Fields>,
+            name: FieldName,
+        ) -> HeaderResult<Vec<FieldValue>> {
+            super::HostFields::get_and_delete(&mut self.0.http(id), fields, name)
+        }
+
+        fn append(
+            &mut self,
+            id: NamedId,
+            fields: Resource<Fields>,
+            name: FieldName,
+            value: FieldValue,
+        ) -> HeaderResult<()> {
+            super::HostFields::append(&mut self.0.http(id), fields, name, value)
+        }
+
+        fn copy_all(
+            &mut self,
+            id: NamedId,
+            fields: Resource<Fields>,
+        ) -> wasmtime::Result<Vec<(FieldName, FieldValue)>> {
+            super::HostFields::copy_all(&mut self.0.http(id), fields)
+        }
+
+        fn clone(
+            &mut self,
+            id: NamedId,
+            fields: Resource<Fields>,
+        ) -> wasmtime::Result<Resource<Fields>> {
+            super::HostFields::clone(&mut self.0.http(id), fields)
+        }
+
+        fn drop(&mut self, id: NamedId, fields: Resource<Fields>) -> wasmtime::Result<()> {
+            super::HostFields::drop(&mut self.0.http(id), fields)
+        }
+    }
+
+    impl<T> types::HostRequest for WasiCtxNamedView<'_, T>
+    where
+        T: WasiHttpNamedView,
+    {
+        fn get_method(&mut self, id: NamedId, req: Resource<Request>) -> wasmtime::Result<Method> {
+            super::HostRequest::get_method(&mut self.0.http(id), req)
+        }
+
+        fn set_method(
+            &mut self,
+            id: NamedId,
+            req: Resource<Request>,
+            method: Method,
+        ) -> wasmtime::Result<Result<(), ()>> {
+            super::HostRequest::set_method(&mut self.0.http(id), req, method)
+        }
+
+        fn get_path_with_query(
+            &mut self,
+            id: NamedId,
+            req: Resource<Request>,
+        ) -> wasmtime::Result<Option<String>> {
+            super::HostRequest::get_path_with_query(&mut self.0.http(id), req)
+        }
+
+        fn set_path_with_query(
+            &mut self,
+            id: NamedId,
+            req: Resource<Request>,
+            path_with_query: Option<String>,
+        ) -> wasmtime::Result<Result<(), ()>> {
+            super::HostRequest::set_path_with_query(&mut self.0.http(id), req, path_with_query)
+        }
+
+        fn get_scheme(
+            &mut self,
+            id: NamedId,
+            req: Resource<Request>,
+        ) -> wasmtime::Result<Option<Scheme>> {
+            super::HostRequest::get_scheme(&mut self.0.http(id), req)
+        }
+
+        fn set_scheme(
+            &mut self,
+            id: NamedId,
+            req: Resource<Request>,
+            scheme: Option<Scheme>,
+        ) -> wasmtime::Result<Result<(), ()>> {
+            super::HostRequest::set_scheme(&mut self.0.http(id), req, scheme)
+        }
+
+        fn get_authority(
+            &mut self,
+            id: NamedId,
+            req: Resource<Request>,
+        ) -> wasmtime::Result<Option<String>> {
+            super::HostRequest::get_authority(&mut self.0.http(id), req)
+        }
+
+        fn set_authority(
+            &mut self,
+            id: NamedId,
+            req: Resource<Request>,
+            authority: Option<String>,
+        ) -> wasmtime::Result<Result<(), ()>> {
+            super::HostRequest::set_authority(&mut self.0.http(id), req, authority)
+        }
+
+        fn get_options(
+            &mut self,
+            id: NamedId,
+            req: Resource<Request>,
+        ) -> wasmtime::Result<Option<Resource<RequestOptions>>> {
+            super::HostRequest::get_options(&mut self.0.http(id), req)
+        }
+
+        fn get_headers(
+            &mut self,
+            id: NamedId,
+            req: Resource<Request>,
+        ) -> wasmtime::Result<Resource<Headers>> {
+            super::HostRequest::get_headers(&mut self.0.http(id), req)
+        }
+    }
+
+    impl<T> types::HostRequestOptions for WasiCtxNamedView<'_, T>
+    where
+        T: WasiHttpNamedView,
+    {
+        fn new(&mut self, id: NamedId) -> wasmtime::Result<Resource<RequestOptions>> {
+            super::HostRequestOptions::new(&mut self.0.http(id))
+        }
+
+        fn get_connect_timeout(
+            &mut self,
+            id: NamedId,
+            opts: Resource<RequestOptions>,
+        ) -> wasmtime::Result<Option<Duration>> {
+            super::HostRequestOptions::get_connect_timeout(&mut self.0.http(id), opts)
+        }
+
+        fn set_connect_timeout(
+            &mut self,
+            id: NamedId,
+            opts: Resource<RequestOptions>,
+            duration: Option<Duration>,
+        ) -> RequestOptionsResult<()> {
+            super::HostRequestOptions::set_connect_timeout(&mut self.0.http(id), opts, duration)
+        }
+
+        fn get_first_byte_timeout(
+            &mut self,
+            id: NamedId,
+            opts: Resource<RequestOptions>,
+        ) -> wasmtime::Result<Option<Duration>> {
+            super::HostRequestOptions::get_first_byte_timeout(&mut self.0.http(id), opts)
+        }
+
+        fn set_first_byte_timeout(
+            &mut self,
+            id: NamedId,
+            opts: Resource<RequestOptions>,
+            duration: Option<Duration>,
+        ) -> RequestOptionsResult<()> {
+            super::HostRequestOptions::set_first_byte_timeout(&mut self.0.http(id), opts, duration)
+        }
+
+        fn get_between_bytes_timeout(
+            &mut self,
+            id: NamedId,
+            opts: Resource<RequestOptions>,
+        ) -> wasmtime::Result<Option<Duration>> {
+            super::HostRequestOptions::get_between_bytes_timeout(&mut self.0.http(id), opts)
+        }
+
+        fn set_between_bytes_timeout(
+            &mut self,
+            id: NamedId,
+            opts: Resource<RequestOptions>,
+            duration: Option<Duration>,
+        ) -> RequestOptionsResult<()> {
+            super::HostRequestOptions::set_between_bytes_timeout(
+                &mut self.0.http(id),
+                opts,
+                duration,
+            )
+        }
+
+        fn clone(
+            &mut self,
+            id: NamedId,
+            opts: Resource<RequestOptions>,
+        ) -> wasmtime::Result<Resource<RequestOptions>> {
+            super::HostRequestOptions::clone(&mut self.0.http(id), opts)
+        }
+
+        fn drop(&mut self, id: NamedId, opts: Resource<RequestOptions>) -> wasmtime::Result<()> {
+            super::HostRequestOptions::drop(&mut self.0.http(id), opts)
+        }
+    }
+
+    impl<T> types::HostResponse for WasiCtxNamedView<'_, T>
+    where
+        T: WasiHttpNamedView,
+    {
+        fn get_status_code(
+            &mut self,
+            id: NamedId,
+            res: Resource<Response>,
+        ) -> wasmtime::Result<StatusCode> {
+            super::HostResponse::get_status_code(&mut self.0.http(id), res)
+        }
+
+        fn set_status_code(
+            &mut self,
+            id: NamedId,
+            res: Resource<Response>,
+            status_code: StatusCode,
+        ) -> wasmtime::Result<Result<(), ()>> {
+            super::HostResponse::set_status_code(&mut self.0.http(id), res, status_code)
+        }
+
+        fn get_headers(
+            &mut self,
+            id: NamedId,
+            res: Resource<Response>,
+        ) -> wasmtime::Result<Resource<Headers>> {
+            super::HostResponse::get_headers(&mut self.0.http(id), res)
+        }
+    }
+
+    impl<T, U> types::HostRequestWithStore<U> for WasiHttpNamed<T>
+    where
+        T: WasiHttpNamedView,
+        U: 'static,
+    {
+        fn new(
+            store: Access<U, Self>,
+            id: NamedId,
+            headers: Resource<Headers>,
+            contents: Option<StreamReader<u8>>,
+            trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+            options: Option<Resource<RequestOptions>>,
+        ) -> wasmtime::Result<(Resource<Request>, FutureReader<Result<(), ErrorCode>>)> {
+            let getter = store.getter();
+            super::new_request(
+                store,
+                move |data| getter(data).0.http(id),
+                headers,
+                contents,
+                trailers,
+                options,
+            )
+        }
+
+        fn consume_body(
+            mut store: Access<U, Self>,
+            id: NamedId,
+            req: Resource<Request>,
+            fut: FutureReader<Result<(), ErrorCode>>,
+        ) -> wasmtime::Result<(
+            StreamReader<u8>,
+            FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+        )> {
+            let getter = store.getter();
+            let Request { body, .. } = store.get().0.http(id).table.delete(req)?;
+            body.consume(store, fut, move |data: &mut U| getter(data).0.http(id))
+        }
+
+        fn drop(
+            mut store: Access<'_, U, Self>,
+            id: NamedId,
+            req: Resource<Request>,
+        ) -> wasmtime::Result<()> {
+            let Request { body, .. } = store.get().0.http(id).table.delete(req)?;
+            body.drop(store)?;
+            Ok(())
+        }
+    }
+
+    impl<T, U> types::HostResponseWithStore<U> for WasiHttpNamed<T>
+    where
+        T: WasiHttpNamedView,
+        U: 'static,
+    {
+        fn new(
+            store: Access<U, Self>,
+            id: NamedId,
+            headers: Resource<Headers>,
+            contents: Option<StreamReader<u8>>,
+            trailers: FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+        ) -> wasmtime::Result<(Resource<Response>, FutureReader<Result<(), ErrorCode>>)> {
+            let getter = store.getter();
+            super::new_response(
+                store,
+                move |data| getter(data).0.http(id),
+                headers,
+                contents,
+                trailers,
+            )
+        }
+
+        fn consume_body(
+            mut store: Access<U, Self>,
+            id: NamedId,
+            res: Resource<Response>,
+            fut: FutureReader<Result<(), ErrorCode>>,
+        ) -> wasmtime::Result<(
+            StreamReader<u8>,
+            FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
+        )> {
+            let getter = store.getter();
+            let Response { body, .. } = store.get().0.http(id).table.delete(res)?;
+            body.consume(store, fut, move |data: &mut U| getter(data).0.http(id))
+        }
+
+        fn drop(
+            mut store: Access<'_, U, Self>,
+            id: NamedId,
+            res: Resource<Response>,
+        ) -> wasmtime::Result<()> {
+            let Response { body, .. } = store.get().0.http(id).table.delete(res)?;
+            body.drop(store)?;
+            Ok(())
+        }
     }
 }

@@ -1,6 +1,5 @@
 ;;! component_model_async = true
 ;;! reference_types = true
-;;! gc_types = true
 ;;! multi_memory = true
 ;;! bulk_memory = true
 
@@ -86,8 +85,8 @@
     (core func $f_lower
       (canon lower
         (func $f)
-        (memory $libc "memory")
-        (realloc (func $libc "realloc"))
+        (memory (core memory $libc "memory"))
+        (realloc (core func $libc "realloc"))
         string-encoding=latin1+utf16
       )
     )
@@ -133,8 +132,8 @@
     (func (export "echo-export") (type $sig)
       (canon lift
         (core func $i "echo-export")
-        (memory $libc "memory")
-        (realloc (func $libc "realloc"))
+        (memory (core memory $libc "memory"))
+        (realloc (core func $libc "realloc"))
         string-encoding=latin1+utf16)
     )
   )
@@ -158,11 +157,11 @@
     (func (export "echo-export") (type $export_sig)
       (canon lift
         (core func $i "echo-export")
-        (memory $libc "memory")
-        (realloc (func $libc "realloc"))
+        (memory (core memory $libc "memory"))
+        (realloc (core func $libc "realloc"))
         string-encoding=utf8
         async
-        (callback (func $i "callback"))
+        (callback (core func $i "callback"))
       )
     )
   )

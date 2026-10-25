@@ -1,5 +1,6 @@
 ;;! target = "x86_64"
 ;;! test = "winch"
+;;! flags = "-W threads"
 
 (module 
   (import "env" "memory" (memory 1 1 shared))
@@ -20,8 +21,8 @@
 ;;       movq    %rsi, 0x10(%rsp)
 ;;       movl    %edx, 0xc(%rsp)
 ;;       movl    0xc(%rsp), %eax
-;;       andw    $1, %ax
-;;       cmpw    $0, %ax
+;;       andl    $1, %eax
+;;       cmpl    $0, %eax
 ;;       jne     0x65
 ;;   46: movl    0xc(%rsp), %eax
 ;;       movq    0x30(%r14), %r11

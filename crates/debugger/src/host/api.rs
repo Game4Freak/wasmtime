@@ -7,10 +7,32 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wasmtime::{
-    Engine, ExnRef, FrameHandle, Func, Global, Instance, Memory, Module, OwnedRooted, Result,
-    Table, Tag, Val, component::Resource, component::ResourceTable,
+    Engine, ExnRef, FrameHandle, Func, Global, Instance, Module, OwnedRooted, Result, Table, Tag,
+    Val, component::Resource, component::ResourceTable,
 };
 use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
+
+/// A memory exposed through the debugger API.
+///
+/// The component-level resource is deliberately shared by both kinds of
+/// Wasmtime linear memory. Shared memories use their own host API and do not
+/// belong to a `Store`, unlike ordinary memories.
+#[derive(Clone)]
+pub enum Memory {
+    Unshared(wasmtime::Memory),
+    #[cfg(feature = "threads")]
+    Shared(wasmtime::SharedMemory),
+}
+
+impl Memory {
+    fn unique_id(&self) -> u64 {
+        match self {
+            Memory::Unshared(memory) => memory.debug_index_in_store(),
+            #[cfg(feature = "threads")]
+            Memory::Shared(memory) => memory.debug_index_in_store(),
+        }
+    }
+}
 
 /// Representation of one debuggee: a store with debugged code inside,
 /// under the control of the debugger.
@@ -257,13 +279,9 @@ fn result_to_event(table: &mut ResourceTable, value: DebugRunResult) -> Result<w
         DebugRunResult::Trap(_t) => wit::Event::Trap,
         DebugRunResult::Breakpoint => wit::Event::Breakpoint,
         DebugRunResult::EpochYield => wit::Event::Interrupted,
-        DebugRunResult::CaughtExceptionThrown(e) => {
+        DebugRunResult::Exception(e) => {
             let e = table.push(WasmException(e))?;
-            wit::Event::CaughtExceptionThrown(e)
-        }
-        DebugRunResult::UncaughtExceptionThrown(e) => {
-            let e = table.push(WasmException(e))?;
-            wit::Event::UncaughtExceptionThrown(e)
+            wit::Event::Exception(e)
         }
     })
 }
@@ -450,7 +468,7 @@ impl wit::HostModule for ResourceTable {
 
 impl wit::HostMemory for ResourceTable {
     async fn size_bytes(&mut self, self_: Resource<Memory>, d: Resource<Debuggee>) -> Result<u64> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         d.memory_size_bytes(memory).await
     }
@@ -460,7 +478,7 @@ impl wit::HostMemory for ResourceTable {
         self_: Resource<Memory>,
         d: Resource<Debuggee>,
     ) -> Result<u64> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         d.memory_page_size(memory).await
     }
@@ -471,7 +489,7 @@ impl wit::HostMemory for ResourceTable {
         d: Resource<Debuggee>,
         delta_bytes: u64,
     ) -> Result<u64> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         d.memory_grow(memory, delta_bytes).await
     }
@@ -483,7 +501,7 @@ impl wit::HostMemory for ResourceTable {
         addr: u64,
         len: u64,
     ) -> Result<Vec<u8>> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         Ok(d.memory_read_bytes(memory, addr, len)
             .await?
@@ -497,7 +515,7 @@ impl wit::HostMemory for ResourceTable {
         addr: u64,
         bytes: Vec<u8>,
     ) -> Result<()> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         d.memory_write_bytes(memory, addr, bytes)
             .await?
@@ -511,7 +529,7 @@ impl wit::HostMemory for ResourceTable {
         d: Resource<Debuggee>,
         addr: u64,
     ) -> Result<u8> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         Ok(d.memory_read_u8(memory, addr)
             .await?
@@ -524,7 +542,7 @@ impl wit::HostMemory for ResourceTable {
         d: Resource<Debuggee>,
         addr: u64,
     ) -> Result<u16> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         Ok(d.memory_read_u16(memory, addr)
             .await?
@@ -537,7 +555,7 @@ impl wit::HostMemory for ResourceTable {
         d: Resource<Debuggee>,
         addr: u64,
     ) -> Result<u32> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         Ok(d.memory_read_u32(memory, addr)
             .await?
@@ -550,7 +568,7 @@ impl wit::HostMemory for ResourceTable {
         d: Resource<Debuggee>,
         addr: u64,
     ) -> Result<u64> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         Ok(d.memory_read_u64(memory, addr)
             .await?
@@ -564,7 +582,7 @@ impl wit::HostMemory for ResourceTable {
         addr: u64,
         value: u8,
     ) -> Result<()> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         d.memory_write_u8(memory, addr, value)
             .await?
@@ -579,7 +597,7 @@ impl wit::HostMemory for ResourceTable {
         addr: u64,
         value: u16,
     ) -> Result<()> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         d.memory_write_u16(memory, addr, value)
             .await?
@@ -594,7 +612,7 @@ impl wit::HostMemory for ResourceTable {
         addr: u64,
         value: u32,
     ) -> Result<()> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         d.memory_write_u32(memory, addr, value)
             .await?
@@ -609,7 +627,7 @@ impl wit::HostMemory for ResourceTable {
         addr: u64,
         value: u64,
     ) -> Result<()> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         let d = debugger(self, &d)?;
         d.memory_write_u64(memory, addr, value)
             .await?
@@ -618,12 +636,12 @@ impl wit::HostMemory for ResourceTable {
     }
 
     async fn clone(&mut self, self_: Resource<Memory>) -> Result<Resource<Memory>> {
-        let memory = *self.get(&self_)?;
+        let memory = self.get(&self_)?.clone();
         Ok(self.push(memory)?)
     }
 
     async fn unique_id(&mut self, self_: Resource<Memory>) -> Result<u64> {
-        Ok(self.get(&self_)?.debug_index_in_store())
+        Ok(self.get(&self_)?.unique_id())
     }
 
     async fn drop(&mut self, rep: Resource<Memory>) -> Result<()> {
