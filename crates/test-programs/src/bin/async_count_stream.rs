@@ -20,7 +20,7 @@ impl Guest for Component {
     async fn get(count: u32) -> StreamReader<u32> {
         let (mut tx, rx) = wit_stream::new();
 
-        wit_bindgen::spawn(async move {
+        wit_bindgen::spawn_local(async move {
             for i in 0..count {
                 let remaining = tx.write_all(vec![i]).await;
                 assert!(remaining.is_empty());
